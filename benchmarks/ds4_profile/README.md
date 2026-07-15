@@ -113,12 +113,12 @@ repositories to immutable commits:
 .venv/bin/hf download deepseek-ai/DeepSeek-V4-Flash \
   tokenizer.json tokenizer_config.json \
   --revision 60d8d70770c6776ff598c94bb586a859a38244f1 \
-  --local-dir /path/to/tokenizers/deepseek-v4-flash
+  --local-dir /path/to/tokenizers/deepseek-v4-flash/60d8d70770c6776ff598c94bb586a859a38244f1
 
 .venv/bin/hf download Qwen/Qwen2.5-Coder-7B-Instruct \
   tokenizer.json tokenizer_config.json vocab.json merges.txt \
   --revision c03e6d358207e414f1eca0bb1891e29f1db0e242 \
-  --local-dir /path/to/tokenizers/qwen2.5-coder-7b-instruct
+  --local-dir /path/to/tokenizers/qwen2.5-coder-7b-instruct/c03e6d358207e414f1eca0bb1891e29f1db0e242
 ```
 
 Build Ticket 02 from the immutable Ticket 01 manifest, raw snapshot, and
