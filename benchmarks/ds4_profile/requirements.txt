@@ -1,0 +1,6 @@
+huggingface-hub==1.22.0
+hf-xet==1.5.1
+pyarrow==23.0.0
+regex==2026.2.28
+tokenizers==0.22.2
+transformers==5.13.1
