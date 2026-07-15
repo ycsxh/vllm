@@ -1,0 +1,59 @@
+{
+  "artifacts": [
+    {
+      "name": "dataset_manifest",
+      "path": "/mnt/ds4/raw/manifest.json",
+      "sha256": "c228d3f670b20185a3bde4be08a67b73877179795f1b899ae4f6a23d64371c6a"
+    },
+    {
+      "name": "normalized_turns",
+      "path": "/mnt/ds4/ticket-01/turns.parquet",
+      "sha256": "9b4d82334e9fa429c7cc38ce56eacb59e219cd7c7ccf301a1468d7ec19e2f168"
+    },
+    {
+      "name": "ticket_02_provenance",
+      "path": "/mnt/ds4/ticket-02/provenance.json",
+      "sha256": "3b1eecdae4a66ae75f47a0c151f8776f3bf9a4fc927019763a041454f2df165c"
+    },
+    {
+      "name": "rendered_turns",
+      "path": "/mnt/ds4/ticket-02/rendered_turns.parquet",
+      "sha256": "d47933e19f63ae1df7fc3fe04e228550b41d76e5ba93c09751a307f46ba33be7"
+    },
+    {
+      "name": "workload_plan",
+      "path": "/mnt/ds4/ticket-02/workload_plan.json",
+      "sha256": "95cec2c58ba1d005cdf8c7253c0bea305c48a8dac40e49a7afdaf74e720352d8"
+    }
+  ],
+  "base": {
+    "cuda": "13.0.2",
+    "python": "3.12",
+    "ubuntu": "22.04"
+  },
+  "dependencies": {
+    "nixl": "1.3.0",
+    "uv": "0.11.28"
+  },
+  "hardware": {
+    "gpu_count": 2,
+    "gpu_name": "NVIDIA GeForce RTX 3090",
+    "p2p_read": "CNS",
+    "topology": "SYS"
+  },
+  "model": {
+    "repo_id": "Qwen/Qwen2.5-Coder-7B-Instruct",
+    "revision": "c03e6d358207e414f1eca0bb1891e29f1db0e242"
+  },
+  "results_dir": "/mnt/ds4/results",
+  "revisions": {
+    "dataset": "4da61f3d06b48b6817a62b99e9c47035c8e59787",
+    "ds4_tokenizer": "60d8d70770c6776ff598c94bb586a859a38244f1",
+    "qwen_model": "c03e6d358207e414f1eca0bb1891e29f1db0e242"
+  },
+  "schema_version": 1,
+  "tokenizers": {
+    "ds4": "/mnt/ds4/tokenizers/deepseek-v4-flash/60d8d70770c6776ff598c94bb586a859a38244f1",
+    "qwen": "/mnt/ds4/tokenizers/qwen2.5-coder-7b-instruct/c03e6d358207e414f1eca0bb1891e29f1db0e242"
+  }
+}
