@@ -339,7 +339,12 @@ def _cpu_dry_run(
 
 def _cache_model(config_path: Path, output_path: Path, print_plan: bool) -> int:
     config = json.loads(config_path.read_text())
-    cache_dir = Path(os.environ.get("HF_HOME", "/mnt/ds4/cache/huggingface"))
+    cache_dir = Path(
+        os.environ.get(
+            "HF_HUB_CACHE",
+            os.environ.get("HF_HOME", "/mnt/ds4/cache/huggingface"),
+        )
+    )
     command = [
         "hf",
         "download",

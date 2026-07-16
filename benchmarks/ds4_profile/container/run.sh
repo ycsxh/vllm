@@ -148,6 +148,7 @@ run=(
     --env "DS4_DECODE_CPUSET=1,3,5,7,9,11"
     --env "DS4_IMAGE_ID=${IMAGE_ID}"
     --env HF_HOME=/mnt/ds4/cache/huggingface
+    --env HF_HUB_CACHE=/mnt/ds4/cache/huggingface
     --env "HF_HUB_OFFLINE=${HF_HUB_OFFLINE}"
     --env HOME=/mnt/ds4/cache/runtime/home
     --env LOGNAME=ds4-profile

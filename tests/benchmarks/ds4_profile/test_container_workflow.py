@@ -119,6 +119,7 @@ def test_run_dry_run_exposes_both_gpu_roles_and_persistent_mounts(
     assert "DS4_DECODE_CPUSET=1,3,5,7,9,11" in rendered_command
     assert "DS4_HOST_INVOCATION=" in rendered_command
     assert "HF_HUB_OFFLINE=1" in rendered_command
+    assert "HF_HUB_CACHE=/mnt/ds4/cache/huggingface" in rendered_command
     assert "LOGNAME=ds4-profile" in rendered_command
     assert "USER=ds4-profile" in rendered_command
     assert ":/mnt/ds4/raw:ro" in rendered_command
@@ -774,7 +775,8 @@ def test_model_cache_plan_pins_the_qwen_revision(tmp_path: Path) -> None:
         )
     )
     env = os.environ.copy()
-    env["HF_HOME"] = str(tmp_path / "hf-cache")
+    env["HF_HOME"] = str(tmp_path / "hf-home")
+    env["HF_HUB_CACHE"] = str(tmp_path / "hf-cache")
 
     result = subprocess.run(
         [
