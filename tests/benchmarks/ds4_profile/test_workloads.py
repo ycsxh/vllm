@@ -8,8 +8,10 @@ import sys
 from pathlib import Path
 
 import pyarrow.parquet as pq
+import pytest
 from transformers import AutoTokenizer
 
+import benchmarks.ds4_profile.workloads as workloads
 from benchmarks.ds4_profile.workloads import (
     build_artifacts,
     build_workload_plan,
@@ -33,6 +35,29 @@ QWEN_TOKENIZER_DIR = (
     / "qwen2.5-coder-7b-instruct"
     / "c03e6d358207e414f1eca0bb1891e29f1db0e242"
 )
+
+
+def test_deepseek_encoding_falls_back_to_installed_distribution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = PROJECT_DIR / "vllm/tokenizers/deepseek_v4_encoding.py"
+
+    class Distribution:
+        def locate_file(self, path: str) -> Path:
+            assert path == "vllm/tokenizers/deepseek_v4_encoding.py"
+            return source_path
+
+    monkeypatch.setattr(workloads, "__file__", str(tmp_path / "workloads.py"))
+    monkeypatch.setattr(
+        workloads.importlib.metadata,
+        "distribution",
+        lambda _: Distribution(),
+    )
+
+    encoding = workloads._load_deepseek_v4_encoding()
+
+    assert encoding.dsml_token == "｜DSML｜"
 
 
 def test_pinned_real_turn_prompts_match_source_token_usage() -> None:

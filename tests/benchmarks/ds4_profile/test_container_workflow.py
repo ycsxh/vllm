@@ -22,6 +22,7 @@ def test_profile_image_reuses_local_vllm_image_and_installs_an_isolated_uv_env()
 
     assert "ARG VLLM_BASE_IMAGE" in dockerfile
     assert "FROM ${VLLM_BASE_IMAGE}" in dockerfile
+    assert "COPY benchmarks/ds4_profile" in dockerfile
     assert "uv venv --system-site-packages /opt/ds4-profile" in dockerfile
     assert "uv pip install" in dockerfile
     assert "--python /opt/ds4-profile/bin/python" in dockerfile

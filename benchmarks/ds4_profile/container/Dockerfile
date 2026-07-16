@@ -22,6 +22,8 @@ ENV DS4_VLLM_DIRTY=${VLLM_BUILD_DIRTY}
 
 WORKDIR /vllm-workspace
 
+COPY benchmarks/ds4_profile /vllm-workspace/benchmarks/ds4_profile
+
 RUN --mount=type=cache,target=/opt/uv/cache \
     uv venv --system-site-packages /opt/ds4-profile && \
     uv pip install \

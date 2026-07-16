@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import importlib.metadata
 import importlib.util
 import json
 import random
@@ -440,6 +441,18 @@ def _load_deepseek_v4_encoding() -> ModuleType:
     source_path = (
         Path(__file__).parents[2] / "vllm" / "tokenizers" / "deepseek_v4_encoding.py"
     )
+    if not source_path.is_file():
+        try:
+            distribution = importlib.metadata.distribution("vllm")
+        except importlib.metadata.PackageNotFoundError as error:
+            raise RuntimeError(
+                "cannot locate the installed vLLM distribution"
+            ) from error
+        source_path = Path(
+            distribution.locate_file("vllm/tokenizers/deepseek_v4_encoding.py")
+        )
+    if not source_path.is_file():
+        raise RuntimeError(f"cannot find DeepSeek V4 encoding at {source_path}")
     spec = importlib.util.spec_from_file_location(
         "vllm_ds4_profile_deepseek_v4_encoding", source_path
     )
