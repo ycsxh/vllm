@@ -95,7 +95,7 @@ fi
 
 gpu_args=(--label ai.vllm.ds4.runtime=cpu)
 if [[ "$1" != "cache-model" && "$1" != "cpu-dry-run" ]]; then
-    gpu_args=(--gpus all --cpuset-cpus=0-11)
+    gpu_args=(--gpus all --cpuset-cpus=0-11 --cap-add SYS_NICE)
 fi
 
 if [[ "${DRY_RUN}" == true ]]; then

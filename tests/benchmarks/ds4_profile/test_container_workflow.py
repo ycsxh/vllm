@@ -112,6 +112,7 @@ def test_run_dry_run_exposes_both_gpu_roles_and_persistent_mounts(
     assert "--network=host" in rendered_command
     assert "--ulimit memlock=-1:-1" in rendered_command
     assert "--cpuset-cpus=0-11" in rendered_command
+    assert "--cap-add SYS_NICE" in rendered_command
     assert "DS4_PREFILL_GPU=0" in rendered_command
     assert "DS4_DECODE_GPU=1" in rendered_command
     assert "DS4_PREFILL_CPUSET=0,2,4,6,8,10" in rendered_command
@@ -168,6 +169,7 @@ def test_cpu_dry_run_does_not_require_an_nvidia_runtime(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert "--gpus" not in result.stdout
     assert "--cpuset-cpus" not in result.stdout
+    assert "--cap-add" not in result.stdout
     assert "HF_HUB_OFFLINE=1" in result.stdout
 
 

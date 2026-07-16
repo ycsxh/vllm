@@ -123,9 +123,10 @@ DS4_RUN=(
 ```
 
 GPU-capable commands use both GPUs, host IPC, host networking, unlimited
-memlock, and no privileged container. `cache-model` and `cpu-dry-run` omit the
-NVIDIA runtime entirely. The wrapper records its invocation and image ID. GPU0
-is the Prefill role and is bound to CPU IDs `0,2,4,6,8,10` on NUMA node 0.
+memlock, and the minimal `SYS_NICE` capability required for NUMA memory
+binding. The container is not privileged. `cache-model` and `cpu-dry-run` omit
+the NVIDIA runtime entirely. The wrapper records its invocation and image ID.
+GPU0 is the Prefill role and is bound to CPU IDs `0,2,4,6,8,10` on NUMA node 0.
 GPU1 is the Decode role and is bound to `1,3,5,7,9,11` on NUMA node 1.
 Preflight re-detects topology instead of trusting these recorded observations.
 
