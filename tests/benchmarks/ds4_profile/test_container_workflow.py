@@ -119,6 +119,8 @@ def test_run_dry_run_exposes_both_gpu_roles_and_persistent_mounts(
     assert "DS4_DECODE_CPUSET=1,3,5,7,9,11" in rendered_command
     assert "DS4_HOST_INVOCATION=" in rendered_command
     assert "HF_HUB_OFFLINE=1" in rendered_command
+    assert "LOGNAME=ds4-profile" in rendered_command
+    assert "USER=ds4-profile" in rendered_command
     assert ":/mnt/ds4/raw:ro" in rendered_command
     assert ":/mnt/ds4/ticket-01:ro" in rendered_command
     assert ":/mnt/ds4/ticket-02:ro" in rendered_command

@@ -150,8 +150,10 @@ run=(
     --env HF_HOME=/mnt/ds4/cache/huggingface
     --env "HF_HUB_OFFLINE=${HF_HUB_OFFLINE}"
     --env HOME=/mnt/ds4/cache/runtime/home
+    --env LOGNAME=ds4-profile
     --env TORCHINDUCTOR_CACHE_DIR=/mnt/ds4/cache/runtime/torchinductor
     --env TRITON_CACHE_DIR=/mnt/ds4/cache/runtime/triton
+    --env USER=ds4-profile
     --env UV_CACHE_DIR=/mnt/ds4/cache/uv
     --env VLLM_CACHE_ROOT=/mnt/ds4/cache/runtime/vllm
     --volume "${SNAPSHOT_DIR}:/mnt/ds4/raw:ro"
