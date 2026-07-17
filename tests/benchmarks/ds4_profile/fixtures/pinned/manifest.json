@@ -1,0 +1,28 @@
+{
+  "dataset": {
+    "repo_id": "Yi30/deepseek-v4-swebench-trajectories",
+    "repo_type": "model",
+    "revision": "4da61f3d06b48b6817a62b99e9c47035c8e59787"
+  },
+  "files": [
+    {
+      "path": "data/no_think/astropy__astropy-12907.traj.json",
+      "sha256": "f75519fb12540da413a8b844bb6a975fa9635b12c82a743eb5995d7c4d145432"
+    },
+    {
+      "path": "data/think_high/astropy__astropy-12907.traj.json",
+      "sha256": "808fdd40dd5327611fbc86d74c94606387c3d6ed3cd1979d469e4b1ec61e9630"
+    }
+  ],
+  "pilot_coverage": {
+    "domains": [
+      "astropy"
+    ],
+    "reasoning_modes": [
+      "no_think",
+      "think_high"
+    ],
+    "trajectory_count": 20,
+    "unique_task_count": 10
+  }
+}
