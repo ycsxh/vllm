@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
 import json
 import os
+import statistics
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +14,354 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import torch
+
+
+def test_v2_point_id_covers_every_workload_dimension() -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    payload = {
+        "workload_family": "homogeneous",
+        "selector": "b2-t512",
+        "requests": [{
+            "request_key": "r0",
+            "trajectory_id": None,
+            "turn_index": None,
+            "reasoning_mode": None,
+            "context_tokens": 4608,
+            "cached_tokens": 4096,
+            "new_tokens": 512,
+            "token_digest": "a" * 64,
+        }],
+        "composition": "none",
+        "seed": 20260715,
+        "batch_size": 1,
+        "chunk_budget": 4096,
+        "cache_condition": "prefix_hit",
+        "block_size": 16,
+        "homogeneous_prefix_tokens": 4096,
+        "capacity_target": "native",
+        "planner_digest": "b" * 64,
+        "planned_chunks": [{
+            "chunk_index": 0,
+            "scheduled_tokens_by_request": [["r0", 512]],
+        }],
+    }
+    original = profile_spine.make_point_id(payload)
+    changed = copy.deepcopy(payload)
+    changed["requests"][0]["cached_tokens"] = 4080
+    assert original.startswith("p2-")
+    assert profile_spine.make_point_id(changed) != original
+    assert profile_spine.make_comparison_id(
+        payload
+    ) == profile_spine.make_comparison_id(
+        {
+            **payload,
+            "cache_condition": "full_recompute",
+            "planned_chunks": [
+                {"chunk_index": 0, "scheduled_tokens_by_request": [["r0", 4096]]},
+                {"chunk_index": 1, "scheduled_tokens_by_request": [["r0", 512]]},
+            ],
+        }
+    )
+    changed_chunk = copy.deepcopy(payload)
+    changed_chunk["planned_chunks"][0]["scheduled_tokens_by_request"][0][1] = 511
+    assert profile_spine.make_point_id(changed_chunk) != original
+    changed_planner = {**payload, "planner_digest": "c" * 64}
+    assert profile_spine.make_point_id(changed_planner) != original
+
+
+def _v2_row(schema: pa.Schema, **values: object) -> dict[str, object]:
+    row: dict[str, object] = {}
+    for field in schema:
+        if pa.types.is_string(field.type):
+            row[field.name] = ""
+        elif pa.types.is_boolean(field.type):
+            row[field.name] = False
+        elif pa.types.is_integer(field.type):
+            row[field.name] = 0
+        elif pa.types.is_floating(field.type):
+            row[field.name] = 0.0
+        elif pa.types.is_list(field.type):
+            row[field.name] = []
+        else:
+            raise AssertionError(f"fixture default missing for {field}")
+    row.update(values)
+    return row
+
+
+def _write_v2_result(tmp_path: Path) -> Path:
+    from benchmarks.ds4_profile import profile_spine
+
+    output_dir = tmp_path / "v2-result"
+    output_dir.mkdir()
+    points = []
+    for index in range(34):
+        for cache_condition in ("prefix_hit", "full_recompute"):
+            payload = {
+                "workload_family": "homogeneous",
+                "selector": f"fixture-{index}",
+                "requests": [{
+                    "request_key": "r0",
+                    "trajectory_id": None,
+                    "turn_index": None,
+                    "reasoning_mode": None,
+                    "context_tokens": 512,
+                    "cached_tokens": 0,
+                    "new_tokens": 512,
+                    "token_digest": f"{index:064x}",
+                }],
+                "composition": "none",
+                "seed": 1,
+                "batch_size": 1,
+                "chunk_budget": 4096,
+                "cache_condition": cache_condition,
+                "block_size": 16,
+                "homogeneous_prefix_tokens": 4096,
+                "capacity_target": "native",
+                "planner_digest": "b" * 64,
+                "planned_chunks": [{
+                    "chunk_index": 0,
+                    "scheduled_tokens_by_request": [["r0", 512]],
+                }],
+            }
+            points.append(
+                {
+                    "point_id": profile_spine.make_point_id(payload),
+                    "comparison_id": profile_spine.make_comparison_id(payload),
+                    "canonical_payload": payload,
+                }
+            )
+    point_ids = [point["point_id"] for point in points]
+    config = {
+        "schema_version": "2.0.0",
+        "run_id": "v2-fixture",
+        "run_kind": "full",
+        "points": points,
+        "canonical_full_manifest": point_ids,
+        "expected_manifest": point_ids,
+        "profile": {"noisy_cv_threshold": 0.05},
+    }
+    raw_rows = []
+    turn_rows = []
+    evidence_rows = []
+    aggregate_rows = []
+    for point in points:
+        payload = point["canonical_payload"]
+        for phase, count in (("warmup", 3), ("steady", 10)):
+            for ordinal in range(count):
+                elapsed = 1.0 if phase == "warmup" else 10.0 + ordinal
+                raw_rows.append(
+                    _v2_row(
+                        profile_spine.V2_RAW_SAMPLE_SCHEMA,
+                        schema_version="2.0.0",
+                        run_id="v2-fixture",
+                        point_id=point["point_id"],
+                        comparison_id=point["comparison_id"],
+                        sample_id=(
+                            f"v2-fixture:{point['point_id']}:{phase}:{ordinal}:0"
+                        ),
+                        role="prefill",
+                        workload_family="homogeneous",
+                        selector=payload["selector"],
+                        composition="none",
+                        cache_condition=payload["cache_condition"],
+                        planner_digest=payload["planner_digest"],
+                        phase=phase,
+                        ordinal=ordinal,
+                        chunk_count=1,
+                        row_kind="chunk",
+                        status="passed",
+                        allocation_state="allocated",
+                        planned_scheduled_tokens_by_request=[
+                            {"request_key": "r0", "scheduled_tokens": 512}
+                        ],
+                        actual_scheduled_tokens_by_request=[
+                            {"request_key": "r0", "scheduled_tokens": 512}
+                        ],
+                        cache_reset_completed=True,
+                        cache_reset_empty=True,
+                        requested_kv_blocks=1,
+                        allocatable_kv_blocks=1,
+                        allocated_kv_blocks=1,
+                        kv_block_bytes=1,
+                        requested_kv_bytes=1,
+                        allocated_kv_bytes=1,
+                        scheduled_tokens=512,
+                        context_tokens=512,
+                        new_tokens=512,
+                        runner_wall_time_ms=elapsed,
+                        cuda_model_time_ms=elapsed,
+                        runtime_mode="FULL",
+                    )
+                )
+                turn_rows.append(
+                    _v2_row(
+                        profile_spine.V2_TURN_SAMPLE_SCHEMA,
+                        schema_version="2.0.0",
+                        run_id="v2-fixture",
+                        point_id=point["point_id"],
+                        comparison_id=point["comparison_id"],
+                        sample_id=f"v2-fixture:{point['point_id']}:{phase}:{ordinal}",
+                        role="prefill",
+                        workload_family="homogeneous",
+                        selector=payload["selector"],
+                        composition="none",
+                        cache_condition=payload["cache_condition"],
+                        planner_digest=payload["planner_digest"],
+                        phase=phase,
+                        ordinal=ordinal,
+                        status="passed",
+                        allocation_state="allocated",
+                        chunk_count=1,
+                        scheduled_tokens=512,
+                        context_tokens=512,
+                        new_tokens=512,
+                        requested_kv_blocks=1,
+                        allocated_kv_blocks=1,
+                        requested_kv_bytes=1,
+                        allocated_kv_bytes=1,
+                        runner_wall_time_ms=elapsed,
+                        cuda_model_time_ms=elapsed,
+                        throughput_tokens_per_s=100.0 + ordinal,
+                        runtime_mode="FULL",
+                    )
+                )
+                if payload["cache_condition"] == "prefix_hit":
+                    evidence_rows.append(
+                        _v2_row(
+                            profile_spine.V2_PREFIX_EVIDENCE_SCHEMA,
+                            schema_version="2.0.0",
+                            run_id="v2-fixture",
+                            point_id=point["point_id"],
+                            phase=phase,
+                            ordinal=ordinal,
+                            request_key="r0",
+                            kv_cache_group="0",
+                            prime_completed=True,
+                            prime_synchronized=True,
+                        )
+                    )
+        values = list(range(10, 20))
+        throughput = list(range(100, 110))
+        mean = sum(values) / len(values)
+        throughput_mean = sum(throughput) / len(throughput)
+        aggregate_rows.append(
+            _v2_row(
+                profile_spine.V2_AGGREGATE_SCHEMA,
+                schema_version="2.0.0",
+                run_id="v2-fixture",
+                point_id=point["point_id"],
+                comparison_id=point["comparison_id"],
+                role="prefill",
+                sample_count=10,
+                runner_wall_time_median_ms=14.5,
+                runner_wall_time_p90_ms=18.1,
+                runner_wall_time_mean_ms=mean,
+                runner_wall_time_cv=statistics.pstdev(values) / mean,
+                throughput_median_tokens_per_s=104.5,
+                throughput_p90_tokens_per_s=108.1,
+                throughput_mean_tokens_per_s=throughput_mean,
+                throughput_cv=statistics.pstdev(throughput) / throughput_mean,
+            )
+        )
+    comparison_rows = []
+    for index in range(34):
+        hit = points[2 * index]
+        miss = points[2 * index + 1]
+        comparison_rows.append(
+            _v2_row(
+                profile_spine.V2_COMPARISON_SCHEMA,
+                schema_version="2.0.0",
+                run_id="v2-fixture",
+                comparison_id=hit["comparison_id"],
+                prefix_hit_point_id=hit["point_id"],
+                full_recompute_point_id=miss["point_id"],
+                prefix_hit_median_ms=14.5,
+                full_recompute_median_ms=14.5,
+                recompute_penalty_ms=0.0,
+                recompute_penalty_ratio=1.0,
+            )
+        )
+    for name, rows, schema in (
+        ("raw_samples.parquet", raw_rows, profile_spine.V2_RAW_SAMPLE_SCHEMA),
+        ("turn_samples.parquet", turn_rows, profile_spine.V2_TURN_SAMPLE_SCHEMA),
+        ("aggregates.parquet", aggregate_rows, profile_spine.V2_AGGREGATE_SCHEMA),
+        ("comparisons.parquet", comparison_rows, profile_spine.V2_COMPARISON_SCHEMA),
+        (
+            "prefix_evidence.parquet",
+            evidence_rows,
+            profile_spine.V2_PREFIX_EVIDENCE_SCHEMA,
+        ),
+    ):
+        pq.write_table(pa.Table.from_pylist(rows, schema=schema), output_dir / name)
+    (output_dir / "run-config.json").write_text(json.dumps(config))
+    (output_dir / "provenance.json").write_text(json.dumps({"run_id": "v2-fixture"}))
+    (output_dir / "result.md").write_text("fixture\n")
+    return output_dir
+
+
+def test_v1_result_still_validates(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    config_path = _write_fixture_inputs(tmp_path)
+    output_dir = tmp_path / "v1-result"
+    profile_spine._write_fixture_result(config_path, output_dir)
+    profile_spine._validate_result_dir(output_dir)
+
+
+def test_v2_validator_rejects_unknown_schema_version(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    output_dir = _write_v2_result(tmp_path)
+    config = json.loads((output_dir / "run-config.json").read_text())
+    config["schema_version"] = "3.0.0"
+    (output_dir / "run-config.json").write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="unsupported schema_version"):
+        profile_spine._validate_result_dir(output_dir)
+
+
+def test_v2_validator_rejects_each_unknown_enum(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    output_dir = _write_v2_result(tmp_path)
+    raw = pq.read_table(output_dir / "raw_samples.parquet").to_pylist()
+    raw[0]["role"] = "decode"
+    pq.write_table(
+        pa.Table.from_pylist(raw, schema=profile_spine.V2_RAW_SAMPLE_SCHEMA),
+        output_dir / "raw_samples.parquet",
+    )
+    with pytest.raises(ValueError, match="unknown role"):
+        profile_spine._validate_result_dir(output_dir)
+
+
+def test_v2_validator_recomputes_aggregate_statistics(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    output_dir = _write_v2_result(tmp_path)
+    aggregates = pq.read_table(output_dir / "aggregates.parquet").to_pylist()
+    aggregates[0]["runner_wall_time_median_ms"] = 1.0
+    pq.write_table(
+        pa.Table.from_pylist(aggregates, schema=profile_spine.V2_AGGREGATE_SCHEMA),
+        output_dir / "aggregates.parquet",
+    )
+    with pytest.raises(
+        ValueError, match="aggregate statistics do not match turn samples"
+    ):
+        profile_spine._validate_result_dir(output_dir)
+
+
+def test_v2_validator_requires_exact_manifest_and_coordinates(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    output_dir = _write_v2_result(tmp_path)
+    raw = pq.read_table(output_dir / "raw_samples.parquet").to_pylist()
+    raw.pop(0)
+    pq.write_table(
+        pa.Table.from_pylist(raw, schema=profile_spine.V2_RAW_SAMPLE_SCHEMA),
+        output_dir / "raw_samples.parquet",
+    )
+    with pytest.raises(ValueError, match="exact planned chunk coordinates"):
+        profile_spine._validate_result_dir(output_dir)
 
 
 def _fake_gpu_worker(

@@ -3,7 +3,9 @@
 
 import argparse
 import copy
+import hashlib
 import json
+import math
 import statistics
 import sys
 import tempfile
@@ -13,7 +15,24 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-SCHEMA_VERSION = "1.0.0"
+V1_SCHEMA_VERSION = "1.0.0"
+V2_SCHEMA_VERSION = "2.0.0"
+SUPPORTED_SCHEMA_VERSIONS = frozenset({V1_SCHEMA_VERSION, V2_SCHEMA_VERSION})
+V2_ENUMS = {
+    "role": frozenset({"prefill"}),
+    "run_kind": frozenset({"full", "smoke"}),
+    "workload_family": frozenset({"homogeneous", "mixed", "exact_replay"}),
+    "cache_condition": frozenset({"prefix_hit", "full_recompute"}),
+    "composition": frozenset({"none", "similar", "random", "high_skew"}),
+    "phase": frozenset({"warmup", "steady"}),
+    "row_kind": frozenset({"chunk", "terminal"}),
+    "runtime_mode": frozenset({"FULL", "PIECEWISE"}),
+    "status": frozenset({"passed", "out_of_capacity", "failed"}),
+    "allocation_state": frozenset({"allocated", "out_of_capacity", "failed"}),
+}
+
+# Kept as an alias for the Ticket 04 writer and its public helper functions.
+SCHEMA_VERSION = V1_SCHEMA_VERSION
 
 RAW_SAMPLE_SCHEMA = pa.schema(
     [
@@ -46,6 +65,8 @@ RAW_SAMPLE_SCHEMA = pa.schema(
     metadata={b"schema_version": SCHEMA_VERSION.encode()},
 )
 
+V1_RAW_SAMPLE_SCHEMA = RAW_SAMPLE_SCHEMA
+
 AGGREGATE_SCHEMA = pa.schema(
     [
         pa.field("schema_version", pa.string(), nullable=False),
@@ -60,6 +81,201 @@ AGGREGATE_SCHEMA = pa.schema(
         pa.field("noisy", pa.bool_(), nullable=False),
     ],
     metadata={b"schema_version": SCHEMA_VERSION.encode()},
+)
+
+V1_AGGREGATE_SCHEMA = AGGREGATE_SCHEMA
+
+
+def canonical_payload_json(payload: dict[str, Any]) -> str:
+    """Return the canonical JSON representation used by v2 identifiers."""
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _identifier(prefix: str, payload: dict[str, Any]) -> str:
+    digest = hashlib.sha256(canonical_payload_json(payload).encode()).hexdigest()
+    return f"{prefix}-{digest}"
+
+
+def make_point_id(payload: dict[str, Any]) -> str:
+    """Return the deterministic identifier for one condition-specific point."""
+    return _identifier("p2", payload)
+
+
+def make_comparison_id(payload: dict[str, Any]) -> str:
+    """Return the deterministic identifier shared by a hit/recompute pair."""
+    comparison = copy.deepcopy(payload)
+    comparison.pop("cache_condition")
+    comparison.pop("planned_chunks")
+    return _identifier("pc2", comparison)
+
+
+_V2_METADATA = {b"schema_version": V2_SCHEMA_VERSION.encode()}
+_REQUEST_TOKEN_VECTOR = pa.list_(
+    pa.struct(
+        [
+            pa.field("request_key", pa.string(), nullable=False),
+            pa.field("scheduled_tokens", pa.int32(), nullable=False),
+        ]
+    )
+)
+_INT_LIST = pa.list_(pa.int32())
+_STRING_LIST = pa.list_(pa.string())
+_SHAPE = pa.list_(pa.int64())
+
+
+def _v2_schema(fields: list[pa.Field]) -> pa.Schema:
+    return pa.schema(fields, metadata=_V2_METADATA)
+
+
+V2_RAW_SAMPLE_SCHEMA = _v2_schema(
+    [
+        pa.field("schema_version", pa.string(), nullable=False),
+        pa.field("run_id", pa.string(), nullable=False),
+        pa.field("point_id", pa.string(), nullable=False),
+        pa.field("comparison_id", pa.string(), nullable=False),
+        pa.field("sample_id", pa.string(), nullable=False),
+        pa.field("role", pa.string(), nullable=False),
+        pa.field("workload_family", pa.string(), nullable=False),
+        pa.field("selector", pa.string(), nullable=False),
+        pa.field("composition", pa.string(), nullable=False),
+        pa.field("cache_condition", pa.string(), nullable=False),
+        pa.field("planner_digest", pa.string(), nullable=False),
+        pa.field("phase", pa.string(), nullable=False),
+        pa.field("ordinal", pa.int32(), nullable=False),
+        pa.field("chunk_index", pa.int32(), nullable=False),
+        pa.field("chunk_count", pa.int32(), nullable=False),
+        pa.field("row_kind", pa.string(), nullable=False),
+        pa.field("status", pa.string(), nullable=False),
+        pa.field("allocation_state", pa.string(), nullable=False),
+        pa.field(
+            "planned_scheduled_tokens_by_request",
+            _REQUEST_TOKEN_VECTOR,
+            nullable=False,
+        ),
+        pa.field(
+            "actual_scheduled_tokens_by_request",
+            _REQUEST_TOKEN_VECTOR,
+            nullable=False,
+        ),
+        pa.field("preempted_request_ids", _STRING_LIST, nullable=False),
+        pa.field("unrelated_request_ids", _STRING_LIST, nullable=False),
+        pa.field("cache_epoch", pa.int64(), nullable=False),
+        pa.field("cache_reset_completed", pa.bool_(), nullable=False),
+        pa.field("cache_reset_empty", pa.bool_(), nullable=False),
+        pa.field("requested_kv_blocks", pa.int32(), nullable=False),
+        pa.field("allocatable_kv_blocks", pa.int32(), nullable=False),
+        pa.field("allocated_kv_blocks", pa.int32(), nullable=False),
+        pa.field("kv_block_bytes", pa.int64(), nullable=False),
+        pa.field("requested_kv_bytes", pa.int64(), nullable=False),
+        pa.field("allocated_kv_bytes", pa.int64(), nullable=False),
+        pa.field("scheduled_tokens", pa.int32(), nullable=False),
+        pa.field("context_tokens", pa.int32(), nullable=False),
+        pa.field("cached_tokens", pa.int32(), nullable=False),
+        pa.field("new_tokens", pa.int32(), nullable=False),
+        pa.field("recomputed_tokens", pa.int32(), nullable=False),
+        pa.field("lookup_time_ms", pa.float64()),
+        pa.field("allocation_time_ms", pa.float64()),
+        pa.field("runner_wall_time_ms", pa.float64()),
+        pa.field("cuda_model_time_ms", pa.float64()),
+        pa.field("runtime_mode", pa.string()),
+        pa.field("error", pa.string()),
+    ]
+)
+
+V2_TURN_SAMPLE_SCHEMA = _v2_schema(
+    [
+        pa.field("schema_version", pa.string(), nullable=False),
+        pa.field("run_id", pa.string(), nullable=False),
+        pa.field("point_id", pa.string(), nullable=False),
+        pa.field("comparison_id", pa.string(), nullable=False),
+        pa.field("sample_id", pa.string(), nullable=False),
+        pa.field("role", pa.string(), nullable=False),
+        pa.field("workload_family", pa.string(), nullable=False),
+        pa.field("selector", pa.string(), nullable=False),
+        pa.field("composition", pa.string(), nullable=False),
+        pa.field("cache_condition", pa.string(), nullable=False),
+        pa.field("planner_digest", pa.string(), nullable=False),
+        pa.field("phase", pa.string(), nullable=False),
+        pa.field("ordinal", pa.int32(), nullable=False),
+        pa.field("status", pa.string(), nullable=False),
+        pa.field("allocation_state", pa.string(), nullable=False),
+        pa.field("chunk_count", pa.int32(), nullable=False),
+        pa.field("scheduled_tokens", pa.int32(), nullable=False),
+        pa.field("context_tokens", pa.int32(), nullable=False),
+        pa.field("cached_tokens", pa.int32(), nullable=False),
+        pa.field("new_tokens", pa.int32(), nullable=False),
+        pa.field("recomputed_tokens", pa.int32(), nullable=False),
+        pa.field("requested_kv_blocks", pa.int32(), nullable=False),
+        pa.field("allocated_kv_blocks", pa.int32(), nullable=False),
+        pa.field("requested_kv_bytes", pa.int64(), nullable=False),
+        pa.field("allocated_kv_bytes", pa.int64(), nullable=False),
+        pa.field("lookup_time_ms", pa.float64(), nullable=False),
+        pa.field("allocation_time_ms", pa.float64(), nullable=False),
+        pa.field("runner_wall_time_ms", pa.float64(), nullable=False),
+        pa.field("cuda_model_time_ms", pa.float64(), nullable=False),
+        pa.field("throughput_tokens_per_s", pa.float64(), nullable=False),
+        pa.field("runtime_mode", pa.string(), nullable=False),
+    ]
+)
+
+V2_AGGREGATE_SCHEMA = _v2_schema(
+    [
+        pa.field("schema_version", pa.string(), nullable=False),
+        pa.field("run_id", pa.string(), nullable=False),
+        pa.field("point_id", pa.string(), nullable=False),
+        pa.field("comparison_id", pa.string(), nullable=False),
+        pa.field("role", pa.string(), nullable=False),
+        pa.field("sample_count", pa.int32(), nullable=False),
+        pa.field("runner_wall_time_median_ms", pa.float64(), nullable=False),
+        pa.field("runner_wall_time_p90_ms", pa.float64(), nullable=False),
+        pa.field("runner_wall_time_mean_ms", pa.float64(), nullable=False),
+        pa.field("runner_wall_time_cv", pa.float64(), nullable=False),
+        pa.field("throughput_median_tokens_per_s", pa.float64(), nullable=False),
+        pa.field("throughput_p90_tokens_per_s", pa.float64(), nullable=False),
+        pa.field("throughput_mean_tokens_per_s", pa.float64(), nullable=False),
+        pa.field("throughput_cv", pa.float64(), nullable=False),
+        pa.field("noisy", pa.bool_(), nullable=False),
+    ]
+)
+
+V2_COMPARISON_SCHEMA = _v2_schema(
+    [
+        pa.field("schema_version", pa.string(), nullable=False),
+        pa.field("run_id", pa.string(), nullable=False),
+        pa.field("comparison_id", pa.string(), nullable=False),
+        pa.field("prefix_hit_point_id", pa.string(), nullable=False),
+        pa.field("full_recompute_point_id", pa.string(), nullable=False),
+        pa.field("prefix_hit_median_ms", pa.float64(), nullable=False),
+        pa.field("full_recompute_median_ms", pa.float64(), nullable=False),
+        pa.field("recompute_penalty_ms", pa.float64(), nullable=False),
+        pa.field("recompute_penalty_ratio", pa.float64(), nullable=False),
+    ]
+)
+
+V2_PREFIX_EVIDENCE_SCHEMA = _v2_schema(
+    [
+        pa.field("schema_version", pa.string(), nullable=False),
+        pa.field("run_id", pa.string(), nullable=False),
+        pa.field("point_id", pa.string(), nullable=False),
+        pa.field("phase", pa.string(), nullable=False),
+        pa.field("ordinal", pa.int32(), nullable=False),
+        pa.field("request_key", pa.string(), nullable=False),
+        pa.field("kv_cache_group", pa.string(), nullable=False),
+        pa.field("prime_scheduler_block_ids", _INT_LIST, nullable=False),
+        pa.field("measured_scheduler_block_ids", _INT_LIST, nullable=False),
+        pa.field("live_kv_tensor_names", _STRING_LIST, nullable=False),
+        pa.field("live_kv_tensor_devices", _STRING_LIST, nullable=False),
+        pa.field("live_kv_tensor_shapes", pa.list_(_SHAPE), nullable=False),
+        pa.field("block_axis", pa.int32(), nullable=False),
+        pa.field("block_dimension", pa.int32(), nullable=False),
+        pa.field("verified_physical_block_ids", _INT_LIST, nullable=False),
+        pa.field("intended_cached_tokens", pa.int32(), nullable=False),
+        pa.field("actual_cached_tokens", pa.int32(), nullable=False),
+        pa.field("prime_completed", pa.bool_(), nullable=False),
+        pa.field("prime_synchronized", pa.bool_(), nullable=False),
+        pa.field("live_cuda_tensor_proven", pa.bool_(), nullable=False),
+        pa.field("hardware_validated", pa.bool_(), nullable=False),
+    ]
 )
 
 
@@ -395,7 +611,7 @@ def _write_result_artifacts(
             path.replace(output_dir / path.name)
 
 
-def _validate_result_dir(result_dir: Path) -> None:
+def _validate_v1_result_dir(result_dir: Path, config: dict[str, Any]) -> None:
     required_files = {
         "aggregates.parquet",
         "provenance.json",
@@ -418,7 +634,6 @@ def _validate_result_dir(result_dir: Path) -> None:
 
     raw_rows = raw.to_pylist()
     aggregate_rows = aggregates.to_pylist()
-    config = json.loads((result_dir / "run-config.json").read_text())
     provenance = json.loads((result_dir / "provenance.json").read_text())
     run_id = config["run_id"]
     observed_run_ids = {row["run_id"] for row in raw_rows + aggregate_rows} | {
@@ -461,6 +676,560 @@ def _validate_result_dir(result_dir: Path) -> None:
             raise ValueError(
                 f"sample_count mismatch for point_id {aggregate['point_id']}"
             )
+
+
+def _v2_required_files() -> set[str]:
+    return {
+        "aggregates.parquet",
+        "comparisons.parquet",
+        "prefix_evidence.parquet",
+        "provenance.json",
+        "raw_samples.parquet",
+        "result.md",
+        "run-config.json",
+        "turn_samples.parquet",
+    }
+
+
+def _validate_v2_schema(path: Path, expected: pa.Schema) -> list[dict[str, Any]]:
+    table = pq.read_table(path)
+    if table.schema != expected:
+        raise ValueError(f"{path.name} does not match the versioned schema")
+    rows = table.to_pylist()
+    if any(row.get("schema_version") != V2_SCHEMA_VERSION for row in rows):
+        raise ValueError(f"{path.name} contains a non-v2 row")
+    return rows
+
+
+def _payload_for_manifest_point(point: dict[str, Any]) -> dict[str, Any]:
+    payload = point.get("canonical_payload", point.get("payload", point))
+    if not isinstance(payload, dict):
+        raise ValueError("manifest point payload must be an object")
+    return payload
+
+
+def _manifest_points(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    points = config.get("points")
+    if not isinstance(points, list):
+        raise ValueError("v2 run-config.json requires points")
+    resolved: dict[str, dict[str, Any]] = {}
+    for point in points:
+        if not isinstance(point, dict):
+            raise ValueError("manifest points must be objects")
+        payload = _payload_for_manifest_point(point)
+        point_id = point.get("point_id", payload.get("point_id"))
+        comparison_id = point.get("comparison_id", payload.get("comparison_id"))
+        if not isinstance(point_id, str) or point_id != make_point_id(payload):
+            raise ValueError("manifest point_id does not match canonical payload")
+        if (
+            not isinstance(comparison_id, str)
+            or comparison_id != make_comparison_id(payload)
+        ):
+            raise ValueError("manifest comparison_id does not match canonical payload")
+        if point_id in resolved:
+            raise ValueError("manifest point_id values must be unique")
+        resolved[point_id] = {
+            "payload": payload,
+            "comparison_id": comparison_id,
+        }
+    return resolved
+
+
+def _manifest_id_set(value: Any, name: str) -> set[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{name} must be a list of point IDs")
+    identifiers = set(value)
+    if len(identifiers) != len(value):
+        raise ValueError(f"{name} must not contain duplicate point IDs")
+    return identifiers
+
+
+def _smoke_selectors(config: dict[str, Any]) -> set[str]:
+    selectors = config.get("smoke_selectors")
+    if selectors is None and isinstance(config.get("smoke"), dict):
+        selectors = config["smoke"].get("selectors")
+    if not isinstance(selectors, list) or not all(
+        isinstance(selector, str) for selector in selectors
+    ):
+        raise ValueError("smoke runs require configured smoke_selectors")
+    return set(selectors)
+
+
+def _planned_chunks(payload: dict[str, Any]) -> list[list[dict[str, Any]]]:
+    chunks = payload.get("planned_chunks")
+    if not isinstance(chunks, list) or not chunks:
+        raise ValueError("manifest point requires planned_chunks")
+    expected = []
+    for index, chunk in enumerate(chunks):
+        if not isinstance(chunk, dict) or chunk.get("chunk_index") != index:
+            raise ValueError("planned chunks must have contiguous chunk_index values")
+        vector = chunk.get("scheduled_tokens_by_request")
+        if isinstance(vector, dict):
+            vector = list(vector.items())
+        if not isinstance(vector, list):
+            raise ValueError("planned chunk requires a request-token vector")
+        normalized = []
+        for item in vector:
+            if isinstance(item, dict):
+                request_key = item.get("request_key")
+                scheduled_tokens = item.get("scheduled_tokens")
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                request_key, scheduled_tokens = item
+            else:
+                raise ValueError("invalid planned request-token vector")
+            if not isinstance(request_key, str) or not isinstance(
+                scheduled_tokens, int
+            ):
+                raise ValueError("invalid planned request-token value")
+            normalized.append(
+                {
+                    "request_key": request_key,
+                    "scheduled_tokens": scheduled_tokens,
+                }
+            )
+        expected.append(normalized)
+    return expected
+
+
+def _raw_sample_id(row: dict[str, Any]) -> str:
+    return (
+        f"{row['run_id']}:{row['point_id']}:{row['phase']}:"
+        f"{row['ordinal']}:{row['chunk_index']}"
+    )
+
+
+def _turn_sample_id(row: dict[str, Any]) -> str:
+    return f"{row['run_id']}:{row['point_id']}:{row['phase']}:{row['ordinal']}"
+
+
+def _require_v2_enums(rows: list[dict[str, Any]], path_name: str) -> None:
+    for row in rows:
+        for field, allowed in V2_ENUMS.items():
+            if field not in row or row[field] is None:
+                continue
+            if row[field] not in allowed:
+                raise ValueError(f"unknown {field} in {path_name}: {row[field]}")
+
+
+def _same_float(actual: float, expected: float) -> bool:
+    return math.isclose(actual, expected, rel_tol=1e-9, abs_tol=1e-9)
+
+
+def _validate_v2_evidence(
+    rows: list[dict[str, Any]],
+    expected_points: dict[str, dict[str, Any]],
+    outcomes: dict[str, str],
+) -> None:
+    observed: set[tuple[str, str, int, str, str]] = set()
+    for row in rows:
+        point_id = row["point_id"]
+        if point_id not in expected_points:
+            raise ValueError("prefix evidence references an unknown point")
+        if row["phase"] not in V2_ENUMS["phase"]:
+            raise ValueError("prefix evidence has an unknown phase")
+        key = (
+            point_id,
+            row["phase"],
+            row["ordinal"],
+            row["request_key"],
+            row["kv_cache_group"],
+        )
+        if key in observed:
+            raise ValueError("duplicate prefix evidence for a request repetition")
+        observed.add(key)
+        if row["hardware_validated"]:
+            if not (
+                row["prime_completed"]
+                and row["prime_synchronized"]
+                and row["live_cuda_tensor_proven"]
+            ):
+                raise ValueError("hardware-validated prefix evidence lacks live proof")
+            shapes = row["live_kv_tensor_shapes"]
+            devices = row["live_kv_tensor_devices"]
+            if not shapes or len(shapes) != len(devices) or set(devices) != {"cuda:0"}:
+                raise ValueError("hardware-validated prefix evidence is not on cuda:0")
+            dimension = row["block_dimension"]
+            axis = row["block_axis"]
+            if dimension <= 0 or any(
+                axis < 0 or axis >= len(shape) for shape in shapes
+            ):
+                raise ValueError("prefix evidence has an invalid block axis")
+            if any(shape[axis] != dimension for shape in shapes):
+                raise ValueError("prefix evidence has inconsistent block dimensions")
+            if any(
+                block_id < 0 or block_id >= dimension
+                for block_id in row["verified_physical_block_ids"]
+            ):
+                raise ValueError("prefix evidence has an invalid physical block ID")
+
+    for point_id, point in expected_points.items():
+        payload = point["payload"]
+        if (
+            payload.get("cache_condition") != "prefix_hit"
+            or outcomes.get(point_id) != "passed"
+        ):
+            continue
+        request_keys = {
+            request["request_key"] for request in payload.get("requests", [])
+        }
+        for phase in ("warmup", "steady"):
+            for ordinal in range(3 if phase == "warmup" else 10):
+                present = {
+                    request_key
+                    for row_point_id, row_phase, row_ordinal, request_key, _ in observed
+                    if (row_point_id, row_phase, row_ordinal)
+                    == (point_id, phase, ordinal)
+                }
+                if present != request_keys:
+                    raise ValueError(
+                        "missing prefix evidence for a completed hit repetition"
+                    )
+
+
+def _validate_v2_statistics(
+    turn_rows: list[dict[str, Any]], aggregate_rows: list[dict[str, Any]],
+    expected_points: dict[str, dict[str, Any]], config: dict[str, Any]
+) -> None:
+    aggregate_by_point = {row["point_id"]: row for row in aggregate_rows}
+    if len(aggregate_by_point) != len(aggregate_rows):
+        raise ValueError("aggregate point_id values must be unique")
+    threshold = config.get("profile", {}).get("noisy_cv_threshold", 0.05)
+    for point_id in expected_points:
+        steady = [
+            row for row in turn_rows
+            if row["point_id"] == point_id and row["phase"] == "steady"
+        ]
+        aggregate = aggregate_by_point.get(point_id)
+        if not steady:
+            if aggregate is not None:
+                raise ValueError("out-of-capacity point must not have an aggregate")
+            continue
+        if aggregate is None:
+            raise ValueError("passed point is missing an aggregate")
+        values = [row["runner_wall_time_ms"] for row in steady]
+        throughput = [row["throughput_tokens_per_s"] for row in steady]
+        mean = statistics.fmean(values)
+        throughput_mean = statistics.fmean(throughput)
+        expected = {
+            "sample_count": len(values),
+            "runner_wall_time_median_ms": statistics.median(values),
+            "runner_wall_time_p90_ms": statistics.quantiles(
+                values, n=10, method="inclusive"
+            )[8],
+            "runner_wall_time_mean_ms": mean,
+            "runner_wall_time_cv": statistics.pstdev(values) / mean if mean else 0.0,
+            "throughput_median_tokens_per_s": statistics.median(throughput),
+            "throughput_p90_tokens_per_s": statistics.quantiles(
+                throughput, n=10, method="inclusive"
+            )[8],
+            "throughput_mean_tokens_per_s": throughput_mean,
+            "throughput_cv": (
+                statistics.pstdev(throughput) / throughput_mean
+                if throughput_mean
+                else 0.0
+            ),
+        }
+        if aggregate["sample_count"] != expected["sample_count"] or any(
+            not _same_float(aggregate[field], value)
+            for field, value in expected.items()
+            if field != "sample_count"
+        ) or aggregate["noisy"] != (expected["runner_wall_time_cv"] > threshold):
+            raise ValueError("aggregate statistics do not match turn samples")
+    if set(aggregate_by_point) - set(expected_points):
+        raise ValueError("aggregate references an unknown point")
+
+
+def _validate_v2_comparisons(
+    rows: list[dict[str, Any]], aggregate_rows: list[dict[str, Any]],
+    outcomes: dict[str, str], expected_points: dict[str, dict[str, Any]],
+) -> None:
+    aggregate_by_point = {row["point_id"]: row for row in aggregate_rows}
+    pairs: dict[str, dict[str, str]] = {}
+    for point_id, point in expected_points.items():
+        condition = point["payload"].get("cache_condition")
+        pairs.setdefault(point["comparison_id"], {})[condition] = point_id
+    if any(set(pair) != {"prefix_hit", "full_recompute"} for pair in pairs.values()):
+        raise ValueError(
+            "manifest comparison pairs must contain one hit and one recompute"
+        )
+    observed: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        comparison_id = row["comparison_id"]
+        if comparison_id in observed or comparison_id not in pairs:
+            raise ValueError("duplicate or unknown comparison")
+        observed[comparison_id] = row
+    for comparison_id, pair in pairs.items():
+        hit = pair["prefix_hit"]
+        recompute = pair["full_recompute"]
+        row = observed.get(comparison_id)
+        if outcomes[hit] == outcomes[recompute] == "passed":
+            if row is None:
+                raise ValueError("passed comparison pair is missing a comparison")
+            if (
+                row["prefix_hit_point_id"] != hit
+                or row["full_recompute_point_id"] != recompute
+            ):
+                raise ValueError("comparison point IDs do not match the manifest")
+            hit_median = aggregate_by_point[hit]["runner_wall_time_median_ms"]
+            recompute_median = aggregate_by_point[recompute][
+                "runner_wall_time_median_ms"
+            ]
+            if not (
+                _same_float(row["prefix_hit_median_ms"], hit_median)
+                and _same_float(row["full_recompute_median_ms"], recompute_median)
+                and _same_float(
+                    row["recompute_penalty_ms"], recompute_median - hit_median
+                )
+                and _same_float(
+                    row["recompute_penalty_ratio"], recompute_median / hit_median
+                )
+            ):
+                raise ValueError("comparison statistics do not match aggregates")
+        elif row is not None:
+            raise ValueError(
+                "out-of-capacity comparison pair must not have a comparison"
+            )
+
+
+def _validate_v2_result_dir(result_dir: Path, config: dict[str, Any]) -> None:
+    missing = sorted(
+        name for name in _v2_required_files() if not (result_dir / name).is_file()
+    )
+    if missing:
+        raise ValueError(f"missing result artifacts: {', '.join(missing)}")
+    raw_rows = _validate_v2_schema(
+        result_dir / "raw_samples.parquet", V2_RAW_SAMPLE_SCHEMA
+    )
+    turn_rows = _validate_v2_schema(
+        result_dir / "turn_samples.parquet", V2_TURN_SAMPLE_SCHEMA
+    )
+    aggregate_rows = _validate_v2_schema(
+        result_dir / "aggregates.parquet", V2_AGGREGATE_SCHEMA
+    )
+    comparison_rows = _validate_v2_schema(
+        result_dir / "comparisons.parquet", V2_COMPARISON_SCHEMA
+    )
+    evidence_rows = _validate_v2_schema(
+        result_dir / "prefix_evidence.parquet", V2_PREFIX_EVIDENCE_SCHEMA
+    )
+    for rows, name in (
+        (raw_rows, "raw_samples.parquet"),
+        (turn_rows, "turn_samples.parquet"),
+        (aggregate_rows, "aggregates.parquet"),
+        (comparison_rows, "comparisons.parquet"),
+        (evidence_rows, "prefix_evidence.parquet"),
+    ):
+        _require_v2_enums(rows, name)
+    expected_points = _manifest_points(config)
+    canonical_full = _manifest_id_set(
+        config.get("canonical_full_manifest"), "canonical_full_manifest"
+    )
+    if len(canonical_full) != 68 or canonical_full != set(expected_points):
+        raise ValueError(
+            "canonical_full_manifest must be the canonical 68-point manifest"
+        )
+    expected_manifest = _manifest_id_set(
+        config.get("expected_manifest"), "expected_manifest"
+    )
+    run_kind = config.get("run_kind")
+    if run_kind not in V2_ENUMS["run_kind"]:
+        raise ValueError("unknown run_kind")
+    if run_kind == "full" and expected_manifest != canonical_full:
+        raise ValueError("full expected_manifest must equal canonical_full_manifest")
+    if run_kind == "smoke":
+        selectors = _smoke_selectors(config)
+        configured = {
+            point_id
+            for point_id, point in expected_points.items()
+            if point["payload"].get("selector") in selectors
+        }
+        if expected_manifest != configured:
+            raise ValueError("smoke expected_manifest does not match smoke selectors")
+    expected_points = {
+        point_id: expected_points[point_id] for point_id in expected_manifest
+    }
+    provenance = json.loads((result_dir / "provenance.json").read_text())
+    run_id = config.get("run_id")
+    all_rows = raw_rows + turn_rows + aggregate_rows + comparison_rows + evidence_rows
+    observed_run_ids = {row["run_id"] for row in all_rows} | {provenance.get("run_id")}
+    if not isinstance(run_id, str) or observed_run_ids != {run_id}:
+        raise ValueError(
+            f"run_id mismatch: expected {run_id}, found {sorted(observed_run_ids)}"
+        )
+    outcomes: dict[str, str] = {}
+    raw_by_point: dict[str, list[dict[str, Any]]] = {}
+    for row in raw_rows:
+        point_id = row["point_id"]
+        if point_id not in expected_points:
+            raise ValueError("raw sample references an unknown point")
+        point = expected_points[point_id]
+        payload = point["payload"]
+        expected_values = {
+            "role": "prefill",
+            "workload_family": payload.get("workload_family"),
+            "selector": payload.get("selector"),
+            "composition": payload.get("composition"),
+            "cache_condition": payload.get("cache_condition"),
+            "planner_digest": payload.get("planner_digest"),
+        }
+        if row["comparison_id"] != point["comparison_id"] or any(
+            row[field] != value for field, value in expected_values.items()
+        ):
+            raise ValueError("raw sample does not match its manifest point")
+        if row["sample_id"] != _raw_sample_id(row):
+            raise ValueError("raw sample_id does not match its coordinates")
+        raw_by_point.setdefault(point_id, []).append(row)
+    if len({row["sample_id"] for row in raw_rows}) != len(raw_rows):
+        raise ValueError("raw sample_id values must be unique")
+    turn_by_point: dict[str, list[dict[str, Any]]] = {}
+    for row in turn_rows:
+        point_id = row["point_id"]
+        if point_id not in expected_points or row["sample_id"] != _turn_sample_id(row):
+            raise ValueError("turn sample has an unknown point or invalid sample_id")
+        point = expected_points[point_id]
+        if row["comparison_id"] != point["comparison_id"]:
+            raise ValueError("turn sample comparison_id does not match its point")
+        payload = point["payload"]
+        if any(
+            row[field] != value
+            for field, value in {
+                "role": "prefill",
+                "workload_family": payload.get("workload_family"),
+                "selector": payload.get("selector"),
+                "composition": payload.get("composition"),
+                "cache_condition": payload.get("cache_condition"),
+                "planner_digest": payload.get("planner_digest"),
+            }.items()
+        ):
+            raise ValueError("turn sample does not match its manifest point")
+        turn_by_point.setdefault(point_id, []).append(row)
+    if len({row["sample_id"] for row in turn_rows}) != len(turn_rows):
+        raise ValueError("turn sample_id values must be unique")
+    for point_id, point in expected_points.items():
+        chunks = _planned_chunks(point["payload"])
+        raw = sorted(
+            raw_by_point.get(point_id, []),
+            key=lambda row: (
+                0 if row["phase"] == "warmup" else 1,
+                row["ordinal"],
+                row["chunk_index"],
+            ),
+        )
+        expected_coordinates = [
+            (phase, ordinal, chunk_index)
+            for phase, count in (("warmup", 3), ("steady", 10))
+            for ordinal in range(count)
+            for chunk_index in range(len(chunks))
+        ]
+        actual_coordinates = [
+            (row["phase"], row["ordinal"], row["chunk_index"]) for row in raw
+        ]
+        terminal_rows = [row for row in raw if row["row_kind"] == "terminal"]
+        if terminal_rows:
+            if len(terminal_rows) != 1:
+                raise ValueError(
+                    "out-of-capacity point requires exactly one terminal row"
+                )
+            terminal = terminal_rows[0]
+            terminal_coordinate = (
+                terminal["phase"],
+                terminal["ordinal"],
+                terminal["chunk_index"],
+            )
+            terminal_position = (
+                expected_coordinates.index(terminal_coordinate)
+                if terminal_coordinate in expected_coordinates
+                else -1
+            )
+            if (
+                terminal_position < 0
+                or actual_coordinates != expected_coordinates[: terminal_position + 1]
+                or terminal["status"] != "out_of_capacity"
+                or terminal["allocation_state"] != "out_of_capacity"
+            ):
+                raise ValueError(
+                    "terminal out-of-capacity row is not a coordinate prefix"
+                )
+            if any(
+                row["row_kind"] != "chunk" or row["status"] != "passed"
+                for row in raw[:-1]
+            ):
+                raise ValueError("out-of-capacity prefix contains a non-passed chunk")
+            if any(
+                row["planned_scheduled_tokens_by_request"]
+                != chunks[row["chunk_index"]]
+                for row in raw
+            ):
+                raise ValueError("raw chunk does not match the planned vector")
+            if turn_by_point.get(point_id) or any(
+                row["point_id"] == point_id for row in aggregate_rows
+            ):
+                raise ValueError("out-of-capacity point has turn or aggregate rows")
+            outcomes[point_id] = "out_of_capacity"
+            continue
+        if actual_coordinates != expected_coordinates or any(
+            row["row_kind"] != "chunk"
+            or row["status"] != "passed"
+            or row["allocation_state"] != "allocated"
+            for row in raw
+        ):
+            raise ValueError(
+                "passed point does not have exact planned chunk coordinates"
+            )
+        for row in raw:
+            expected_vector = chunks[row["chunk_index"]]
+            if (
+                row["chunk_count"] != len(chunks)
+                or row["planned_scheduled_tokens_by_request"] != expected_vector
+                or row["actual_scheduled_tokens_by_request"] != expected_vector
+                or row["runtime_mode"] not in V2_ENUMS["runtime_mode"]
+            ):
+                raise ValueError("raw chunk does not match the planned vector")
+        turns = turn_by_point.get(point_id, [])
+        if {(row["phase"], row["ordinal"]) for row in turns} != {
+            (phase, ordinal)
+            for phase, count in (("warmup", 3), ("steady", 10))
+            for ordinal in range(count)
+        } or len(turns) != 13:
+            raise ValueError("passed point does not have exact turn coordinates")
+        if any(
+            row["status"] != "passed"
+            or row["allocation_state"] != "allocated"
+            or row["runtime_mode"] not in V2_ENUMS["runtime_mode"]
+            for row in turns
+        ):
+            raise ValueError("passed point has an invalid turn sample")
+        outcomes[point_id] = "passed"
+    for row in aggregate_rows:
+        point_id = row["point_id"]
+        if point_id not in expected_points:
+            raise ValueError("aggregate references an unknown point")
+        point = expected_points[point_id]
+        if row["comparison_id"] != point["comparison_id"] or row["role"] != "prefill":
+            raise ValueError("aggregate does not match its manifest point")
+    if any(
+        row["point_id"] not in expected_points
+        or outcomes.get(row["point_id"]) != "passed"
+        for row in evidence_rows
+    ):
+        raise ValueError("prefix evidence must describe a completed point")
+    _validate_v2_evidence(evidence_rows, expected_points, outcomes)
+    _validate_v2_statistics(turn_rows, aggregate_rows, expected_points, config)
+    _validate_v2_comparisons(comparison_rows, aggregate_rows, outcomes, expected_points)
+
+
+def _validate_result_dir(result_dir: Path) -> None:
+    config_path = result_dir / "run-config.json"
+    if not config_path.is_file():
+        raise ValueError("missing result artifacts: run-config.json")
+    config = json.loads(config_path.read_text())
+    version = config.get("schema_version")
+    if version == V1_SCHEMA_VERSION:
+        _validate_v1_result_dir(result_dir, config)
+    elif version == V2_SCHEMA_VERSION:
+        _validate_v2_result_dir(result_dir, config)
+    else:
+        raise ValueError(f"unsupported schema_version: {version}")
 
 
 def _write_fixture_result(config_path: Path, output_dir: Path) -> None:
