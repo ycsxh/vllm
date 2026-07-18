@@ -14,7 +14,11 @@
 - Local work is limited to focused CPU contract tests and deterministic fixture artifacts; do not load Qwen, initialize CUDA, run a GPU worker, or opt into Ticket 04's GPU test.
 - Full pilot planning and complete container/runtime acceptance run on the school server in the existing Ticket 03 image.
 - The planner and replay consume prompt metadata and prompt token IDs only; they never read completion/decode token IDs, allocate KV tensors, reserve HBM, or make a GPU-residency claim.
-- Use batch size one, serial turn order, block size `16`, SHA-256 chained hashes, one `FullAttentionSpec`, one pinned full trajectory, and one pinned usable capacity. Usable capacity excludes the reserved null block.
+- Use batch size one, serial turn order, block size `16`, SHA-256 chained
+  hashes, `PYTHONHASHSEED=0`, one `FullAttentionSpec`, one pinned full
+  trajectory, and one pinned usable capacity. Initialize vLLM's process-global
+  null hash once at replay/process entry, never once per request. Usable
+  capacity excludes the reserved null block.
 - Exercise the real `Request` and `KVCacheManager` interface. Do not implement an LRU, prefix lookup, allocation, or free-order imitation.
 - Do not modify `benchmarks/ds4_profile/profile_spine.py`, `gpu_profile.py`, `config/profile-spine.json`, or Ticket 05 tests, schemas, point IDs, validators, and runtime behavior.
 - Keep mounted snapshot, Ticket 01/02 artifacts, and tokenizers read-only. Write planning and replay outputs only below the explicit result directory.
@@ -42,7 +46,7 @@ Use these names and types consistently in every task:
 
 ```python
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -59,6 +63,8 @@ Operation = Literal[
     "admission_failure",
 ]
 MissClass = Literal["compulsory", "capacity", "prefix_mismatch"]
+CacheOutcome = Literal["hit", "miss", "manager_forced_recompute"]
+EventSource = Literal["lookup", "observer", "native", "replay"]
 
 
 @dataclass(frozen=True)
@@ -77,10 +83,19 @@ class ReplayTurn:
 
 @dataclass(frozen=True)
 class PoolCall:
-    operation: Literal["touch", "allocate", "free"]
+    operation: Literal["touch", "allocate", "evict", "free"]
     call_ordinal: int
     block_ids: tuple[int, ...]
     duration_ns: int
+    evicted: bool | None
+
+
+@dataclass(frozen=True)
+class InputRecord:
+    logical_name: str
+    path: str
+    size_bytes: int
+    sha256: str
 
 
 @dataclass(frozen=True)
@@ -95,6 +110,7 @@ class ReplayResult:
 The module-level functions used across tasks have these exact signatures:
 
 - `load_full_turns(config: dict[str, Any]) -> list[ReplayTurn]`
+- `_initialize_hashing() -> None`
 - `make_request(turn: ReplayTurn, block_size: int, request_id: str) -> Request`
 - `make_manager(capacity_blocks: int, block_size: int, max_model_len: int) -> KVCacheManager`
 - `observe_block_pool(manager: KVCacheManager) -> Iterator[list[PoolCall]]`
@@ -103,6 +119,8 @@ The module-level functions used across tasks have these exact signatures:
 - `verify_pinned_selection(config: dict[str, Any], plan: dict[str, Any]) -> None`
 - `write_result(config: dict[str, Any], result: ReplayResult, output_dir: Path) -> None`
 - `validate_result_dir(result_dir: Path) -> None`
+- `collect_input_records(config: dict[str, Any]) -> list[InputRecord]`
+- `verify_input_records(records: Sequence[InputRecord]) -> None`
 - `_out_of_capacity_result(*, run_id: str, turn: ReplayTurn, event_rows: list[dict[str, Any]], turn_rows: list[dict[str, Any]], manager: KVCacheManager, error: str) -> ReplayResult`
 
 ---
@@ -122,6 +140,7 @@ The module-level functions used across tasks have these exact signatures:
 Add imports and a row factory that contains prompt fields only; deliberately omit execution completion IDs:
 
 ```python
+import hashlib
 import json
 from pathlib import Path
 
@@ -215,7 +234,7 @@ def test_load_full_turns_keeps_prompt_ids_and_never_requires_decode_ids(
 Run:
 
 ```bash
-.venv/bin/python -m pytest \
+PYTHONHASHSEED=0 .venv/bin/python -m pytest \
   tests/benchmarks/ds4_profile/test_kv_cache_replay.py \
   -k 'load_full_turns' -v
 ```
@@ -317,7 +336,9 @@ git commit -m "[Benchmarks] Add DS4 cache replay inputs" \
 
 **Interfaces:**
 - Consumes: `ReplayTurn` from Task 1; vLLM `Request`, `KVCacheManager`, `KVCacheConfig`, `KVCacheGroupSpec`, and `FullAttentionSpec`.
-- Produces: `PoolCall`, `make_request`, `make_manager`, `observe_block_pool`, `_resident_hashes(manager) -> set[str]`, and `_active_block_count(manager) -> int`.
+- Produces: `PoolCall`, `_initialize_hashing`, `make_request`, `make_manager`,
+  `observe_block_pool`, `_resident_hashes(manager) -> set[str]`, and
+  `_active_block_count(manager) -> int`.
 
 - [ ] **Step 1: Write failing real-manager and observer tests**
 
@@ -341,6 +362,42 @@ def _replay_turn(
     )
 
 
+@pytest.fixture(autouse=True)
+def _stable_hash_seed(monkeypatch: pytest.MonkeyPatch) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import _initialize_hashing
+
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
+    _initialize_hashing()
+
+
+def test_hash_initialization_is_once_and_equal_prefixes_hash_identically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from benchmarks.ds4_profile import kv_cache_replay
+
+    original = kv_cache_replay.init_none_hash
+    calls = []
+
+    def counting_init(hash_fn) -> None:
+        calls.append(hash_fn)
+        original(hash_fn)
+
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
+    monkeypatch.setattr(kv_cache_replay, "_HASHING_INITIALIZED", False)
+    monkeypatch.setattr(kv_cache_replay, "init_none_hash", counting_init)
+    kv_cache_replay._initialize_hashing()
+    kv_cache_replay._initialize_hashing()
+    first = kv_cache_replay.make_request(
+        _replay_turn(0, [1, 1, 2, 2]), 2, "first"
+    )
+    second = kv_cache_replay.make_request(
+        _replay_turn(1, [1, 1, 9, 9]), 2, "second"
+    )
+
+    assert calls == [kv_cache_replay.sha256]
+    assert first.block_hashes[0] == second.block_hashes[0]
+
+
 def test_real_manager_hashes_only_full_blocks_and_reserves_null_block() -> None:
     from benchmarks.ds4_profile.kv_cache_replay import make_manager, make_request
 
@@ -353,18 +410,20 @@ def test_real_manager_hashes_only_full_blocks_and_reserves_null_block() -> None:
 
 
 def test_observer_records_touch_before_allocate_and_reverse_free() -> None:
+    from vllm.distributed.kv_events import BlockRemoved
     from benchmarks.ds4_profile.kv_cache_replay import (
         make_manager,
         make_request,
         observe_block_pool,
     )
 
-    manager = make_manager(capacity_blocks=4, block_size=2, max_model_len=32)
+    manager = make_manager(capacity_blocks=3, block_size=2, max_model_len=32)
     first = make_request(_replay_turn(0, [1, 1, 2, 2, 3]), 2, "first")
     hit, hit_tokens, _ = manager.get_computed_blocks(first)
     assert manager.allocate_slots(first, first.num_tokens, hit_tokens, hit) is not None
     first_ids = manager.get_block_ids("first")[0]
     manager.free(first)
+    manager.take_events()
 
     second = make_request(_replay_turn(1, [1, 1, 9, 9, 8]), 2, "second")
     hit, hit_tokens, _ = manager.get_computed_blocks(second)
@@ -374,8 +433,20 @@ def test_observer_records_touch_before_allocate_and_reverse_free() -> None:
         ) is not None
         second_ids = manager.get_block_ids("second")[0]
         manager.free(second)
+    native_events = manager.take_events()
 
-    assert [call.operation for call in calls][:2] == ["touch", "allocate"]
+    operations = [call.operation for call in calls]
+    assert operations[0] == "touch"
+    assert operations.index("allocate") > max(
+        index for index, operation in enumerate(operations) if operation == "evict"
+    )
+    assert operations[-1] == "free"
+    eviction_calls = [call for call in calls if call.operation == "evict"]
+    removed = [event for event in native_events if isinstance(event, BlockRemoved)]
+    assert all(call.duration_ns >= 0 for call in eviction_calls)
+    assert sum(call.evicted is True for call in eviction_calls) == sum(
+        len(event.block_hashes) for event in removed
+    )
     free = next(call for call in calls if call.operation == "free")
     assert free.block_ids == tuple(reversed(second_ids))
     assert first_ids[-1] not in second_ids or len(set(first_ids)) < len(first_ids)
@@ -384,16 +455,18 @@ def test_observer_records_touch_before_allocate_and_reverse_free() -> None:
 - [ ] **Step 2: Run tests and verify missing interfaces**
 
 ```bash
-.venv/bin/python -m pytest \
+PYTHONHASHSEED=0 .venv/bin/python -m pytest \
   tests/benchmarks/ds4_profile/test_kv_cache_replay.py \
-  -k 'real_manager or observer' -v
+  -k 'hash_initialization or real_manager or observer' -v
 ```
 
-Expected: FAIL with `ImportError` for `make_manager`, `make_request`, or `observe_block_pool`.
+Expected: FAIL with `ImportError` for `_initialize_hashing`, `make_manager`,
+`make_request`, or `observe_block_pool`.
 
 - [ ] **Step 3: Implement the exact vLLM factory**
 
 ```python
+import os
 from contextlib import contextmanager
 from time import perf_counter_ns
 
@@ -413,10 +486,23 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import Request
 
 
+_HASHING_INITIALIZED = False
+
+
+def _initialize_hashing() -> None:
+    global _HASHING_INITIALIZED
+    if os.environ.get("PYTHONHASHSEED") != "0":
+        raise RuntimeError("Ticket 07 requires PYTHONHASHSEED=0")
+    if not _HASHING_INITIALIZED:
+        init_none_hash(sha256)
+        _HASHING_INITIALIZED = True
+
+
 def make_request(turn: ReplayTurn, block_size: int, request_id: str) -> Request:
+    if not _HASHING_INITIALIZED:
+        raise RuntimeError("initialize Ticket 07 hashing before creating requests")
     sampling = SamplingParams(max_tokens=1)
     sampling.update_from_generation_config({}, eos_token_id=0)
-    init_none_hash(sha256)
     return Request(
         request_id=request_id,
         prompt_token_ids=list(turn.prompt_token_ids),
@@ -454,6 +540,11 @@ def make_manager(
     )
 ```
 
+`replay_session` and each CLI command call `_initialize_hashing()` before making
+requests. The Boolean guard guarantees exactly one `init_none_hash(sha256)` call
+per process even when a planner evaluates multiple trajectories. Never call
+`init_none_hash` from `make_request`.
+
 - [ ] **Step 4: Implement scoped observation without changing semantics**
 
 Materialize the free iterable once so observation and the original method see the same order. Restore all methods in `finally`:
@@ -465,15 +556,21 @@ def observe_block_pool(
 ) -> Iterator[list[PoolCall]]:
     pool = manager.block_pool
     calls: list[PoolCall] = []
-    originals = (pool.touch, pool.get_new_blocks, pool.free_blocks)
+    originals = (
+        pool.touch,
+        pool.get_new_blocks,
+        pool._maybe_evict_cached_block,
+        pool.free_blocks,
+    )
 
     def record(
-        operation: Literal["touch", "allocate", "free"],
+        operation: Literal["touch", "allocate", "evict", "free"],
         block_ids: tuple[int, ...],
-        started_ns: int,
+        duration_ns: int,
+        evicted: bool | None = None,
     ) -> None:
         calls.append(
-            PoolCall(operation, len(calls), block_ids, perf_counter_ns() - started_ns)
+            PoolCall(operation, len(calls), block_ids, duration_ns, evicted)
         )
 
     def touch(blocks):
@@ -482,32 +579,72 @@ def observe_block_pool(
         try:
             return originals[0](block_list)
         finally:
-            record("touch", tuple(block.block_id for block in block_list), started)
+            record(
+                "touch",
+                tuple(block.block_id for block in block_list),
+                perf_counter_ns() - started,
+            )
 
     def get_new_blocks(num_blocks: int):
+        nested_before = sum(
+            call.duration_ns for call in calls if call.operation == "evict"
+        )
         started = perf_counter_ns()
         blocks = originals[1](num_blocks)
-        record("allocate", tuple(block.block_id for block in blocks), started)
+        elapsed = perf_counter_ns() - started
+        nested_after = sum(
+            call.duration_ns for call in calls if call.operation == "evict"
+        )
+        record(
+            "allocate",
+            tuple(block.block_id for block in blocks),
+            elapsed - (nested_after - nested_before),
+        )
         return blocks
+
+    def maybe_evict_cached_block(block):
+        started = perf_counter_ns()
+        evicted = originals[2](block)
+        record(
+            "evict",
+            (block.block_id,),
+            perf_counter_ns() - started,
+            evicted,
+        )
+        return evicted
 
     def free_blocks(blocks):
         block_list = list(blocks)
         started = perf_counter_ns()
         try:
-            return originals[2](block_list)
+            return originals[3](block_list)
         finally:
-            record("free", tuple(block.block_id for block in block_list), started)
+            record(
+                "free",
+                tuple(block.block_id for block in block_list),
+                perf_counter_ns() - started,
+            )
 
     pool.touch = touch
     pool.get_new_blocks = get_new_blocks
+    pool._maybe_evict_cached_block = maybe_evict_cached_block
     pool.free_blocks = free_blocks
     try:
         yield calls
     finally:
-        pool.touch, pool.get_new_blocks, pool.free_blocks = originals
+        (
+            pool.touch,
+            pool.get_new_blocks,
+            pool._maybe_evict_cached_block,
+            pool.free_blocks,
+        ) = originals
 ```
 
-Use narrow `# type: ignore[method-assign]` annotations on the six assignments if mypy requires them. Do not suppress any other type error.
+Use narrow `# type: ignore[method-assign]` annotations on these eight assignments
+if mypy requires them. The wrapper must invoke the bound original exactly once,
+return its exact Boolean, and restore it in `finally`; it observes real eviction
+semantics and never reimplements hash removal or event emission. Do not suppress
+any other type error.
 
 - [ ] **Step 5: Run tests and verify green**
 
@@ -536,7 +673,7 @@ git commit -m "[Benchmarks] Add the real KV cache replay seam" \
 
 **Interfaces:**
 - Consumes: Task 2 manager and observer functions; native `BlockStored` and `BlockRemoved` returned by `manager.take_events()`.
-- Produces: `ReplayResult`, `replay_session`, `_prefix_source(turn, block_position, block_size) -> PrefixSource`, `_future_accesses(turns, block_size) -> dict[str, tuple[int, ...]]`, and `_classify_miss(...) -> MissClass`.
+- Produces: `ReplayResult`, `replay_session`, `_prefix_source(turn, block_position, block_size) -> PrefixSource`, `_future_accesses(turns, block_size) -> dict[str, tuple[int, ...]]`, `_lookup_outcome`, and `_classify_miss`.
 
 - [ ] **Step 1: Write the failing hand-checkable replay test**
 
@@ -600,14 +737,41 @@ def test_replay_stops_without_mutating_an_out_of_capacity_prompt() -> None:
     assert result.turn_rows[0]["prompt_tokens"] == 6
     assert result.turn_rows[0]["status"] == "out_of_capacity"
     assert result.event_rows[-1]["operation"] == "admission_failure"
+
+
+def test_replay_separates_manager_forced_recompute_from_capacity_miss() -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import replay_session
+
+    result = replay_session(
+        run_id="fixture-run",
+        turns=[
+            _replay_turn(0, [1, 1, 2, 2]),
+            _replay_turn(1, [1, 1, 2, 2]),
+        ],
+        capacity_blocks=2,
+        block_size=2,
+        max_model_len=32,
+    )
+
+    forced = [
+        row
+        for row in result.event_rows
+        if row["turn_index"] == 1
+        and row["cache_outcome"] == "manager_forced_recompute"
+    ]
+    assert len(forced) == 1
+    assert forced[0]["block_position"] == 1
+    assert forced[0]["miss_class"] is None
+    assert result.turn_rows[1]["manager_forced_recompute_blocks"] == 1
+    assert result.turn_rows[1]["capacity_miss_blocks"] == 0
 ```
 
 - [ ] **Step 2: Run replay tests and verify red**
 
 ```bash
-.venv/bin/python -m pytest \
+PYTHONHASHSEED=0 .venv/bin/python -m pytest \
   tests/benchmarks/ds4_profile/test_kv_cache_replay.py \
-  -k 'replay_classifies or out_of_capacity' -v
+  -k 'replay_classifies or out_of_capacity or manager_forced' -v
 ```
 
 Expected: FAIL with `ImportError: cannot import name 'replay_session'`.
@@ -653,6 +817,29 @@ def _classify_miss(
     if block_position < max_seen_depth:
         return "prefix_mismatch"
     return "compulsory"
+
+
+def _lookup_outcome(
+    *,
+    block_hash: str,
+    block_position: int,
+    full_block_count: int,
+    hit_blocks: int,
+    prompt_tokens: int,
+    block_size: int,
+    resident_before: set[str],
+) -> CacheOutcome:
+    if block_position < hit_blocks:
+        return "hit"
+    if block_hash not in resident_before:
+        return "miss"
+    if (
+        prompt_tokens % block_size == 0
+        and block_position == full_block_count - 1
+        and block_position == hit_blocks
+    ):
+        return "manager_forced_recompute"
+    raise RuntimeError("resident hash exists beyond the legal manager hit")
 ```
 
 - [ ] **Step 4: Implement `replay_session` around the real manager calls**
@@ -664,8 +851,18 @@ computed, hit_tokens, _ = manager.get_computed_blocks(request)
 hit_blocks = hit_tokens // block_size
 resident_before = _resident_hashes(manager)
 request_hashes = tuple(_canonical_hash(value) for value in request.block_hashes)
-if any(value in resident_before for value in request_hashes[hit_blocks:]):
-    raise RuntimeError("resident hash exists beyond the continuous manager hit")
+outcomes = tuple(
+    _lookup_outcome(
+        block_hash=value,
+        block_position=position,
+        full_block_count=len(request_hashes),
+        hit_blocks=hit_blocks,
+        prompt_tokens=request.num_tokens,
+        block_size=block_size,
+        resident_before=resident_before,
+    )
+    for position, value in enumerate(request_hashes)
+)
 
 with observe_block_pool(manager) as pool_calls:
     allocated = manager.allocate_slots(
@@ -698,10 +895,21 @@ admission failure. For successful turns:
 
 - `cached_tokens = hit_tokens`;
 - `recomputed_tokens = request.num_tokens - hit_tokens`;
-- one lookup row per full request hash, with `cache_outcome` `hit` or `miss`;
-- one control row per `PoolCall`;
-- one `store` or `evict` row per native block hash;
+- one lookup row per full request hash, with `cache_outcome` `hit`, `miss`, or
+  `manager_forced_recompute`;
+- `manager_forced_recompute` is legal only for the resident final full block of
+  a block-aligned prompt immediately beyond the returned hit, because
+  `get_computed_blocks` caps the hit at `prompt_len - 1`; it has null
+  `miss_class` and is never counted as capacity loss;
+- one `event_source="observer"` control row per `PoolCall`, including every
+  true and false call to the real `_maybe_evict_cached_block`;
+- one `event_source="native"` `store` or `evict` row per native block hash;
 - `BlockRemoved` is the only source of eviction truth;
+- pair observer calls with `evicted=True` to native removals in order for this
+  single-group manager; never infer a removal from allocation or free;
+- sum observer eviction-call durations into `eviction_time_ns`, and subtract
+  those nested durations from `allocation_time_ns` so the two timings do not
+  overlap;
 - future reuse is the first access turn greater than the eviction turn;
 - native evictions with no later exact-hash access set `never_reused=True`, `useful_later=False`, and null reuse-distance fields; and
 - call ordering must show every turn's touches before allocations and free last.
@@ -720,7 +928,7 @@ Expected: `2 passed`; the first test observes all three miss classes and a usefu
 - [ ] **Step 6: Run the real-manager regression tests used as prior art**
 
 ```bash
-.venv/bin/python -m pytest \
+PYTHONHASHSEED=0 .venv/bin/python -m pytest \
   tests/v1/core/test_prefix_caching.py::test_prefill \
   tests/v1/core/test_single_type_kv_cache_manager.py::test_evictable_cached_blocks_not_double_allocated \
   -v
@@ -750,7 +958,11 @@ git commit -m "[Benchmarks] Replay DS4 cache metadata" \
 
 **Interfaces:**
 - Consumes: `load_full_turns`, `replay_session`, and `ReplayResult`.
-- Produces: `build_selection_plan`, `verify_pinned_selection`, `_select_candidate(candidates: Sequence[dict[str, Any]]) -> dict[str, Any]`, and a config whose `selection.status` is either `unselected` for planning or `pinned` for normal replay.
+- Produces: `collect_input_records`, `verify_input_records`,
+  `build_selection_plan`, `verify_pinned_selection`,
+  `_select_candidate(candidates: Sequence[dict[str, Any]]) -> dict[str, Any]`,
+  and a config whose `selection.status` is either `unselected` for planning or
+  `pinned` for normal replay.
 
 - [ ] **Step 1: Write failing deterministic-selection tests**
 
@@ -785,7 +997,27 @@ def test_selection_uses_capacity_mode_and_trajectory_stable_key() -> None:
 
 
 def test_verify_pinned_selection_rejects_drift() -> None:
-    from benchmarks.ds4_profile.kv_cache_replay import verify_pinned_selection
+    from benchmarks.ds4_profile.kv_cache_replay import (
+        _canonical_json_sha256,
+        _with_canonical_sha256,
+        verify_pinned_selection,
+    )
+
+    input_set_sha256 = _canonical_json_sha256([])
+    plan = _with_canonical_sha256(
+        {
+            "schema_version": "1.0.0",
+            "status": "selected",
+            "inputs": [],
+            "candidates": [],
+            "selected": {
+                "trajectory_id": "task:no_think",
+                "reasoning_mode": "no_think",
+                "capacity_blocks": 11,
+                "input_set_sha256": input_set_sha256,
+            },
+        }
+    )
 
     config = {
         "selection": {
@@ -793,33 +1025,79 @@ def test_verify_pinned_selection_rejects_drift() -> None:
             "trajectory_id": "task:no_think",
             "reasoning_mode": "no_think",
             "capacity_blocks": 10,
-            "planning_sha256": "a" * 64,
+            "input_set_sha256": input_set_sha256,
+            "planning_sha256": plan["sha256"],
         }
-    }
-    plan = {
-        "selected": {
-            "trajectory_id": "task:no_think",
-            "reasoning_mode": "no_think",
-            "capacity_blocks": 11,
-        },
-        "sha256": "a" * 64,
     }
 
     with pytest.raises(ValueError, match="pinned selection does not match"):
         verify_pinned_selection(config, plan)
+
+
+def test_input_records_cover_data_provenance_and_every_tokenizer_file(
+    tmp_path: Path,
+) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import (
+        collect_input_records,
+        verify_input_records,
+    )
+
+    tokenizer = tmp_path / "tokenizer"
+    tokenizer.mkdir()
+    files = {
+        "manifest": tmp_path / "manifest.json",
+        "normalized_turns": tmp_path / "turns.parquet",
+        "normalized_provenance": tmp_path / "ticket-01-provenance.json",
+        "rendered_turns": tmp_path / "rendered.parquet",
+        "workload_provenance": tmp_path / "ticket-02-provenance.json",
+    }
+    for index, path in enumerate(files.values()):
+        path.write_bytes(f"input-{index}".encode())
+    (tokenizer / "tokenizer.json").write_text("tokenizer")
+    (tokenizer / "tokenizer_config.json").write_text("config")
+    config = {
+        "artifacts": {name: str(path) for name, path in files.items()},
+        "tokenizer": {"path": str(tokenizer)},
+    }
+
+    records = collect_input_records(config)
+    verify_input_records(records)
+
+    assert {record.logical_name for record in records} == {
+        "manifest",
+        "ticket_01_data",
+        "ticket_01_provenance",
+        "ticket_02_data",
+        "ticket_02_provenance",
+        "tokenizer:tokenizer.json",
+        "tokenizer:tokenizer_config.json",
+    }
+    (tokenizer / "tokenizer.json").write_text("tampered")
+    with pytest.raises(ValueError, match="input SHA-256 mismatch"):
+        verify_input_records(records)
 ```
 
 - [ ] **Step 2: Run selection tests and verify red**
 
 ```bash
-.venv/bin/python -m pytest \
+PYTHONHASHSEED=0 .venv/bin/python -m pytest \
   tests/benchmarks/ds4_profile/test_kv_cache_replay.py \
-  -k 'selection_uses or pinned_selection' -v
+  -k 'selection_uses or pinned_selection or input_records' -v
 ```
 
 Expected: FAIL with missing planner interfaces.
 
 - [ ] **Step 3: Implement candidate evaluation and stable selection**
+
+Implement `collect_input_records` over exactly five fixed inputs—manifest,
+Ticket 01 data/provenance, and Ticket 02 data/provenance—plus every regular file
+under the tokenizer directory in sorted relative-path order. Each record stores
+logical name, mounted path, byte length, and a streaming SHA-256. Follow
+symlinks only to read their file content, retain the mounted symlink path in the
+record, reject duplicate logical names and an empty tokenizer directory, and
+make `verify_input_records` recompute size and digest from disk. Canonicalize the
+record list as sorted compact JSON and expose its SHA-256 as
+`input_set_sha256`.
 
 Group turns by trajectory. For each group, set capacity to the maximum `ceil(prompt_tokens / block_size)`, run the real metadata replay, and mark it eligible only when every turn passed and at least one native eviction occurred:
 
@@ -842,7 +1120,12 @@ def _select_candidate(candidates: Sequence[dict[str, Any]]) -> dict[str, Any]:
 def build_selection_plan(
     config: dict[str, Any], turns: Sequence[ReplayTurn]
 ) -> dict[str, Any]:
+    _initialize_hashing()
     block_size = config["replay"]["block_size"]
+    inputs = collect_input_records(config)
+    verify_input_records(inputs)
+    input_rows = [asdict(record) for record in inputs]
+    input_set_sha256 = _canonical_json_sha256(input_rows)
     candidates = []
     for trajectory_id in sorted({turn.trajectory_id for turn in turns}):
         session = [turn for turn in turns if turn.trajectory_id == trajectory_id]
@@ -871,16 +1154,25 @@ def build_selection_plan(
                 "reason": result.error,
             }
         )
-    selected = _select_candidate(candidates)
-    return {
+    selected = {
+        **_select_candidate(candidates),
+        "input_set_sha256": input_set_sha256,
+    }
+    payload = {
         "schema_version": SCHEMA_VERSION,
         "status": "selected",
         "selected": selected,
         "candidates": candidates,
+        "inputs": input_rows,
     }
+    return _with_canonical_sha256(payload)
 ```
 
-Serialize the plan without its digest using sorted compact JSON, compute SHA-256, then add the digest as top-level `sha256`. `verify_pinned_selection` compares trajectory, reasoning mode, capacity, and planning digest exactly.
+`_with_canonical_sha256` serializes the plan without its digest using sorted
+compact JSON, computes SHA-256, and adds it as top-level `sha256`.
+`verify_pinned_selection` verifies that digest, recomputes every input record,
+recomputes `input_set_sha256`, and compares trajectory, reasoning mode,
+capacity, input-set digest, and planning digest exactly.
 
 - [ ] **Step 4: Add the explicit pre-selection config state**
 
@@ -891,6 +1183,7 @@ Create this exact JSON before the school-server planning pass:
   "artifacts": {
     "manifest": "/mnt/ds4/raw/manifest.json",
     "normalized_turns": "/mnt/ds4/ticket-01/turns.parquet",
+    "normalized_provenance": "/mnt/ds4/ticket-01/provenance.json",
     "rendered_turns": "/mnt/ds4/ticket-02/rendered_turns.parquet",
     "workload_provenance": "/mnt/ds4/ticket-02/provenance.json"
   },
@@ -905,6 +1198,7 @@ Create this exact JSON before the school-server planning pass:
   "schema_version": "1.0.0",
   "selection": {
     "capacity_blocks": null,
+    "input_set_sha256": null,
     "planning_sha256": null,
     "reasoning_mode": null,
     "status": "unselected",
@@ -922,12 +1216,14 @@ Create this exact JSON before the school-server planning pass:
 }
 ```
 
-`run` must reject `status != "pinned"`; only `plan` accepts `unselected`.
+`run` must reject `status != "pinned"`; only `plan` accepts `unselected`. A run
+also fails before manager construction if any planning-record input path, size,
+or SHA differs from current mounted content.
 
 - [ ] **Step 5: Run selection tests and full focused tests**
 
 ```bash
-.venv/bin/python -m pytest \
+PYTHONHASHSEED=0 .venv/bin/python -m pytest \
   tests/benchmarks/ds4_profile/test_kv_cache_replay.py -v
 ```
 
@@ -964,21 +1260,51 @@ def test_artifacts_are_versioned_metadata_only_and_cross_validated(
     tmp_path: Path,
 ) -> None:
     from benchmarks.ds4_profile.kv_cache_replay import (
+        _canonical_json_sha256,
+        _with_canonical_sha256,
         replay_session,
         validate_result_dir,
         write_result,
     )
 
+    input_path = tmp_path / "manifest.json"
+    input_path.write_bytes(b"fixture-input")
+    inputs = [
+        {
+            "logical_name": "manifest",
+            "path": str(input_path),
+            "size_bytes": input_path.stat().st_size,
+            "sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
+        }
+    ]
+    input_set_sha256 = _canonical_json_sha256(inputs)
+    planning_record = _with_canonical_sha256(
+        {
+            "schema_version": "1.0.0",
+            "status": "selected",
+            "inputs": inputs,
+            "candidates": [],
+            "selected": {
+                "trajectory_id": "task:no_think",
+                "reasoning_mode": "no_think",
+                "capacity_blocks": 3,
+                "input_set_sha256": input_set_sha256,
+            },
+        }
+    )
     config = {
         "schema_version": "1.0.0",
         "run_id": "fixture-run",
+        "inputs": inputs,
+        "planning_record": planning_record,
         "replay": {"block_size": 2, "max_model_len": 32},
         "selection": {
             "status": "pinned",
             "trajectory_id": "task:no_think",
             "reasoning_mode": "no_think",
             "capacity_blocks": 3,
-            "planning_sha256": "a" * 64,
+            "input_set_sha256": input_set_sha256,
+            "planning_sha256": planning_record["sha256"],
         },
         "source": {"commit": "abc123", "dirty": False},
     }
@@ -1029,14 +1355,99 @@ def test_validator_recomputes_counts_and_rejects_unknown_enums(tmp_path: Path) -
 
     with pytest.raises(ValueError, match="unknown operation"):
         validate_result_dir(output)
+
+
+def _rewrite_event_rows(output: Path, mutate) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import CACHE_EVENT_SCHEMA
+
+    path = output / "cache_events.parquet"
+    rows = pq.read_table(path).to_pylist()
+    mutate(rows)
+    pq.write_table(pa.Table.from_pylist(rows, schema=CACHE_EVENT_SCHEMA), path)
+
+
+def _validate_fixture(output: Path) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import validate_result_dir
+
+    validate_result_dir(output)
+
+
+def test_validator_recomputes_miss_attribution(tmp_path: Path) -> None:
+    output = _write_valid_result(tmp_path)
+
+    def corrupt(rows) -> None:
+        row = next(item for item in rows if item["cache_outcome"] == "miss")
+        row["miss_class"] = (
+            "capacity" if row["miss_class"] != "capacity" else "compulsory"
+        )
+
+    _rewrite_event_rows(output, corrupt)
+    with pytest.raises(ValueError, match="miss attribution mismatch"):
+        _validate_fixture(output)
+
+
+def test_validator_recomputes_future_reuse(tmp_path: Path) -> None:
+    output = _write_valid_result(tmp_path)
+
+    def corrupt(rows) -> None:
+        row = next(
+            item
+            for item in rows
+            if item["event_source"] == "native" and item["operation"] == "evict"
+        )
+        row["useful_later"] = True
+        row["never_reused"] = False
+        row["next_reuse_turn"] = row["turn_index"] + 1
+        row["turns_until_reuse"] = 1
+
+    _rewrite_event_rows(output, corrupt)
+    with pytest.raises(ValueError, match="future reuse mismatch"):
+        _validate_fixture(output)
+
+
+def test_validator_reconstructs_call_order(tmp_path: Path) -> None:
+    output = _write_valid_result(tmp_path)
+
+    def corrupt(rows) -> None:
+        touch = next(item for item in rows if item["operation"] == "touch")
+        allocate = next(
+            item
+            for item in rows
+            if item["turn_index"] == touch["turn_index"]
+            and item["operation"] == "allocate"
+        )
+        touch["operation_ordinal"], allocate["operation_ordinal"] = (
+            allocate["operation_ordinal"],
+            touch["operation_ordinal"],
+        )
+        for row in (touch, allocate):
+            row["event_id"] = (
+                f'{row["run_id"]}:{row["trajectory_id"]}:{row["turn_index"]}:'
+                f'{row["operation"]}:{row["operation_ordinal"]}'
+            )
+
+    _rewrite_event_rows(output, corrupt)
+    with pytest.raises(ValueError, match="operation ordering mismatch"):
+        _validate_fixture(output)
+
+
+def test_validator_replays_occupancy_transitions(tmp_path: Path) -> None:
+    output = _write_valid_result(tmp_path)
+
+    def corrupt(rows) -> None:
+        rows[1]["active_blocks_before"] += 1
+
+    _rewrite_event_rows(output, corrupt)
+    with pytest.raises(ValueError, match="occupancy transition mismatch"):
+        _validate_fixture(output)
 ```
 
 - [ ] **Step 2: Run artifact tests and verify red**
 
 ```bash
-.venv/bin/python -m pytest \
+PYTHONHASHSEED=0 .venv/bin/python -m pytest \
   tests/benchmarks/ds4_profile/test_kv_cache_replay.py \
-  -k 'artifacts_are or validator_recomputes' -v
+  -k 'artifacts_are or validator' -v
 ```
 
 Expected: FAIL because `write_result` and `validate_result_dir` are absent.
@@ -1053,12 +1464,15 @@ CACHE_EVENT_SCHEMA = pa.schema(
         pa.field("trajectory_id", pa.string(), nullable=False),
         pa.field("turn_index", pa.int32(), nullable=False),
         pa.field("event_id", pa.string(), nullable=False),
+        pa.field("event_source", pa.string(), nullable=False),
         pa.field("operation", pa.string(), nullable=False),
         pa.field("operation_ordinal", pa.int32(), nullable=False),
         pa.field("status", pa.string(), nullable=False),
         pa.field("cache_outcome", pa.string()),
         pa.field("miss_class", pa.string()),
         pa.field("duration_ns", pa.int64()),
+        pa.field("eviction_time_ns", pa.int64()),
+        pa.field("evicted", pa.bool_()),
         pa.field("block_position", pa.int32()),
         pa.field("block_id", pa.int64()),
         pa.field("block_hash", pa.string()),
@@ -1091,6 +1505,7 @@ TURN_SUMMARY_SCHEMA = pa.schema(
         pa.field("cached_tokens", pa.int32(), nullable=False),
         pa.field("recomputed_tokens", pa.int32(), nullable=False),
         pa.field("hit_blocks", pa.int32(), nullable=False),
+        pa.field("manager_forced_recompute_blocks", pa.int32(), nullable=False),
         pa.field("compulsory_miss_blocks", pa.int32(), nullable=False),
         pa.field("capacity_miss_blocks", pa.int32(), nullable=False),
         pa.field("prefix_mismatch_blocks", pa.int32(), nullable=False),
@@ -1102,6 +1517,7 @@ TURN_SUMMARY_SCHEMA = pa.schema(
         pa.field("lookup_time_ns", pa.int64(), nullable=False),
         pa.field("touch_time_ns", pa.int64(), nullable=False),
         pa.field("allocation_time_ns", pa.int64(), nullable=False),
+        pa.field("eviction_time_ns", pa.int64(), nullable=False),
         pa.field("free_time_ns", pa.int64(), nullable=False),
         pa.field("error", pa.string()),
     ],
@@ -1117,7 +1533,10 @@ TURN_SUMMARY_SCHEMA = pa.schema(
 {
     "artifact_schema_version": SCHEMA_VERSION,
     "hardware_validated": False,
+    "inputs": config["inputs"],
     "metadata_only_validated": result.status == "passed",
+    "planning_record": config["planning_record"],
+    "planning_sha256": config["selection"]["planning_sha256"],
     "run_id": config["run_id"],
     "selection": config["selection"],
     "source": config["source"],
@@ -1125,19 +1544,43 @@ TURN_SUMMARY_SCHEMA = pa.schema(
 }
 ```
 
-The validator must:
+The validator must never trust derived labels or summaries. It sorts by
+trajectory, turn, and operation ordinal, then reconstructs the resident-hash,
+ever-stored-hash, active-block, cached-block, and free-block state from lookup,
+observer, and native rows. It must:
 
 - require all five files and exact Arrow schemas;
 - require every row's `schema_version == "1.0.0"`;
 - require one run ID across config, provenance, events, and turns;
 - require unique `event_id == f"{run_id}:{trajectory_id}:{turn_index}:{operation}:{operation_ordinal}"`;
-- validate operation, status, outcome, miss-class, and prefix-source enums;
+- validate event-source, operation, status, outcome (including
+  `manager_forced_recompute`), miss-class, and prefix-source enums;
 - require miss class only when `cache_outcome == "miss"`;
-- require future-reuse boolean complements and nullability rules;
+- independently recompute compulsory/capacity/prefix-mismatch from the
+  reconstructed resident and ever-stored sets, and require capacity only when
+  the exact hash was stored previously but is not resident;
+- independently recognize the legal final-block manager-forced-recompute case
+  and reject that outcome anywhere else;
+- independently scan future ordered lookup hashes after every native removal to
+  recompute next reuse turn, turn distance, and
+  `useful_later`/`never_reused` plus their nullability;
+- require lookup rows first, touch before eviction checks, each true observer
+  eviction paired one-to-one with the following native removal, allocation
+  after its nested eviction checks, native stores after allocation, and free
+  last for each turn;
+- replay every active/cached/free before/after transition, require each row's
+  before state equals the preceding after state, and reject impossible deltas;
+- require `eviction_time_ns` only on observer eviction calls, equal their
+  duration, sum it independently per turn, and ensure allocation timing is
+  exclusive of nested eviction timing;
 - recompute per-turn hit/miss/allocation/eviction/free counts from events;
+- recompute manager-forced-recompute counts separately from all miss classes;
 - require `cached_tokens + recomputed_tokens == prompt_tokens`;
 - require all successful configured turns in increasing serial order;
 - require at least one eviction for a passed result; and
+- recompute and verify every manifest, Ticket 01/02 data/provenance, and
+  tokenizer input size/SHA from provenance, then verify the canonical input-set
+  and planning-record digests; and
 - require `hardware_validated is False` and `metadata_only_validated` only for passed results.
 
 - [ ] **Step 5: Implement the three-command CLI**
@@ -1160,15 +1603,17 @@ validate.add_argument("--result-dir", type=Path, required=True)
 
 `plan` loads full turns, builds the plan, and writes sorted JSON. `run` requires
 `selection.status == "pinned"`, checks the planning record SHA and selection,
-filters exactly one complete trajectory, calls `replay_session`, writes
-artifacts, and exits `0` only for passed status. `validate` exits `0` only after
+recomputes every input file record, copies the verified planning record and
+input records into the effective config, filters exactly one complete
+trajectory, calls `replay_session`, writes artifacts, and exits `0` only for
+passed status. `validate` exits `0` only after
 independent validation. Validation errors print
 `validation failed: {validation message}` to stderr and exit `2`.
 
 - [ ] **Step 6: Run artifact tests and the whole Ticket 07 suite**
 
 ```bash
-.venv/bin/python -m pytest \
+PYTHONHASHSEED=0 .venv/bin/python -m pytest \
   tests/benchmarks/ds4_profile/test_kv_cache_replay.py -v
 ```
 
@@ -1243,12 +1688,13 @@ def test_container_wrapper_marks_cache_replay_as_cpu_only() -> None:
     assert "ai.vllm.ds4.runtime=cpu" in result.stdout
     assert "--gpus" not in result.stdout
     assert "SYS_NICE" not in result.stdout
+    assert "PYTHONHASHSEED=0" in result.stdout
 ```
 
 - [ ] **Step 2: Run container tests and verify red**
 
 ```bash
-.venv/bin/python -m pytest \
+PYTHONHASHSEED=0 .venv/bin/python -m pytest \
   tests/benchmarks/ds4_profile/test_kv_cache_replay.py \
   -k 'container_runtime or container_wrapper' -v
 ```
@@ -1355,11 +1801,13 @@ esac
 ```
 
 Keep `cache-model` as the only command with `HF_HUB_OFFLINE=0`; cache replay stays offline.
+Add `--env PYTHONHASHSEED=0` to the common Docker invocation so planning,
+replay, validation, and exact-image pytest share the same chained-hash seed.
 
 - [ ] **Step 5: Run container tests and regression plan checks**
 
 ```bash
-.venv/bin/python -m pytest \
+PYTHONHASHSEED=0 .venv/bin/python -m pytest \
   tests/benchmarks/ds4_profile/test_kv_cache_replay.py \
   tests/benchmarks/ds4_profile/test_container_workflow.py \
   -v
@@ -1442,7 +1890,7 @@ Explain that pinning the selection requires a new clean commit/image before the 
 - [ ] **Step 4: Run the complete lightweight local gate**
 
 ```bash
-.venv/bin/python -m pytest \
+PYTHONHASHSEED=0 .venv/bin/python -m pytest \
   tests/benchmarks/ds4_profile/test_kv_cache_replay.py \
   tests/benchmarks/ds4_profile/test_container_workflow.py \
   -v
@@ -1507,15 +1955,24 @@ With `DS4_RUN` defined as in the runbook, using image `local/vllm-ds4-profile:ti
 "${DS4_RUN[@]}" kv-cache-replay plan \
   --output /mnt/ds4/results/ticket-07-selection.json
 
-.venv/bin/python -c '
+PYTHONHASHSEED=0 .venv/bin/python -c '
 import json
 from pathlib import Path
 p = Path.home() / "ds4-storage/results/ticket-07-selection.json"
 value = json.loads(p.read_text())
 assert value["status"] == "selected"
 assert value["selected"]["eviction_count"] > 0
+assert {
+    "manifest",
+    "ticket_01_data",
+    "ticket_01_provenance",
+    "ticket_02_data",
+    "ticket_02_provenance",
+}.issubset({item["logical_name"] for item in value["inputs"]})
+assert any(item["logical_name"].startswith("tokenizer:") for item in value["inputs"])
 print(json.dumps({
     "capacity_blocks": value["selected"]["capacity_blocks"],
+    "input_set_sha256": value["selected"]["input_set_sha256"],
     "planning_sha256": value["sha256"],
     "reasoning_mode": value["selected"]["reasoning_mode"],
     "status": "pinned",
@@ -1524,14 +1981,20 @@ print(json.dumps({
 '
 ```
 
-Expected: exit `0` and one complete JSON `selection` object. The planner candidate list shows every rejected/eligible trajectory, every admitted selected turn, and at least one native eviction. It contains no completion/decode token field.
+Expected: exit `0` and one complete JSON `selection` object. The planner
+candidate list shows every rejected/eligible trajectory, every admitted
+selected turn, and at least one native eviction. Its hashed input inventory
+covers both ticket data/provenance pairs and every tokenizer file, and it
+contains no completion/decode token field.
 
 - [ ] **Step 3: Pin exactly the planner output and commit it**
 
-Use `apply_patch` to replace the five fields under `selection` with the exact JSON object printed in Step 2. Do not edit `replay`, input paths, or tokenizer revision. Then verify equality using the module:
+Use `apply_patch` to replace the six fields under `selection` with the exact
+JSON object printed in Step 2. Do not edit `replay`, input paths, or tokenizer
+revision. Then verify equality and all mounted input hashes using the module:
 
 ```bash
-.venv/bin/python -c '
+PYTHONHASHSEED=0 .venv/bin/python -c '
 import json
 from pathlib import Path
 from benchmarks.ds4_profile.kv_cache_replay import verify_pinned_selection
@@ -1582,7 +2045,11 @@ sha256sum \
   "$RESULT_DIR/result.md"
 ```
 
-Expected: run and validator exit `0`; all configured turns pass; at least one eviction exists; result text contains `Metadata only: yes` and `GPU/HBM validated: no`; five checksums are printed.
+Expected: run and validator exit `0`; all configured turns pass; at least one
+eviction exists; manager-forced recomputes are separate from misses; observer
+eviction timing reconciles with native removals; every pinned input SHA is
+recomputed; result text contains `Metadata only: yes` and
+`GPU/HBM validated: no`; five checksums are printed.
 
 - [ ] **Step 6: Run the focused tests in the exact image**
 
@@ -1618,6 +2085,11 @@ Expected: the evidence commit changes only the handoff. Acceptance remains bound
 - [ ] Confirm every event/turn artifact uses schema version `1.0.0`, stable IDs, validated enum values, and cross-file run/trajectory/turn integrity.
 - [ ] Confirm all native evictions have complementary `useful_later`/`never_reused` labels and correct nullability/reuse distance.
 - [ ] Confirm admission failure is preserved rather than changing capacity or prompt length.
+- [ ] Confirm `PYTHONHASHSEED=0` is present in local commands and Docker, null-hash initialization occurs once per process, and equal prefixes in separate requests produce equal hashes.
+- [ ] Confirm scoped observation calls and restores the real `_maybe_evict_cached_block`, records exclusive eviction timing, and pairs true calls with native removals without implementing eviction semantics.
+- [ ] Confirm resident final blocks withheld by the manager's `prompt_len - 1` cap are labeled `manager_forced_recompute`, never capacity misses.
+- [ ] Confirm the validator independently reconstructs miss classes, future reuse, ordering, occupancy, and exclusive eviction timing, with corruption tests for each derived contract.
+- [ ] Confirm planning, run, provenance, and validation recompute manifest, Ticket 01/02 data and provenance, and every tokenizer file SHA rather than trusting configured paths.
 - [ ] Confirm local evidence contains only focused CPU contracts and server evidence contains the full planning/container run.
 - [ ] Confirm docs and artifacts state that Ticket 07 used prompt metadata only and did not read Decode tokens, allocate KV tensors, establish HBM residency, or validate GPU behavior.
 - [ ] Confirm no remote mutation or push occurred during implementation without a separate user instruction.
