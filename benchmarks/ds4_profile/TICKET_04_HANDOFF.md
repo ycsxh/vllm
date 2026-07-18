@@ -19,6 +19,40 @@ The developer workstation must not load the Qwen model, set
 gated by default. Real `GPUWorker` execution, CUDA Graph evidence, and the
 dual-GPU end-to-end result belong only to the school-server stage.
 
+## School-server acceptance incident
+
+The first school-server acceptance attempt against `c8625b4e9f` found a
+serious correctness defect in the real asynchronous GPU path. This commit is
+not hardware accepted and must not be presented as passing.
+
+The retained invalid run is
+`ticket-04/ds4-spine-20260718T134929Z-0fd115ed` under the isolated server
+evidence root. Preflight was ready and both RTX 3090 workers loaded the pinned
+model, compiled the requested ranges, and captured `FULL` and `PIECEWISE` CUDA
+Graphs. The run still correctly finalized as invalid:
+
+- Prefill treated `sampled_token_ids=[[]]` as an actual sampled token because
+  it checked only the outer list.
+- Decode compared the returned sampled token with the `-1` placeholder stored
+  in runner state by async scheduling.
+- More importantly, the teacher-forcing injection updated CPU-side request
+  state but did not replace the GPU-resident `prev_sampled_token_ids` consumed
+  by the next model step. Merely accepting the `-1` placeholder could therefore
+  make bookkeeping tests pass while the model advanced with its sampled token
+  instead of the predetermined replay token.
+
+The invalid artifacts contain six raw rows, zero aggregates, structured
+Prefill and Decode failure phases, `hardware_validated: false`, and an Invalid
+`result.md`. The independent validator passed structural validation only; that
+does not override the invalid hardware result.
+
+Any fix must preserve async scheduling, the low-level
+`Worker.execute_model` boundary, torch.compile, and CUDA Graph requirements.
+Async mode must replace the request's GPU `prev_sampled_token_ids` entry as
+well as CPU state. A focused test must prove that the next step's real GPU
+input reads the injected token. Acceptance must be rerun from preflight through
+the hardware-gated pytest against the new exact commit and image.
+
 ## Transfer the implementation
 
 The branch has not been pushed as part of this handoff. From the developer
