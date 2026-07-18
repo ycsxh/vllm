@@ -154,6 +154,8 @@ counts; a hardware-valid run also records the observed CUDA Graph runtime mode
 for every warmup and steady sample. The school-server command and acceptance
 procedure are documented in
 [`container/README.md`](container/README.md#ticket-04-profile-spine).
+The exact local-to-server continuation is recorded in
+[`TICKET_04_HANDOFF.md`](TICKET_04_HANDOFF.md).
 
 On a developer workstation, use only result validation, the focused CPU
 contract tests, and `profile-spine --print-plan`. Do not load the model or opt
