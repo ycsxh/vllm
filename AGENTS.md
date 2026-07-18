@@ -1,7 +1,21 @@
 # Agent Instructions for vLLM
 
-> These instructions apply to **all** AI-assisted contributions to `vllm-project/vllm`.
+> These instructions apply to **all** AI-assisted work in this fork.
 > Breaching these guidelines can result in automatic banning.
+
+## 0. Repository Authority (Mandatory)
+
+- Make all pushes and GitHub state changes only in the personal fork
+  `ycsxh/vllm`; treat `vllm-project/vllm` as a read-only reference.
+- Never create, edit, comment on, label, review, close, or otherwise mutate an
+  upstream issue, PR, discussion, release, workflow, or repository setting.
+- State-changing `gh` commands must specify `--repo ycsxh/vllm`, and pushes must
+  name the personal-fork remote explicitly. Verify both target repositories
+  before executing the mutation.
+- Read-only upstream fetches and duplicate-work searches are allowed, but must
+  not produce public interaction records.
+- Keep fork-only issues, PR metadata, and this authority policy out of every
+  patch proposed to upstream.
 
 ## 1. Contribution Policy (Mandatory)
 

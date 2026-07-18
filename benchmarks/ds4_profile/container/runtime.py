@@ -13,6 +13,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -729,6 +731,174 @@ def _gpu_smoke(config_path: Path, output_path: Path, print_plan: bool) -> int:
     return 0 if passed else 2
 
 
+def _profile_role_settings() -> dict[str, dict[str, str | int]]:
+    return {
+        "prefill": {
+            "gpu": os.environ.get("DS4_PREFILL_GPU", "0"),
+            "cpuset": os.environ.get("DS4_PREFILL_CPUSET", "0,2,4,6,8,10"),
+            "numa_node": 0,
+        },
+        "decode": {
+            "gpu": os.environ.get("DS4_DECODE_GPU", "1"),
+            "cpuset": os.environ.get("DS4_DECODE_CPUSET", "1,3,5,7,9,11"),
+            "numa_node": 1,
+        },
+    }
+
+
+def _profile_spine_worker_commands(
+    profile_config_path: Path, work_dir: Path
+) -> list[list[str]]:
+    return [
+        [
+            "numactl",
+            f"--physcpubind={settings['cpuset']}",
+            f"--membind={settings['numa_node']}",
+            "env",
+            f"CUDA_VISIBLE_DEVICES={settings['gpu']}",
+            sys.executable,
+            "-m",
+            "benchmarks.ds4_profile.profile_spine",
+            "gpu-worker",
+            "--config",
+            str(profile_config_path),
+            "--role",
+            role,
+            "--output",
+            str(work_dir / f"{role}.json"),
+        ]
+        for role, settings in _profile_role_settings().items()
+    ]
+
+
+def _effective_profile_config(profile_config_path: Path) -> dict[str, Any]:
+    config = json.loads(profile_config_path.read_text())
+    if not config.get("run_id"):
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        config["run_id"] = f"ds4-spine-{timestamp}-{uuid.uuid4().hex[:8]}"
+    dirty_value = os.environ.get(
+        "DS4_VLLM_DIRTY", str(config.get("source", {}).get("dirty", True))
+    ).lower()
+    config["source"] = {
+        "commit": os.environ.get(
+            "DS4_VLLM_COMMIT", config.get("source", {}).get("commit", "unknown")
+        ),
+        "dirty": (
+            dirty_value == "true" if dirty_value in {"true", "false"} else "unknown"
+        ),
+    }
+    config["roles"] = _profile_role_settings()
+    return config
+
+
+def _profile_spine_assemble_command(
+    config_path: Path,
+    preflight_path: Path,
+    work_dir: Path,
+    output_dir: Path,
+) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "benchmarks.ds4_profile.profile_spine",
+        "assemble",
+        "--config",
+        str(config_path),
+        "--preflight",
+        str(preflight_path),
+        "--worker-result",
+        str(work_dir / "prefill.json"),
+        "--worker-result",
+        str(work_dir / "decode.json"),
+        "--output-dir",
+        str(output_dir),
+    ]
+
+
+def _profile_spine(
+    container_config_path: Path,
+    profile_config_path: Path,
+    output_dir: Path | None,
+    print_plan: bool,
+) -> int:
+    config = _effective_profile_config(profile_config_path)
+    if output_dir is None:
+        output_dir = Path("/mnt/ds4/results/ticket-04") / config["run_id"]
+    work_dir = output_dir.parent / f".{output_dir.name}.workers"
+    effective_config_path = work_dir / "run-config.json"
+    preflight_path = work_dir / "preflight.json"
+    commands = _profile_spine_worker_commands(effective_config_path, work_dir)
+    assemble_command = _profile_spine_assemble_command(
+        effective_config_path, preflight_path, work_dir, output_dir
+    )
+    if print_plan:
+        print(
+            shlex.join(
+                [
+                    sys.executable,
+                    "-m",
+                    "benchmarks.ds4_profile.container.runtime",
+                    "preflight",
+                    "--config",
+                    str(container_config_path),
+                    "--output",
+                    str(preflight_path),
+                ]
+            )
+        )
+        for command in commands:
+            print(shlex.join(command))
+        print(shlex.join(assemble_command))
+        return 0
+
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        dir=output_dir.parent, prefix=f".{output_dir.name}.workers-"
+    ) as temporary_dir:
+        actual_work_dir = Path(temporary_dir)
+        actual_config_path = actual_work_dir / "run-config.json"
+        actual_preflight_path = actual_work_dir / "preflight.json"
+        _write_json(actual_config_path, config)
+        preflight_returncode = _preflight(container_config_path, actual_preflight_path)
+        actual_commands = _profile_spine_worker_commands(
+            actual_config_path, actual_work_dir
+        )
+        if preflight_returncode == 0:
+            processes = [subprocess.Popen(command) for command in actual_commands]
+            returncodes = [process.wait() for process in processes]
+        else:
+            returncodes = [2, 2]
+            for role in ("prefill", "decode"):
+                _write_json(
+                    actual_work_dir / f"{role}.json",
+                    {
+                        "schema_version": config["schema_version"],
+                        "run_id": config["run_id"],
+                        "hardware_validated": False,
+                        "role": role,
+                        "runner_boundary": (
+                            "vllm.v1.worker.gpu_worker.Worker.execute_model"
+                        ),
+                        "samples": [],
+                        "status": "skipped",
+                        "error": "hardware preflight failed",
+                    },
+                )
+        for command, returncode in zip(actual_commands, returncodes):
+            worker_path = Path(command[-1])
+            worker = json.loads(worker_path.read_text())
+            worker["command"] = command
+            worker["returncode"] = returncode
+            _write_json(worker_path, worker)
+        actual_assemble_command = _profile_spine_assemble_command(
+            actual_config_path,
+            actual_preflight_path,
+            actual_work_dir,
+            output_dir,
+        )
+        return subprocess.run(actual_assemble_command, check=False).returncode
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="DS4 container runtime checks.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -763,6 +933,17 @@ def main() -> None:
     gpu_worker.add_argument("--role", choices=("prefill", "decode"), required=True)
     gpu_worker.add_argument("--output", type=Path, required=True)
     gpu_worker.add_argument("--inspect-input", action="store_true")
+    profile_spine = subparsers.add_parser("profile-spine")
+    profile_spine.add_argument(
+        "--config", type=Path, default=Path("/mnt/ds4/config/container-contract.json")
+    )
+    profile_spine.add_argument(
+        "--profile-config",
+        type=Path,
+        default=Path("/mnt/ds4/config/profile-spine.json"),
+    )
+    profile_spine.add_argument("--output-dir", type=Path)
+    profile_spine.add_argument("--print-plan", action="store_true")
     cache_model = subparsers.add_parser("cache-model")
     cache_model.add_argument(
         "--config", type=Path, default=Path("/mnt/ds4/config/container-contract.json")
@@ -793,6 +974,15 @@ def main() -> None:
     if args.command == "gpu-worker":
         raise SystemExit(
             _gpu_worker(args.config, args.role, args.output, args.inspect_input)
+        )
+    if args.command == "profile-spine":
+        raise SystemExit(
+            _profile_spine(
+                args.config,
+                args.profile_config,
+                args.output_dir,
+                args.print_plan,
+            )
         )
     if args.command == "cache-model":
         raise SystemExit(_cache_model(args.config, args.output, args.print_plan))

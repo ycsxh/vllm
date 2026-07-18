@@ -1,0 +1,55 @@
+{
+  "artifacts": {
+    "rendered_turns": "/mnt/ds4/ticket-02/rendered_turns.parquet",
+    "workload_plan": "/mnt/ds4/ticket-02/workload_plan.json"
+  },
+  "model": {
+    "repo_id": "Qwen/Qwen2.5-Coder-7B-Instruct",
+    "revision": "c03e6d358207e414f1eca0bb1891e29f1db0e242",
+    "tokenizer": "/mnt/ds4/tokenizers/qwen2.5-coder-7b-instruct/c03e6d358207e414f1eca0bb1891e29f1db0e242"
+  },
+  "profile": {
+    "block_size": 16,
+    "max_num_batched_tokens": 4096,
+    "measured_repetitions": 10,
+    "noisy_cv_threshold": 0.05,
+    "prefill_chunk_tokens": 128,
+    "warmup_repetitions": 3
+  },
+  "runtime": {
+    "compilation": {
+      "capture_sizes": [1, 128],
+      "compile_sizes": [1, 128],
+      "cudagraph_mode": "FULL_AND_PIECEWISE",
+      "mode": "VLLM_COMPILE"
+    },
+    "dtype": "half",
+    "enable_chunked_prefill": true,
+    "enable_prefix_caching": true,
+    "enforce_eager": false,
+    "gpu_memory_utilization": 0.9,
+    "kv_cache_dtype": "auto",
+    "max_num_seqs": 1,
+    "sampling": {
+      "max_tokens": 1,
+      "temperature": 0.0
+    },
+    "seed": 0,
+    "skip_tokenizer_init": true,
+    "tensor_parallel_size": 1
+  },
+  "roles": {
+    "decode": {
+      "gpu": 1
+    },
+    "prefill": {
+      "gpu": 0
+    }
+  },
+  "run_id": null,
+  "schema_version": "1.0.0",
+  "source": {
+    "commit": "unknown",
+    "dirty": true
+  }
+}
