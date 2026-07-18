@@ -8,6 +8,8 @@ from typing import Any
 
 from benchmarks.ds4_profile.profile_spine import make_sample_row
 
+_ASYNC_TOKEN_PLACEHOLDER = -1
+
 
 def _create_vllm_config(config: dict[str, Any]):
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
@@ -210,21 +212,57 @@ def _cudagraph_observation(output: Any) -> dict[str, int | str]:
     }
 
 
-def _inject_teacher_forced_token(worker: Any, req_id: str, token_id: int) -> int:
+def _has_sampled_tokens(output: Any) -> bool:
+    return output is not None and any(output.sampled_token_ids)
+
+
+def _inject_teacher_forced_token(
+    worker: Any,
+    req_id: str,
+    sampled_token_id: int,
+    injected_token_id: int,
+) -> None:
     runner = worker.model_runner
     request = runner.requests[req_id]
     if not request.output_token_ids:
         raise RuntimeError("cannot replace a sampled token before sampling")
-    sampled_token_id = request.output_token_ids[-1]
-    request.output_token_ids[-1] = token_id
+    state_token_id = request.output_token_ids[-1]
+    if state_token_id not in {sampled_token_id, _ASYNC_TOKEN_PLACEHOLDER}:
+        raise RuntimeError("runner state does not contain the sampled token")
+    request.output_token_ids[-1] = injected_token_id
     req_index = runner.input_batch.req_id_to_index[req_id]
     token_index = (
         runner.input_batch.num_prompt_tokens[req_index]
         + len(request.output_token_ids)
         - 1
     )
-    runner.input_batch.token_ids_cpu[req_index, token_index] = token_id
-    return sampled_token_id
+    runner.input_batch.token_ids_cpu[req_index, token_index] = injected_token_id
+
+    prev_sampled_token_ids = runner.input_batch.prev_sampled_token_ids
+    if prev_sampled_token_ids is None:
+        return
+    if prev_sampled_token_ids.ndim != 2 or req_index >= prev_sampled_token_ids.shape[0]:
+        raise RuntimeError("async sampled-token cache has an unexpected shape")
+    cached_token_id = int(prev_sampled_token_ids[req_index, 0].item())
+    if cached_token_id != sampled_token_id:
+        raise RuntimeError(
+            "async sampled-token cache does not contain the sampled token"
+        )
+    prev_sampled_token_ids[req_index, 0] = injected_token_id
+
+
+def _assert_teacher_forced_input(
+    worker: Any, req_id: str, expected_token_id: int
+) -> None:
+    runner = worker.model_runner
+    req_id_to_index = runner.input_batch.req_id_to_index
+    if len(req_id_to_index) != 1 or req_id_to_index.get(req_id) != 0:
+        raise RuntimeError("teacher-forced input verification requires batch size one")
+    actual_token_id = int(runner.input_ids.gpu[0].item())
+    if actual_token_id != expected_token_id:
+        raise RuntimeError(
+            "next model step did not consume the injected teacher-forced token"
+        )
 
 
 def _phase(index: int, warmup_repetitions: int) -> tuple[str, int]:
@@ -297,7 +335,7 @@ def _run_prefill(
         phase, ordinal = _phase(index, profile["warmup_repetitions"])
         try:
             output, wall_ms, cuda_ms = _execute_timed(executor, scheduler_output)
-            if output is not None and output.sampled_token_ids:
+            if _has_sampled_tokens(output):
                 raise RuntimeError("chunked-prefill point unexpectedly sampled a token")
             observation = _cudagraph_observation(output)
         except Exception as error:
@@ -381,11 +419,12 @@ def _run_decode(
             setup_output, _, _ = _execute_timed(executor, scheduler_output)
             computed_tokens += chunk_tokens
         setup_sampled_token_id = _sampled_token_id(setup_output)
-        replaced_token_id = _inject_teacher_forced_token(
-            worker, req_id, completion_token_ids[0]
+        _inject_teacher_forced_token(
+            worker,
+            req_id,
+            setup_sampled_token_id,
+            completion_token_ids[0],
         )
-        if replaced_token_id != setup_sampled_token_id:
-            raise RuntimeError("runner state does not contain the setup sampled token")
     except Exception as error:
         rows.append(
             make_sample_row(
@@ -421,13 +460,15 @@ def _run_decode(
         cached_tokens = len(prompt_token_ids) + index
         try:
             output, wall_ms, cuda_ms = _execute_timed(executor, scheduler_output)
+            _assert_teacher_forced_input(worker, req_id, completion_token_ids[index])
             sampled_token_id = _sampled_token_id(output)
             observation = _cudagraph_observation(output)
-            replaced_token_id = _inject_teacher_forced_token(
-                worker, req_id, injected_token_id
+            _inject_teacher_forced_token(
+                worker,
+                req_id,
+                sampled_token_id,
+                injected_token_id,
             )
-            if replaced_token_id != sampled_token_id:
-                raise RuntimeError("runner state does not contain the sampled token")
         except Exception as error:
             rows.append(
                 make_sample_row(

@@ -6,10 +6,79 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import torch
+
+
+def _fake_gpu_worker(
+    *, state_token_id: int, cached_token_id: int | None
+) -> SimpleNamespace:
+    prev_sampled_token_ids = (
+        None if cached_token_id is None else torch.tensor([[cached_token_id]])
+    )
+    input_batch = SimpleNamespace(
+        num_prompt_tokens=[2],
+        prev_sampled_token_ids=prev_sampled_token_ids,
+        req_id_to_index={"request": 0},
+        token_ids_cpu=torch.zeros((1, 4), dtype=torch.int64),
+    )
+    runner = SimpleNamespace(
+        input_batch=input_batch,
+        input_ids=SimpleNamespace(gpu=torch.zeros(1, dtype=torch.int64)),
+        requests={"request": SimpleNamespace(output_token_ids=[state_token_id])},
+    )
+    return SimpleNamespace(model_runner=runner)
+
+
+def test_prefill_sample_detection_checks_inner_request_tokens() -> None:
+    from benchmarks.ds4_profile.gpu_profile import _has_sampled_tokens
+
+    assert not _has_sampled_tokens(SimpleNamespace(sampled_token_ids=[[]]))
+    assert _has_sampled_tokens(SimpleNamespace(sampled_token_ids=[[17]]))
+
+
+@pytest.mark.parametrize(
+    ("state_token_id", "cached_token_id"),
+    [(17, None), (-1, 17)],
+)
+def test_teacher_forcing_replaces_sync_and_async_token_state(
+    state_token_id: int, cached_token_id: int | None
+) -> None:
+    from benchmarks.ds4_profile.gpu_profile import _inject_teacher_forced_token
+
+    worker = _fake_gpu_worker(
+        state_token_id=state_token_id,
+        cached_token_id=cached_token_id,
+    )
+    _inject_teacher_forced_token(worker, "request", 17, 23)
+
+    runner = worker.model_runner
+    assert runner.requests["request"].output_token_ids == [23]
+    assert runner.input_batch.token_ids_cpu[0, 2].item() == 23
+    if cached_token_id is not None:
+        assert runner.input_batch.prev_sampled_token_ids[0, 0].item() == 23
+
+
+def test_next_gpu_input_must_consume_the_injected_token() -> None:
+    from benchmarks.ds4_profile.gpu_profile import (
+        _assert_teacher_forced_input,
+        _inject_teacher_forced_token,
+    )
+
+    worker = _fake_gpu_worker(state_token_id=-1, cached_token_id=17)
+    _inject_teacher_forced_token(worker, "request", 17, 23)
+    runner = worker.model_runner
+
+    runner.input_ids.gpu.copy_(runner.input_batch.prev_sampled_token_ids[:, 0])
+    _assert_teacher_forced_input(worker, "request", 23)
+
+    runner.input_ids.gpu[0] = 17
+    with pytest.raises(RuntimeError, match="did not consume"):
+        _assert_teacher_forced_input(worker, "request", 23)
 
 
 def _write_fixture_inputs(tmp_path: Path) -> Path:
