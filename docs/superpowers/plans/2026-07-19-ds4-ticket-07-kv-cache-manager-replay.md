@@ -19,6 +19,10 @@
   trajectory, and one pinned usable capacity. Initialize vLLM's process-global
   null hash once at replay/process entry, never once per request. Usable
   capacity excludes the reserved null block.
+- Set `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` before process startup and before
+  any vLLM import in local tests, direct CLI use, and Docker. Native event
+  hashes must remain byte-valued SHA-256 hashes identical to the request
+  prepass; never convert or compare lossy 64-bit integer event hashes.
 - Exercise the real `Request` and `KVCacheManager` interface. Do not implement an LRU, prefix lookup, allocation, or free-order imitation.
 - Do not modify `benchmarks/ds4_profile/profile_spine.py`, `gpu_profile.py`, `config/profile-spine.json`, or Ticket 05 tests, schemas, point IDs, validators, and runtime behavior.
 - Keep mounted snapshot, Ticket 01/02 artifacts, and tokenizers read-only. Write planning and replay outputs only below the explicit result directory.
@@ -121,6 +125,7 @@ The module-level functions used across tasks have these exact signatures:
 - `validate_result_dir(result_dir: Path) -> None`
 - `collect_input_records(config: dict[str, Any]) -> list[InputRecord]`
 - `verify_input_records(records: Sequence[InputRecord]) -> None`
+- `_selected_turn_manifest(turns: Sequence[ReplayTurn], block_size: int) -> list[dict[str, Any]]`
 - `_out_of_capacity_result(*, run_id: str, turn: ReplayTurn, event_rows: list[dict[str, Any]], turn_rows: list[dict[str, Any]], manager: KVCacheManager, error: str) -> ReplayResult`
 
 ---
@@ -142,11 +147,15 @@ Add imports and a row factory that contains prompt fields only; deliberately omi
 ```python
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+
+assert os.environ["PYTHONHASHSEED"] == "0"
+assert os.environ["VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES"] == "0"
 
 
 def _turn_row(
@@ -234,7 +243,7 @@ def test_load_full_turns_keeps_prompt_ids_and_never_requires_decode_ids(
 Run:
 
 ```bash
-PYTHONHASHSEED=0 .venv/bin/python -m pytest \
+PYTHONHASHSEED=0 VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0 .venv/bin/python -m pytest \
   tests/benchmarks/ds4_profile/test_kv_cache_replay.py \
   -k 'load_full_turns' -v
 ```
@@ -367,6 +376,7 @@ def _stable_hash_seed(monkeypatch: pytest.MonkeyPatch) -> None:
     from benchmarks.ds4_profile.kv_cache_replay import _initialize_hashing
 
     monkeypatch.setenv("PYTHONHASHSEED", "0")
+    monkeypatch.setenv("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES", "0")
     _initialize_hashing()
 
 
@@ -396,6 +406,27 @@ def test_hash_initialization_is_once_and_equal_prefixes_hash_identically(
 
     assert calls == [kv_cache_replay.sha256]
     assert first.block_hashes[0] == second.block_hashes[0]
+
+
+def test_native_events_preserve_byte_sha_hashes() -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import make_manager, make_request
+    from vllm.distributed.kv_events import BlockStored
+
+    manager = make_manager(capacity_blocks=2, block_size=2, max_model_len=32)
+    request = make_request(_replay_turn(0, [1, 1, 2, 2]), 2, "request")
+    hit, hit_tokens, _ = manager.get_computed_blocks(request)
+    assert manager.allocate_slots(
+        request, request.num_tokens, hit_tokens, hit
+    ) is not None
+
+    hashes = [
+        value
+        for event in manager.take_events()
+        if isinstance(event, BlockStored)
+        for value in event.block_hashes or []
+    ]
+    assert hashes
+    assert all(isinstance(value, bytes) and len(value) == 32 for value in hashes)
 
 
 def test_real_manager_hashes_only_full_blocks_and_reserves_null_block() -> None:
@@ -455,9 +486,9 @@ def test_observer_records_touch_before_allocate_and_reverse_free() -> None:
 - [ ] **Step 2: Run tests and verify missing interfaces**
 
 ```bash
-PYTHONHASHSEED=0 .venv/bin/python -m pytest \
+PYTHONHASHSEED=0 VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0 .venv/bin/python -m pytest \
   tests/benchmarks/ds4_profile/test_kv_cache_replay.py \
-  -k 'hash_initialization or real_manager or observer' -v
+  -k 'hash_initialization or native_events or real_manager or observer' -v
 ```
 
 Expected: FAIL with `ImportError` for `_initialize_hashing`, `make_manager`,
@@ -469,6 +500,9 @@ Expected: FAIL with `ImportError` for `_initialize_hashing`, `make_manager`,
 import os
 from contextlib import contextmanager
 from time import perf_counter_ns
+
+if os.environ.get("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES") != "0":
+    raise RuntimeError("Ticket 07 requires byte-valued KV event hashes")
 
 import torch
 from vllm.sampling_params import SamplingParams
@@ -493,6 +527,8 @@ def _initialize_hashing() -> None:
     global _HASHING_INITIALIZED
     if os.environ.get("PYTHONHASHSEED") != "0":
         raise RuntimeError("Ticket 07 requires PYTHONHASHSEED=0")
+    if os.environ.get("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES") != "0":
+        raise RuntimeError("Ticket 07 requires byte-valued KV event hashes")
     if not _HASHING_INITIALIZED:
         init_none_hash(sha256)
         _HASHING_INITIALIZED = True
@@ -769,7 +805,7 @@ def test_replay_separates_manager_forced_recompute_from_capacity_miss() -> None:
 - [ ] **Step 2: Run replay tests and verify red**
 
 ```bash
-PYTHONHASHSEED=0 .venv/bin/python -m pytest \
+PYTHONHASHSEED=0 VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0 .venv/bin/python -m pytest \
   tests/benchmarks/ds4_profile/test_kv_cache_replay.py \
   -k 'replay_classifies or out_of_capacity or manager_forced' -v
 ```
@@ -928,7 +964,7 @@ Expected: `2 passed`; the first test observes all three miss classes and a usefu
 - [ ] **Step 6: Run the real-manager regression tests used as prior art**
 
 ```bash
-PYTHONHASHSEED=0 .venv/bin/python -m pytest \
+PYTHONHASHSEED=0 VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0 .venv/bin/python -m pytest \
   tests/v1/core/test_prefix_caching.py::test_prefill \
   tests/v1/core/test_single_type_kv_cache_manager.py::test_evictable_cached_blocks_not_double_allocated \
   -v
@@ -999,11 +1035,13 @@ def test_selection_uses_capacity_mode_and_trajectory_stable_key() -> None:
 def test_verify_pinned_selection_rejects_drift() -> None:
     from benchmarks.ds4_profile.kv_cache_replay import (
         _canonical_json_sha256,
+        _selected_turn_manifest,
         _with_canonical_sha256,
         verify_pinned_selection,
     )
 
     input_set_sha256 = _canonical_json_sha256([])
+    turn_manifest_sha256 = _canonical_json_sha256([])
     plan = _with_canonical_sha256(
         {
             "schema_version": "1.0.0",
@@ -1015,6 +1053,8 @@ def test_verify_pinned_selection_rejects_drift() -> None:
                 "reasoning_mode": "no_think",
                 "capacity_blocks": 11,
                 "input_set_sha256": input_set_sha256,
+                "turns": [],
+                "turn_manifest_sha256": turn_manifest_sha256,
             },
         }
     )
@@ -1027,6 +1067,7 @@ def test_verify_pinned_selection_rejects_drift() -> None:
             "capacity_blocks": 10,
             "input_set_sha256": input_set_sha256,
             "planning_sha256": plan["sha256"],
+            "turn_manifest_sha256": turn_manifest_sha256,
         }
     }
 
@@ -1080,7 +1121,7 @@ def test_input_records_cover_data_provenance_and_every_tokenizer_file(
 - [ ] **Step 2: Run selection tests and verify red**
 
 ```bash
-PYTHONHASHSEED=0 .venv/bin/python -m pytest \
+PYTHONHASHSEED=0 VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0 .venv/bin/python -m pytest \
   tests/benchmarks/ds4_profile/test_kv_cache_replay.py \
   -k 'selection_uses or pinned_selection or input_records' -v
 ```
@@ -1098,6 +1139,13 @@ record, reject duplicate logical names and an empty tokenizer directory, and
 make `verify_input_records` recompute size and digest from disk. Canonicalize the
 record list as sorted compact JSON and expose its SHA-256 as
 `input_set_sha256`.
+
+Implement `_selected_turn_manifest` by sorting one trajectory on `turn_index`
+and rejecting duplicates or gaps. Each ordered row contains exactly
+`trajectory_id`, `turn_index`, `prompt_tokens`,
+`prompt_token_ids_sha256` (SHA-256 of compact JSON token IDs), and
+`block_hashes_sha256` (SHA-256 of compact JSON canonical chained block hashes).
+Hash the complete ordered row list as `turn_manifest_sha256`.
 
 Group turns by trajectory. For each group, set capacity to the maximum `ceil(prompt_tokens / block_size)`, run the real metadata replay, and mark it eligible only when every turn passed and at least one native eviction occurred:
 
@@ -1128,7 +1176,11 @@ def build_selection_plan(
     input_set_sha256 = _canonical_json_sha256(input_rows)
     candidates = []
     for trajectory_id in sorted({turn.trajectory_id for turn in turns}):
-        session = [turn for turn in turns if turn.trajectory_id == trajectory_id]
+        session = sorted(
+            (turn for turn in turns if turn.trajectory_id == trajectory_id),
+            key=lambda turn: turn.turn_index,
+        )
+        selected_turns = _selected_turn_manifest(session, block_size)
         capacity = max(
             (turn.prompt_tokens + block_size - 1) // block_size for turn in session
         )
@@ -1146,6 +1198,8 @@ def build_selection_plan(
                 "turn_count": len(session),
                 "capacity_blocks": capacity,
                 "eviction_count": result.eviction_count,
+                "turns": selected_turns,
+                "turn_manifest_sha256": _canonical_json_sha256(selected_turns),
                 "status": (
                     "eligible"
                     if result.status == "passed" and result.eviction_count > 0
@@ -1172,7 +1226,10 @@ def build_selection_plan(
 compact JSON, computes SHA-256, and adds it as top-level `sha256`.
 `verify_pinned_selection` verifies that digest, recomputes every input record,
 recomputes `input_set_sha256`, and compares trajectory, reasoning mode,
-capacity, input-set digest, and planning digest exactly.
+capacity, input-set digest, ordered-turn-manifest digest, and planning digest
+exactly. `run` reconstructs turns from the hash-verified pinned inputs, requires
+their ordered manifest to equal `plan["selected"]["turns"]`, and copies that
+exact list to top-level `selected_turns` in `run-config.json`.
 
 - [ ] **Step 4: Add the explicit pre-selection config state**
 
@@ -1187,10 +1244,15 @@ Create this exact JSON before the school-server planning pass:
     "rendered_turns": "/mnt/ds4/ticket-02/rendered_turns.parquet",
     "workload_provenance": "/mnt/ds4/ticket-02/provenance.json"
   },
+  "environment": {
+    "PYTHONHASHSEED": "0",
+    "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES": "0"
+  },
   "replay": {
     "batch_size": 1,
     "block_size": 16,
     "hash_function": "sha256",
+    "kv_event_hash_format": "bytes",
     "max_model_len": 65536,
     "order": "serial"
   },
@@ -1202,6 +1264,7 @@ Create this exact JSON before the school-server planning pass:
     "planning_sha256": null,
     "reasoning_mode": null,
     "status": "unselected",
+    "turn_manifest_sha256": null,
     "trajectory_id": null
   },
   "source": {
@@ -1223,7 +1286,7 @@ or SHA differs from current mounted content.
 - [ ] **Step 5: Run selection tests and full focused tests**
 
 ```bash
-PYTHONHASHSEED=0 .venv/bin/python -m pytest \
+PYTHONHASHSEED=0 VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0 .venv/bin/python -m pytest \
   tests/benchmarks/ds4_profile/test_kv_cache_replay.py -v
 ```
 
@@ -1278,6 +1341,12 @@ def test_artifacts_are_versioned_metadata_only_and_cross_validated(
         }
     ]
     input_set_sha256 = _canonical_json_sha256(inputs)
+    replay_turns = [
+        _replay_turn(0, [1, 1, 2, 2, 3]),
+        _replay_turn(1, [1, 1, 9, 9, 8, 8]),
+    ]
+    selected_turns = _selected_turn_manifest(replay_turns, block_size=2)
+    turn_manifest_sha256 = _canonical_json_sha256(selected_turns)
     planning_record = _with_canonical_sha256(
         {
             "schema_version": "1.0.0",
@@ -1289,15 +1358,26 @@ def test_artifacts_are_versioned_metadata_only_and_cross_validated(
                 "reasoning_mode": "no_think",
                 "capacity_blocks": 3,
                 "input_set_sha256": input_set_sha256,
+                "turns": selected_turns,
+                "turn_manifest_sha256": turn_manifest_sha256,
             },
         }
     )
     config = {
         "schema_version": "1.0.0",
         "run_id": "fixture-run",
+        "environment": {
+            "PYTHONHASHSEED": "0",
+            "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES": "0",
+        },
         "inputs": inputs,
         "planning_record": planning_record,
-        "replay": {"block_size": 2, "max_model_len": 32},
+        "selected_turns": selected_turns,
+        "replay": {
+            "block_size": 2,
+            "kv_event_hash_format": "bytes",
+            "max_model_len": 32,
+        },
         "selection": {
             "status": "pinned",
             "trajectory_id": "task:no_think",
@@ -1305,15 +1385,13 @@ def test_artifacts_are_versioned_metadata_only_and_cross_validated(
             "capacity_blocks": 3,
             "input_set_sha256": input_set_sha256,
             "planning_sha256": planning_record["sha256"],
+            "turn_manifest_sha256": turn_manifest_sha256,
         },
         "source": {"commit": "abc123", "dirty": False},
     }
     result = replay_session(
         run_id="fixture-run",
-        turns=[
-            _replay_turn(0, [1, 1, 2, 2, 3]),
-            _replay_turn(1, [1, 1, 9, 9, 8, 8]),
-        ],
+        turns=replay_turns,
         capacity_blocks=3,
         block_size=2,
         max_model_len=32,
@@ -1440,12 +1518,32 @@ def test_validator_replays_occupancy_transitions(tmp_path: Path) -> None:
     _rewrite_event_rows(output, corrupt)
     with pytest.raises(ValueError, match="occupancy transition mismatch"):
         _validate_fixture(output)
+
+
+@pytest.mark.parametrize("corruption", ["omit", "reorder", "tamper"])
+def test_validator_reconstructs_the_exact_ordered_selected_turns(
+    tmp_path: Path, corruption: str
+) -> None:
+    output = _write_valid_result(tmp_path)
+    path = output / "run-config.json"
+    config = json.loads(path.read_text())
+    turns = config["selected_turns"]
+    if corruption == "omit":
+        config["selected_turns"] = turns[:-1]
+    elif corruption == "reorder":
+        config["selected_turns"] = list(reversed(turns))
+    else:
+        config["selected_turns"][0]["prompt_token_ids_sha256"] = "0" * 64
+    path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+
+    with pytest.raises(ValueError, match="selected turn manifest mismatch"):
+        _validate_fixture(output)
 ```
 
 - [ ] **Step 2: Run artifact tests and verify red**
 
 ```bash
-PYTHONHASHSEED=0 .venv/bin/python -m pytest \
+PYTHONHASHSEED=0 VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0 .venv/bin/python -m pytest \
   tests/benchmarks/ds4_profile/test_kv_cache_replay.py \
   -k 'artifacts_are or validator' -v
 ```
@@ -1533,11 +1631,13 @@ TURN_SUMMARY_SCHEMA = pa.schema(
 {
     "artifact_schema_version": SCHEMA_VERSION,
     "hardware_validated": False,
+    "environment": config["environment"],
     "inputs": config["inputs"],
     "metadata_only_validated": result.status == "passed",
     "planning_record": config["planning_record"],
     "planning_sha256": config["selection"]["planning_sha256"],
     "run_id": config["run_id"],
+    "selected_turns": config["selected_turns"],
     "selection": config["selection"],
     "source": config["source"],
     "status": result.status,
@@ -1581,6 +1681,14 @@ observer, and native rows. It must:
 - recompute and verify every manifest, Ticket 01/02 data/provenance, and
   tokenizer input size/SHA from provenance, then verify the canonical input-set
   and planning-record digests; and
+- reconstruct the selected trajectory from those verified inputs, recompute
+  every prompt-token and chained-block-hash digest, and require exact ordered
+  equality among reconstructed turns, planning-record selected turns,
+  run-config selected turns, provenance selected turns, and artifact turn
+  summaries; omitted, extra, reordered, or mutated turns all fail closed; and
+- require config, provenance, and the validator process environment all contain
+  `PYTHONHASHSEED="0"` and `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES="0"`, require
+  `kv_event_hash_format="bytes"`, and reject any integer native event hash; and
 - require `hardware_validated is False` and `metadata_only_validated` only for passed results.
 
 - [ ] **Step 5: Implement the three-command CLI**
@@ -1613,7 +1721,7 @@ independent validation. Validation errors print
 - [ ] **Step 6: Run artifact tests and the whole Ticket 07 suite**
 
 ```bash
-PYTHONHASHSEED=0 .venv/bin/python -m pytest \
+PYTHONHASHSEED=0 VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0 .venv/bin/python -m pytest \
   tests/benchmarks/ds4_profile/test_kv_cache_replay.py -v
 ```
 
@@ -1689,12 +1797,13 @@ def test_container_wrapper_marks_cache_replay_as_cpu_only() -> None:
     assert "--gpus" not in result.stdout
     assert "SYS_NICE" not in result.stdout
     assert "PYTHONHASHSEED=0" in result.stdout
+    assert "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0" in result.stdout
 ```
 
 - [ ] **Step 2: Run container tests and verify red**
 
 ```bash
-PYTHONHASHSEED=0 .venv/bin/python -m pytest \
+PYTHONHASHSEED=0 VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0 .venv/bin/python -m pytest \
   tests/benchmarks/ds4_profile/test_kv_cache_replay.py \
   -k 'container_runtime or container_wrapper' -v
 ```
@@ -1769,7 +1878,9 @@ Add `_effective_kv_cache_replay_config(config_path: Path) -> dict[str, Any]` by
 following `_effective_profile_config`: copy the checked-in JSON, generate
 `ds4-kv-replay-{UTC timestamp}-{8 hex characters}` only when `run_id` is null,
 and replace `source` from `DS4_VLLM_COMMIT` and `DS4_VLLM_DIRTY` with the same
-boolean-or-`"unknown"` parsing. For `run`, choose
+boolean-or-`"unknown"` parsing. Read the two hash environment variables from
+the already-started process, require both equal the checked-in values, and
+persist those actual values under `environment`. For `run`, choose
 `/mnt/ds4/results/ticket-07/{run_id}` when `--result-dir` is absent, write the
 effective JSON to the sibling staging path
 `/mnt/ds4/results/ticket-07/.{run_id}.work/run-config.json`, and pass that path
@@ -1801,13 +1912,15 @@ esac
 ```
 
 Keep `cache-model` as the only command with `HF_HUB_OFFLINE=0`; cache replay stays offline.
-Add `--env PYTHONHASHSEED=0` to the common Docker invocation so planning,
-replay, validation, and exact-image pytest share the same chained-hash seed.
+Add `--env PYTHONHASHSEED=0` and
+`--env VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` to the common Docker invocation
+so planning, replay, validation, and exact-image pytest share the same chained
+hash seed and byte-valued native event format.
 
 - [ ] **Step 5: Run container tests and regression plan checks**
 
 ```bash
-PYTHONHASHSEED=0 .venv/bin/python -m pytest \
+PYTHONHASHSEED=0 VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0 .venv/bin/python -m pytest \
   tests/benchmarks/ds4_profile/test_kv_cache_replay.py \
   tests/benchmarks/ds4_profile/test_container_workflow.py \
   -v
@@ -1890,7 +2003,7 @@ Explain that pinning the selection requires a new clean commit/image before the 
 - [ ] **Step 4: Run the complete lightweight local gate**
 
 ```bash
-PYTHONHASHSEED=0 .venv/bin/python -m pytest \
+PYTHONHASHSEED=0 VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0 .venv/bin/python -m pytest \
   tests/benchmarks/ds4_profile/test_kv_cache_replay.py \
   tests/benchmarks/ds4_profile/test_container_workflow.py \
   -v
@@ -1955,7 +2068,7 @@ With `DS4_RUN` defined as in the runbook, using image `local/vllm-ds4-profile:ti
 "${DS4_RUN[@]}" kv-cache-replay plan \
   --output /mnt/ds4/results/ticket-07-selection.json
 
-PYTHONHASHSEED=0 .venv/bin/python -c '
+PYTHONHASHSEED=0 VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0 .venv/bin/python -c '
 import json
 from pathlib import Path
 p = Path.home() / "ds4-storage/results/ticket-07-selection.json"
@@ -1976,6 +2089,7 @@ print(json.dumps({
     "planning_sha256": value["sha256"],
     "reasoning_mode": value["selected"]["reasoning_mode"],
     "status": "pinned",
+    "turn_manifest_sha256": value["selected"]["turn_manifest_sha256"],
     "trajectory_id": value["selected"]["trajectory_id"],
 }, indent=2, sort_keys=True))
 '
@@ -1985,16 +2099,18 @@ Expected: exit `0` and one complete JSON `selection` object. The planner
 candidate list shows every rejected/eligible trajectory, every admitted
 selected turn, and at least one native eviction. Its hashed input inventory
 covers both ticket data/provenance pairs and every tokenizer file, and it
-contains no completion/decode token field.
+contains no completion/decode token field. The selected ordered turn manifest
+contains every selected turn exactly once with prompt-token and block-hash
+digests.
 
 - [ ] **Step 3: Pin exactly the planner output and commit it**
 
-Use `apply_patch` to replace the six fields under `selection` with the exact
+Use `apply_patch` to replace the seven fields under `selection` with the exact
 JSON object printed in Step 2. Do not edit `replay`, input paths, or tokenizer
 revision. Then verify equality and all mounted input hashes using the module:
 
 ```bash
-PYTHONHASHSEED=0 .venv/bin/python -c '
+PYTHONHASHSEED=0 VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0 .venv/bin/python -c '
 import json
 from pathlib import Path
 from benchmarks.ds4_profile.kv_cache_replay import verify_pinned_selection
@@ -2086,10 +2202,12 @@ Expected: the evidence commit changes only the handoff. Acceptance remains bound
 - [ ] Confirm all native evictions have complementary `useful_later`/`never_reused` labels and correct nullability/reuse distance.
 - [ ] Confirm admission failure is preserved rather than changing capacity or prompt length.
 - [ ] Confirm `PYTHONHASHSEED=0` is present in local commands and Docker, null-hash initialization occurs once per process, and equal prefixes in separate requests produce equal hashes.
+- [ ] Confirm `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` is set before every test/CLI/container process imports vLLM, is recorded in config/provenance, and native/prepass hashes remain the same 32-byte SHA values.
 - [ ] Confirm scoped observation calls and restores the real `_maybe_evict_cached_block`, records exclusive eviction timing, and pairs true calls with native removals without implementing eviction semantics.
 - [ ] Confirm resident final blocks withheld by the manager's `prompt_len - 1` cap are labeled `manager_forced_recompute`, never capacity misses.
 - [ ] Confirm the validator independently reconstructs miss classes, future reuse, ordering, occupancy, and exclusive eviction timing, with corruption tests for each derived contract.
 - [ ] Confirm planning, run, provenance, and validation recompute manifest, Ticket 01/02 data and provenance, and every tokenizer file SHA rather than trusting configured paths.
+- [ ] Confirm the canonical selected-turn list and its prompt/block-hash digests are identical and ordered across the planning record, run config, provenance, reconstructed pinned inputs, and turn artifacts; omission, reorder, and tamper tests fail.
 - [ ] Confirm local evidence contains only focused CPU contracts and server evidence contains the full planning/container run.
 - [ ] Confirm docs and artifacts state that Ticket 07 used prompt metadata only and did not read Decode tokens, allocate KV tensors, establish HBM residency, or validate GPU behavior.
 - [ ] Confirm no remote mutation or push occurred during implementation without a separate user instruction.
