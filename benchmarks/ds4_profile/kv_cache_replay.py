@@ -65,10 +65,26 @@ def load_full_turns(config: dict[str, Any]) -> list[ReplayTurn]:
         block_size=config["replay"]["block_size"],
         include_token_ids=True,
     )
-    ticket_02 = pq.read_table(artifacts["rendered_turns"]).to_pylist()
-    expected = {
-        (row["trajectory_id"], row["turn_index"]): row for row in ticket_02
-    }
+    ticket_02 = pq.read_table(
+        artifacts["rendered_turns"], columns=list(SCALAR_TURN_FIELDS)
+    ).to_pylist()
+    expected: dict[tuple[str, int], dict[str, Any]] = {}
+    for row in ticket_02:
+        key = (row["trajectory_id"], row["turn_index"])
+        if key in expected:
+            raise ValueError(f"Ticket 02 duplicate key for {key}")
+        expected[key] = row
+
+    rendered_keys = [
+        (row["trajectory_id"], row["turn_index"]) for row in rendered
+    ]
+    if len(rendered_keys) != len(set(rendered_keys)):
+        raise ValueError("reconstructed turns contain duplicate keys")
+    if set(rendered_keys) != set(expected):
+        raise ValueError("Ticket 02 key set mismatch")
+    if len(rendered_keys) != len(expected):
+        raise ValueError("Ticket 02 row cardinality mismatch")
+
     turns: list[ReplayTurn] = []
     for row in rendered:
         key = (row["trajectory_id"], row["turn_index"])

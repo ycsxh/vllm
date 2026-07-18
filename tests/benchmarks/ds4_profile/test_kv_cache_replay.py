@@ -90,3 +90,96 @@ def test_load_full_turns_keeps_prompt_ids_and_never_requires_decode_ids(
 
     assert [turn.turn_index for turn in turns] == [0, 1]
     assert turns[1].prompt_token_ids == (1, 2, 3, 4, 5, 6)
+
+
+def test_load_full_turns_reads_only_ticket_02_scalar_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from benchmarks.ds4_profile import kv_cache_replay, workloads
+
+    row = _turn_row("task:no_think", 0, [1, 2, 3, 4])
+    monkeypatch.setattr(workloads, "render_turns", lambda **_: [row])
+    ticket_02 = dict(row)
+    ticket_02.pop("_prompt_token_ids")
+    ticket_02["execution_prompt_token_ids"] = [1, 2, 3, 4]
+    ticket_02["execution_completion_token_ids"] = [5, 6]
+    rendered_path = tmp_path / "rendered_turns.parquet"
+    pq.write_table(pa.Table.from_pylist([ticket_02]), rendered_path)
+    selected_columns: list[list[str]] = []
+    read_table = kv_cache_replay.pq.read_table
+
+    def record_selected_columns(path: str, *, columns: list[str]) -> pa.Table:
+        selected_columns.append(columns)
+        return read_table(path, columns=columns)
+
+    monkeypatch.setattr(kv_cache_replay.pq, "read_table", record_selected_columns)
+    config = {
+        "artifacts": {
+            "manifest": str(tmp_path / "manifest.json"),
+            "normalized_turns": str(tmp_path / "turns.parquet"),
+            "rendered_turns": str(rendered_path),
+        },
+        "tokenizer": {"path": str(tmp_path / "tokenizer")},
+        "replay": {"block_size": 4},
+    }
+
+    kv_cache_replay.load_full_turns(config)
+
+    assert selected_columns == [list(kv_cache_replay.SCALAR_TURN_FIELDS)]
+    assert "execution_prompt_token_ids" not in selected_columns[0]
+    assert "execution_completion_token_ids" not in selected_columns[0]
+
+
+def test_load_full_turns_rejects_duplicate_ticket_02_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from benchmarks.ds4_profile import workloads
+    from benchmarks.ds4_profile.kv_cache_replay import load_full_turns
+
+    row = _turn_row("task:no_think", 0, [1, 2, 3, 4])
+    monkeypatch.setattr(workloads, "render_turns", lambda **_: [row])
+    ticket_02 = dict(row)
+    ticket_02.pop("_prompt_token_ids")
+    rendered_path = tmp_path / "rendered_turns.parquet"
+    pq.write_table(pa.Table.from_pylist([ticket_02, ticket_02]), rendered_path)
+    config = {
+        "artifacts": {
+            "manifest": str(tmp_path / "manifest.json"),
+            "normalized_turns": str(tmp_path / "turns.parquet"),
+            "rendered_turns": str(rendered_path),
+        },
+        "tokenizer": {"path": str(tmp_path / "tokenizer")},
+        "replay": {"block_size": 4},
+    }
+
+    with pytest.raises(ValueError, match="Ticket 02 duplicate key"):
+        load_full_turns(config)
+
+
+def test_load_full_turns_rejects_extra_ticket_02_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from benchmarks.ds4_profile import workloads
+    from benchmarks.ds4_profile.kv_cache_replay import load_full_turns
+
+    row = _turn_row("task:no_think", 0, [1, 2, 3, 4])
+    monkeypatch.setattr(workloads, "render_turns", lambda **_: [row])
+    ticket_02_rows = []
+    for turn_index in (0, 1):
+        ticket_02 = _turn_row("task:no_think", turn_index, [1, 2, 3, 4])
+        ticket_02.pop("_prompt_token_ids")
+        ticket_02_rows.append(ticket_02)
+    rendered_path = tmp_path / "rendered_turns.parquet"
+    pq.write_table(pa.Table.from_pylist(ticket_02_rows), rendered_path)
+    config = {
+        "artifacts": {
+            "manifest": str(tmp_path / "manifest.json"),
+            "normalized_turns": str(tmp_path / "turns.parquet"),
+            "rendered_turns": str(rendered_path),
+        },
+        "tokenizer": {"path": str(tmp_path / "tokenizer")},
+        "replay": {"block_size": 4},
+    }
+
+    with pytest.raises(ValueError, match="Ticket 02 key set mismatch"):
+        load_full_turns(config)
