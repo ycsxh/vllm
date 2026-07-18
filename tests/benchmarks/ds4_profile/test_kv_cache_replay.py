@@ -140,6 +140,86 @@ def test_observer_records_touch_before_allocate_and_reverse_free() -> None:
     assert first_ids[-1] not in second_ids or len(set(first_ids)) < len(first_ids)
 
 
+def test_replay_classifies_misses_eviction_and_future_reuse() -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import replay_session
+
+    turns = [
+        _replay_turn(0, [1, 1, 2, 2, 3]),
+        _replay_turn(1, [1, 1, 9, 9, 8, 8]),
+        _replay_turn(2, [1, 1, 2, 2, 7]),
+    ]
+
+    result = replay_session(
+        run_id="fixture-run",
+        turns=turns,
+        capacity_blocks=3,
+        block_size=2,
+        max_model_len=32,
+    )
+
+    misses = {
+        row["miss_class"] for row in result.event_rows if row["cache_outcome"] == "miss"
+    }
+    evictions = [row for row in result.event_rows if row["operation"] == "evict"]
+    assert result.status == "passed"
+    assert misses == {"compulsory", "prefix_mismatch", "capacity"}
+    assert any(
+        row["useful_later"] is True
+        and row["turns_until_reuse"] == 1
+        and row["never_reused"] is False
+        for row in evictions
+    )
+    assert all(
+        row["prefix_source"] in {"global", "task", "session"}
+        for row in result.event_rows
+        if row["block_position"] is not None
+    )
+
+
+def test_replay_stops_without_mutating_an_out_of_capacity_prompt() -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import replay_session
+
+    turn = _replay_turn(0, [1, 1, 2, 2, 3, 3])
+    result = replay_session(
+        run_id="fixture-run",
+        turns=[turn],
+        capacity_blocks=2,
+        block_size=2,
+        max_model_len=32,
+    )
+
+    assert result.status == "out_of_capacity"
+    assert result.turn_rows[0]["prompt_tokens"] == 6
+    assert result.turn_rows[0]["status"] == "out_of_capacity"
+    assert result.event_rows[-1]["operation"] == "admission_failure"
+
+
+def test_replay_separates_manager_forced_recompute_from_capacity_miss() -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import replay_session
+
+    result = replay_session(
+        run_id="fixture-run",
+        turns=[
+            _replay_turn(0, [1, 1, 2, 2]),
+            _replay_turn(1, [1, 1, 2, 2]),
+        ],
+        capacity_blocks=2,
+        block_size=2,
+        max_model_len=32,
+    )
+
+    forced = [
+        row
+        for row in result.event_rows
+        if row["turn_index"] == 1 and row["cache_outcome"] == "manager_forced_recompute"
+    ]
+    assert len(forced) == 1
+    assert forced[0]["block_position"] == 1
+    assert forced[0]["miss_class"] is None
+    assert result.turn_rows[1]["manager_forced_recompute_blocks"] == 1
+    assert result.turn_rows[1]["capacity_miss_blocks"] == 0
+
+
 def _turn_row(
     trajectory_id: str,
     turn_index: int,

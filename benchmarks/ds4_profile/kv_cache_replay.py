@@ -3,7 +3,7 @@
 
 import hashlib
 import os
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +17,7 @@ if os.environ.get("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES") != "0":
 
 import torch
 
+from vllm.distributed.kv_events import BlockRemoved, BlockStored
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -35,6 +36,10 @@ from vllm.v1.request import Request
 SCHEMA_VERSION = "1.0.0"
 
 ReasoningMode = Literal["no_think", "think_high"]
+PrefixSource = Literal["global", "task", "session"]
+CacheOutcome = Literal["hit", "miss", "manager_forced_recompute"]
+MissClass = Literal["compulsory", "prefix_mismatch", "capacity"]
+ReplayStatus = Literal["passed", "out_of_capacity", "invalid"]
 
 _HASHING_INITIALIZED = False
 
@@ -72,6 +77,14 @@ class PoolCall:
     block_ids: tuple[int, ...]
     duration_ns: int
     evicted: bool | None = None
+
+
+@dataclass(frozen=True)
+class ReplayResult:
+    status: ReplayStatus
+    event_rows: list[dict[str, Any]]
+    turn_rows: list[dict[str, Any]]
+    error: str | None = None
 
 
 def _sha256(path: Path) -> str:
@@ -294,3 +307,488 @@ def load_full_turns(config: dict[str, Any]) -> list[ReplayTurn]:
             )
         )
     return sorted(turns, key=lambda turn: (turn.trajectory_id, turn.turn_index))
+
+
+def _prefix_source(
+    turn: ReplayTurn, block_position: int, block_size: int
+) -> PrefixSource:
+    block_start = block_position * block_size
+    if block_start < turn.global_prefix_tokens:
+        return "global"
+    if block_start < turn.task_prefix_tokens:
+        return "task"
+    return "session"
+
+
+def _turn_hashes(turn: ReplayTurn, block_size: int) -> tuple[str, ...]:
+    request = make_request(turn, block_size, f"prepass:{turn.turn_index}")
+    return tuple(_canonical_hash(value) for value in request.block_hashes)
+
+
+def _future_accesses(
+    turns: Sequence[ReplayTurn], block_size: int
+) -> dict[str, tuple[int, ...]]:
+    accesses: dict[str, list[int]] = {}
+    for turn in turns:
+        for block_hash in _turn_hashes(turn, block_size):
+            accesses.setdefault(block_hash, []).append(turn.turn_index)
+    return {key: tuple(values) for key, values in accesses.items()}
+
+
+def _classify_miss(
+    *,
+    block_hash: str,
+    block_position: int,
+    ever_stored: set[str],
+    max_seen_depth: int,
+) -> MissClass:
+    if block_hash in ever_stored:
+        return "capacity"
+    if block_position < max_seen_depth:
+        return "prefix_mismatch"
+    return "compulsory"
+
+
+def _lookup_outcome(
+    *,
+    block_hash: str,
+    block_position: int,
+    full_block_count: int,
+    hit_blocks: int,
+    prompt_tokens: int,
+    block_size: int,
+    resident_before: set[str],
+) -> CacheOutcome:
+    if block_position < hit_blocks:
+        return "hit"
+    if block_hash not in resident_before:
+        return "miss"
+    if (
+        prompt_tokens % block_size == 0
+        and block_position == full_block_count - 1
+        and block_position == hit_blocks
+    ):
+        return "manager_forced_recompute"
+    raise RuntimeError("resident hash exists beyond the legal manager hit")
+
+
+def _row_base(run_id: str, turn: ReplayTurn) -> dict[str, Any]:
+    return {
+        "run_id": run_id,
+        "trajectory_id": turn.trajectory_id,
+        "task_id": turn.task_id,
+        "reasoning_mode": turn.reasoning_mode,
+        "turn_index": turn.turn_index,
+    }
+
+
+def _event_row(
+    run_id: str,
+    turn: ReplayTurn,
+    *,
+    operation: str,
+    event_source: str,
+    occupancy_before: int,
+    occupancy_after: int,
+    block_position: int | None = None,
+    block_id: int | None = None,
+    block_hash: str | None = None,
+    cache_outcome: CacheOutcome | None = None,
+    miss_class: MissClass | None = None,
+    prefix_source: PrefixSource | None = None,
+    duration_ns: int | None = None,
+    observer_call_index: int | None = None,
+    observer_evicted: bool | None = None,
+    reuse_turn_index: int | None = None,
+    turns_until_reuse: int | None = None,
+    useful_later: bool | None = None,
+    never_reused: bool | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    return _row_base(run_id, turn) | {
+        "operation": operation,
+        "event_source": event_source,
+        "occupancy_before": occupancy_before,
+        "occupancy_after": occupancy_after,
+        "block_position": block_position,
+        "block_id": block_id,
+        "block_hash": block_hash,
+        "cache_outcome": cache_outcome,
+        "miss_class": miss_class,
+        "prefix_source": prefix_source,
+        "duration_ns": duration_ns,
+        "observer_call_index": observer_call_index,
+        "observer_evicted": observer_evicted,
+        "reuse_turn_index": reuse_turn_index,
+        "turns_until_reuse": turns_until_reuse,
+        "useful_later": useful_later,
+        "never_reused": never_reused,
+        "error": error,
+    }
+
+
+def _turn_row(
+    run_id: str,
+    turn: ReplayTurn,
+    *,
+    status: ReplayStatus,
+    error: str | None,
+    cached_tokens: int,
+    recomputed_tokens: int,
+    hit_blocks: int,
+    miss_blocks: int,
+    manager_forced_recompute_blocks: int,
+    capacity_miss_blocks: int,
+    allocation_count: int,
+    eviction_count: int,
+    free_count: int,
+    occupancy_before: int,
+    occupancy_after: int,
+    lookup_time_ns: int = 0,
+    allocation_time_ns: int = 0,
+    eviction_time_ns: int = 0,
+) -> dict[str, Any]:
+    return _row_base(run_id, turn) | {
+        "status": status,
+        "error": error,
+        "prompt_tokens": turn.prompt_tokens,
+        "cached_tokens": cached_tokens,
+        "recomputed_tokens": recomputed_tokens,
+        "hit_blocks": hit_blocks,
+        "miss_blocks": miss_blocks,
+        "manager_forced_recompute_blocks": manager_forced_recompute_blocks,
+        "capacity_miss_blocks": capacity_miss_blocks,
+        "allocation_count": allocation_count,
+        "eviction_count": eviction_count,
+        "free_count": free_count,
+        "occupancy_before": occupancy_before,
+        "occupancy_after": occupancy_after,
+        "lookup_time_ns": lookup_time_ns,
+        "allocation_time_ns": allocation_time_ns,
+        "eviction_time_ns": eviction_time_ns,
+    }
+
+
+def _out_of_capacity_result(
+    *,
+    run_id: str,
+    turn: ReplayTurn,
+    event_rows: list[dict[str, Any]],
+    turn_rows: list[dict[str, Any]],
+    manager: KVCacheManager,
+    error: str,
+) -> ReplayResult:
+    occupancy = _active_block_count(manager)
+    event_rows.append(
+        _event_row(
+            run_id,
+            turn,
+            operation="admission_failure",
+            event_source="replay",
+            occupancy_before=occupancy,
+            occupancy_after=occupancy,
+            error=error,
+        )
+    )
+    turn_rows.append(
+        _turn_row(
+            run_id,
+            turn,
+            status="out_of_capacity",
+            error=error,
+            cached_tokens=0,
+            recomputed_tokens=turn.prompt_tokens,
+            hit_blocks=0,
+            miss_blocks=0,
+            manager_forced_recompute_blocks=0,
+            capacity_miss_blocks=0,
+            allocation_count=0,
+            eviction_count=0,
+            free_count=0,
+            occupancy_before=occupancy,
+            occupancy_after=occupancy,
+        )
+    )
+    return ReplayResult("out_of_capacity", event_rows, turn_rows, error)
+
+
+def _future_reuse(
+    block_hash: str,
+    turn_index: int,
+    future_accesses: dict[str, tuple[int, ...]],
+) -> tuple[int | None, int | None, bool, bool]:
+    reuse_turn = next(
+        (
+            access_turn
+            for access_turn in future_accesses.get(block_hash, ())
+            if access_turn > turn_index
+        ),
+        None,
+    )
+    if reuse_turn is None:
+        return None, None, False, True
+    return reuse_turn, reuse_turn - turn_index, True, False
+
+
+def replay_session(
+    *,
+    run_id: str,
+    turns: Sequence[ReplayTurn],
+    capacity_blocks: int,
+    block_size: int,
+    max_model_len: int,
+) -> ReplayResult:
+    _initialize_hashing()
+    manager = make_manager(capacity_blocks, block_size, max_model_len)
+    event_rows: list[dict[str, Any]] = []
+    turn_rows: list[dict[str, Any]] = []
+    future_accesses = _future_accesses(turns, block_size)
+    ever_stored: set[str] = set()
+    max_seen_depth = 0
+
+    for turn in turns:
+        occupancy_before = _active_block_count(manager)
+        try:
+            request = make_request(turn, block_size, f"{run_id}:{turn.turn_index}")
+            resident_before = _resident_hashes(manager)
+            lookup_started = perf_counter_ns()
+            computed, hit_tokens, _ = manager.get_computed_blocks(request)
+            lookup_time_ns = perf_counter_ns() - lookup_started
+            hit_blocks = hit_tokens // block_size
+            request_hashes = tuple(
+                _canonical_hash(value) for value in request.block_hashes
+            )
+            outcomes = tuple(
+                _lookup_outcome(
+                    block_hash=value,
+                    block_position=position,
+                    full_block_count=len(request_hashes),
+                    hit_blocks=hit_blocks,
+                    prompt_tokens=request.num_tokens,
+                    block_size=block_size,
+                    resident_before=resident_before,
+                )
+                for position, value in enumerate(request_hashes)
+            )
+            miss_classes = tuple(
+                _classify_miss(
+                    block_hash=block_hash,
+                    block_position=position,
+                    ever_stored=ever_stored,
+                    max_seen_depth=max_seen_depth,
+                )
+                if outcome == "miss"
+                else None
+                for position, (block_hash, outcome) in enumerate(
+                    zip(request_hashes, outcomes, strict=True)
+                )
+            )
+
+            with observe_block_pool(manager) as pool_calls:
+                allocation_started = perf_counter_ns()
+                allocated = manager.allocate_slots(
+                    request,
+                    request.num_tokens - hit_tokens,
+                    hit_tokens,
+                    computed,
+                )
+                allocation_elapsed = perf_counter_ns() - allocation_started
+                if allocated is None:
+                    return _out_of_capacity_result(
+                        run_id=run_id,
+                        turn=turn,
+                        event_rows=event_rows,
+                        turn_rows=turn_rows,
+                        manager=manager,
+                        error="KV cache admission failed at pinned capacity",
+                    )
+                native_events = manager.take_events()
+                request_block_ids = manager.get_block_ids(request.request_id)[0]
+                manager.free(request)
+
+            eviction_time_ns = sum(
+                call.duration_ns for call in pool_calls if call.operation == "evict"
+            )
+            allocation_time_ns = max(0, allocation_elapsed - eviction_time_ns)
+            occupancy_after = _active_block_count(manager)
+            block_ids = tuple(request_block_ids[: len(request_hashes)])
+
+            for position, (block_hash, outcome, miss_class) in enumerate(
+                zip(request_hashes, outcomes, miss_classes, strict=True)
+            ):
+                event_rows.append(
+                    _event_row(
+                        run_id,
+                        turn,
+                        operation="lookup",
+                        event_source="replay",
+                        occupancy_before=occupancy_before,
+                        occupancy_after=occupancy_before,
+                        block_position=position,
+                        block_id=block_ids[position],
+                        block_hash=block_hash,
+                        cache_outcome=outcome,
+                        miss_class=miss_class,
+                        prefix_source=_prefix_source(turn, position, block_size),
+                    )
+                )
+
+            removed_hashes = [
+                _canonical_hash(block_hash)
+                for event in native_events
+                if isinstance(event, BlockRemoved)
+                for block_hash in event.block_hashes
+            ]
+            evict_calls = [
+                call
+                for call in pool_calls
+                if call.operation == "evict" and call.evicted is True
+            ]
+            if len(evict_calls) != len(removed_hashes):
+                raise RuntimeError("observer/native eviction count mismatch")
+            evict_call_by_hash = {
+                block_hash: call.index
+                for block_hash, call in zip(removed_hashes, evict_calls, strict=True)
+            }
+
+            for call in pool_calls:
+                if call.operation == "free":
+                    continue
+                event_rows.append(
+                    _event_row(
+                        run_id,
+                        turn,
+                        operation=call.operation,
+                        event_source="observer",
+                        occupancy_before=occupancy_before,
+                        occupancy_after=occupancy_after,
+                        duration_ns=call.duration_ns,
+                        observer_call_index=call.index,
+                        observer_evicted=call.evicted,
+                    )
+                )
+
+            for event in native_events:
+                if isinstance(event, BlockStored):
+                    for block_hash in event.block_hashes or []:
+                        canonical_hash = _canonical_hash(block_hash)
+                        position = request_hashes.index(canonical_hash)
+                        event_rows.append(
+                            _event_row(
+                                run_id,
+                                turn,
+                                operation="store",
+                                event_source="native",
+                                occupancy_before=occupancy_before,
+                                occupancy_after=occupancy_after,
+                                block_position=position,
+                                block_id=block_ids[position],
+                                block_hash=canonical_hash,
+                                prefix_source=_prefix_source(
+                                    turn, position, block_size
+                                ),
+                            )
+                        )
+                        ever_stored.add(canonical_hash)
+                elif isinstance(event, BlockRemoved):
+                    for block_hash in event.block_hashes:
+                        canonical_hash = _canonical_hash(block_hash)
+                        reuse_turn, reuse_distance, useful_later, never_reused = (
+                            _future_reuse(
+                                canonical_hash, turn.turn_index, future_accesses
+                            )
+                        )
+                        event_rows.append(
+                            _event_row(
+                                run_id,
+                                turn,
+                                operation="evict",
+                                event_source="native",
+                                occupancy_before=occupancy_before,
+                                occupancy_after=occupancy_after,
+                                block_hash=canonical_hash,
+                                observer_call_index=evict_call_by_hash[canonical_hash],
+                                reuse_turn_index=reuse_turn,
+                                turns_until_reuse=reuse_distance,
+                                useful_later=useful_later,
+                                never_reused=never_reused,
+                            )
+                        )
+
+            for call in pool_calls:
+                if call.operation != "free":
+                    continue
+                event_rows.append(
+                    _event_row(
+                        run_id,
+                        turn,
+                        operation=call.operation,
+                        event_source="observer",
+                        occupancy_before=occupancy_before,
+                        occupancy_after=occupancy_after,
+                        duration_ns=call.duration_ns,
+                        observer_call_index=call.index,
+                        observer_evicted=call.evicted,
+                    )
+                )
+
+            miss_blocks = sum(outcome == "miss" for outcome in outcomes)
+            capacity_miss_blocks = sum(
+                miss_class == "capacity" for miss_class in miss_classes
+            )
+            turn_rows.append(
+                _turn_row(
+                    run_id,
+                    turn,
+                    status="passed",
+                    error=None,
+                    cached_tokens=hit_tokens,
+                    recomputed_tokens=request.num_tokens - hit_tokens,
+                    hit_blocks=sum(outcome == "hit" for outcome in outcomes),
+                    miss_blocks=miss_blocks,
+                    manager_forced_recompute_blocks=sum(
+                        outcome == "manager_forced_recompute" for outcome in outcomes
+                    ),
+                    capacity_miss_blocks=capacity_miss_blocks,
+                    allocation_count=sum(
+                        call.operation == "allocate" for call in pool_calls
+                    ),
+                    eviction_count=len(removed_hashes),
+                    free_count=sum(call.operation == "free" for call in pool_calls),
+                    occupancy_before=occupancy_before,
+                    occupancy_after=occupancy_after,
+                    lookup_time_ns=lookup_time_ns,
+                    allocation_time_ns=allocation_time_ns,
+                    eviction_time_ns=eviction_time_ns,
+                )
+            )
+            max_seen_depth = max(max_seen_depth, len(request_hashes))
+        except Exception as error:
+            error_text = f"{type(error).__name__}: {error}"
+            occupancy_after = _active_block_count(manager)
+            completed_evictions = sum(
+                row["operation"] == "evict" and row["event_source"] == "native"
+                for row in event_rows
+            )
+            turn_rows.append(
+                _turn_row(
+                    run_id,
+                    turn,
+                    status="invalid",
+                    error=error_text,
+                    cached_tokens=0,
+                    recomputed_tokens=turn.prompt_tokens,
+                    hit_blocks=0,
+                    miss_blocks=0,
+                    manager_forced_recompute_blocks=0,
+                    capacity_miss_blocks=0,
+                    allocation_count=0,
+                    eviction_count=completed_evictions,
+                    free_count=0,
+                    occupancy_before=occupancy_before,
+                    occupancy_after=occupancy_after,
+                )
+            )
+            return ReplayResult("invalid", event_rows, turn_rows, error_text)
+
+    return ReplayResult("passed", event_rows, turn_rows)
