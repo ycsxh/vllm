@@ -18,6 +18,8 @@ WorkloadFamily = Literal["homogeneous", "mixed", "exact_replay"]
 
 CHUNK_ALGORITHM = "equal-active-cap-v1"
 HOMOGENEOUS_TOKEN_ALGORITHM = "sha256-legal-pool-v1"
+CANONICAL_BLOCK_SIZE = 16
+CANONICAL_HOMOGENEOUS_PREFIX_TOKENS = 4096
 
 
 @dataclass(frozen=True)
@@ -361,12 +363,17 @@ def _validate_inputs(
     token_budget: int,
     homogeneous_prefix_tokens: int,
 ) -> None:
-    if block_size <= 0:
-        raise ValueError("block_size must be positive")
+    if block_size != CANONICAL_BLOCK_SIZE:
+        raise ValueError(f"block_size must be {CANONICAL_BLOCK_SIZE}")
     if token_budget <= 0:
         raise ValueError("token_budget must be positive")
-    if homogeneous_prefix_tokens <= 0 or homogeneous_prefix_tokens % block_size:
-        raise ValueError("homogeneous prefix must be divisible by block_size")
+    if homogeneous_prefix_tokens != CANONICAL_HOMOGENEOUS_PREFIX_TOKENS:
+        raise ValueError(
+            "homogeneous prefix must be "
+            f"{CANONICAL_HOMOGENEOUS_PREFIX_TOKENS} tokens"
+        )
+    if homogeneous_prefix_tokens % CANONICAL_BLOCK_SIZE:
+        raise ValueError("homogeneous prefix must be divisible by 16")
     if workload_plan.get("token_budget") != token_budget:
         raise ValueError("workload plan token_budget does not match planner")
 

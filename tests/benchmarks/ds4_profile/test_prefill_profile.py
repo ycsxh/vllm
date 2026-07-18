@@ -2,24 +2,121 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
-import json
 from collections import Counter
-from pathlib import Path
 
-import pyarrow.parquet as pq
 import pytest
 
+import benchmarks.ds4_profile.prefill_profile as prefill_profile
 from benchmarks.ds4_profile.prefill_profile import build_prefill_points
 from benchmarks.ds4_profile.profile_spine import make_point_id
 
-PROJECT_DIR = Path(__file__).parents[3]
-ARTIFACT_DIR = PROJECT_DIR / ".scratch/ds4-agent-1p1d-profile/artifacts/ticket-02"
+HOMOGENEOUS_CASES = (
+    (1, 128),
+    (1, 512),
+    (1, 1024),
+    (1, 2048),
+    (1, 4096),
+    (2, 128),
+    (2, 512),
+    (2, 1024),
+    (2, 2048),
+    (4, 128),
+    (4, 512),
+    (4, 1024),
+    (8, 128),
+    (8, 256),
+    (8, 512),
+)
+
+
+def _fixture_turn(index: int, new_tokens: int, reasoning_mode: str) -> dict:
+    cached_tokens = 16
+    prompt_tokens = cached_tokens + new_tokens
+    token_ids = [1 + (index * 37 + position) % 512 for position in range(prompt_tokens)]
+    return {
+        "trajectory_id": f"trajectory-{index}",
+        "turn_index": index,
+        "reasoning_mode": reasoning_mode,
+        "prompt_tokens": prompt_tokens,
+        "reusable_prefix_tokens": cached_tokens,
+        "new_prefill_tokens": new_tokens,
+        "execution_prompt_token_ids": token_ids,
+        "execution_completion_token_ids": [1 + index],
+    }
 
 
 def _pinned_inputs() -> tuple[dict, list[dict]]:
-    plan = json.loads((ARTIFACT_DIR / "workload_plan.json").read_text())
-    turns = pq.read_table(ARTIFACT_DIR / "rendered_turns.parquet").to_pylist()
-    return plan, turns
+    """Return a compact, deterministic Ticket 02-shaped planner fixture."""
+    lengths = (16, 32, 48, 64, 80, 96, 112, 128, 256, 512)
+    turns = [
+        _fixture_turn(
+            index,
+            length,
+            "no_think" if index % 2 == 0 else "think_high",
+        )
+        for index, length in enumerate(lengths)
+    ]
+
+    def reference(index: int) -> dict:
+        turn = turns[index]
+        return {
+            key: turn[key]
+            for key in (
+                "trajectory_id",
+                "turn_index",
+                "reasoning_mode",
+                "prompt_tokens",
+                "reusable_prefix_tokens",
+                "new_prefill_tokens",
+            )
+        }
+
+    mixed_batches = []
+    batch_indexes = {
+        "similar": {2: (0, 1), 4: (0, 1, 2, 3), 8: tuple(range(8))},
+        "random": {2: (8, 9), 4: (8, 3, 7, 1), 8: tuple(range(8))},
+        "high_skew": {
+            2: (0, 9),
+            4: (0, 1, 2, 9),
+            8: (0, 1, 2, 3, 4, 5, 6, 9),
+        },
+    }
+    for composition, by_batch_size in batch_indexes.items():
+        for batch_size, indexes in by_batch_size.items():
+            references = [reference(index) for index in indexes]
+            mixed_batches.append(
+                {
+                    "composition": composition,
+                    "batch_size": batch_size,
+                    "turns": references,
+                    "total_scheduled_tokens": sum(
+                        item["new_prefill_tokens"] for item in references
+                    ),
+                }
+            )
+
+    exact_replays = []
+    for offset, reasoning_mode in enumerate(("no_think", "think_high")):
+        for quantile, index in zip((0.0, 0.25, 0.5, 0.75, 1.0), range(offset, 10, 2)):
+            exact_replays.append(
+                {
+                    **reference(index),
+                    "selection_quantile": quantile,
+                }
+            )
+    return {
+        "token_budget": 4096,
+        "p_homogeneous": [
+            {
+                "batch_size": batch_size,
+                "per_request_scheduled_tokens": new_tokens,
+                "total_scheduled_tokens": batch_size * new_tokens,
+            }
+            for batch_size, new_tokens in HOMOGENEOUS_CASES
+        ],
+        "mixed_batches": mixed_batches,
+        "exact_replays": exact_replays,
+    }, turns
 
 
 def _build_pinned_points():
@@ -118,8 +215,7 @@ def test_planner_preserves_requests_and_pairs_conditions() -> None:
     selected = next(
         item
         for item in plan["exact_replays"]
-        if item["reasoning_mode"] == "no_think"
-        and item["selection_quantile"] == 0.0
+        if item["reasoning_mode"] == "no_think" and item["selection_quantile"] == 0.0
     )
     assert (replay.requests[0].trajectory_id, replay.requests[0].turn_index) == (
         selected["trajectory_id"],
@@ -169,27 +265,47 @@ def test_planner_rejects_invalid_capacity_or_prefix_alignment() -> None:
             homogeneous_prefix_tokens=4096,
             seed=20260715,
         )
-    with pytest.raises(ValueError, match="divisible"):
+    with pytest.raises(ValueError, match="block_size must be 16"):
+        build_prefill_points(
+            plan,
+            turns,
+            block_size=8,
+            token_budget=4096,
+            homogeneous_prefix_tokens=4096,
+            seed=20260715,
+        )
+    with pytest.raises(ValueError, match="homogeneous prefix must be 4096"):
         build_prefill_points(
             plan,
             turns,
             block_size=16,
             token_budget=4096,
-            homogeneous_prefix_tokens=4097,
+            homogeneous_prefix_tokens=4080,
             seed=20260715,
         )
 
 
-def test_point_id_covers_planned_chunks_and_planner_algorithm() -> None:
+def test_point_id_covers_planned_chunks_and_planner_algorithms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     point = _build_pinned_points()[0]
     changed_chunk = copy.deepcopy(point.canonical_payload)
     changed_chunk["planned_chunks"][0]["scheduled_tokens_by_request"][0] = (
         "r0",
-        changed_chunk["planned_chunks"][0]["scheduled_tokens_by_request"][0][1]
-        - 1,
+        changed_chunk["planned_chunks"][0]["scheduled_tokens_by_request"][0][1] - 1,
     )
-    changed_planner = copy.deepcopy(point.canonical_payload)
-    changed_planner["planner_digest"] = "0" * 64
-
     assert make_point_id(changed_chunk) != point.point_id
-    assert make_point_id(changed_planner) != point.point_id
+
+    monkeypatch.setattr(prefill_profile, "CHUNK_ALGORITHM", "changed-chunk-v2")
+    changed_chunk_algorithm = _build_pinned_points()[0]
+    assert changed_chunk_algorithm.planner_digest != point.planner_digest
+    assert changed_chunk_algorithm.point_id != point.point_id
+
+    monkeypatch.setattr(
+        prefill_profile,
+        "HOMOGENEOUS_TOKEN_ALGORITHM",
+        "changed-homogeneous-token-v2",
+    )
+    changed_algorithms = _build_pinned_points()[0]
+    assert changed_algorithms.planner_digest != changed_chunk_algorithm.planner_digest
+    assert changed_algorithms.point_id != changed_chunk_algorithm.point_id
