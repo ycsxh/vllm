@@ -18,13 +18,15 @@
 - Enforce at most 4096 scheduled tokens across a batch and at most 8 active sequences.
 - Consume the pinned Ticket 02 selections unchanged: 15 homogeneous, 9 mixed, and 10 exact workloads, each with `prefix_hit` and `full_recompute`, totaling 68 points.
 - Homogeneous requests use distinct deterministic 4096-token block-aligned prefixes; checked-in configuration uses 3 warmups, 10 steady samples, and a 5% noisy-CV threshold.
-- A hit repetition must persist the prime SchedulerOutput block tables sent to GPU0, execute and synchronize every prime chunk, and verify that the measured SchedulerOutput reuses those same physical block IDs in every worker KV tensor group before timing. Equal token IDs alone are never hit evidence.
+- A hit repetition must persist the prime SchedulerOutput block tables sent to GPU0, execute and synchronize every prime chunk, and verify that the measured SchedulerOutput reuses those same physical block IDs in live `worker.model_runner.kv_caches` tensors before timing. Every mapped tensor must be an actual `torch.Tensor` on `cuda:0`; equal token IDs or config-only capacity are never hit evidence.
 - Recompute repetitions begin in a fresh cache epoch and must verify zero cached tokens before timing.
 - Time only `vllm.v1.worker.gpu_worker.Worker.execute_model`; record Scheduler, allocation, cache reset, and prime work separately.
 - Main results require torch.compile and CUDA Graph runtime mode `FULL` or `PIECEWISE`; `NONE` invalidates a measured point.
 - New artifacts use schema `2.0.0`; validation of accepted Ticket 04 schema `1.0.0` remains supported without cross-version coercion.
 - Empty, partial, or preempted Scheduler output is never timed. The whole point is `out_of_capacity` only when the expected batch was isolated, allocator pressure is proven from required versus allocatable blocks, and cleanup returns to a verified empty reset epoch; every other mismatch invalidates the run.
-- The v2 validator requires the exact 68-point manifest ID set and exact planned phase/repetition/chunk coordinates. The only shortened coordinate sequence it accepts is a strict prefix ending in one structurally valid terminal `out_of_capacity` row.
+- Every v2 run declares `run_kind` as `full` or `smoke` and freezes its expected manifest before execution. Full requires the canonical 68 IDs; smoke requires exactly the canonical configured selection. The validator never infers the expected set from observed rows.
+- The v2 validator requires the frozen manifest ID set and exact planned phase/repetition/chunk coordinates. The only shortened coordinate sequence it accepts is a strict prefix ending in one structurally valid terminal `out_of_capacity` row.
+- Emit a comparison if and only if both paired manifest points pass. Omit it if and only if valid terminal evidence proves at least one side is OOC; every missing or extra comparison invalidates the run.
 - Do not add latency thresholds to correctness or hardware-gated tests.
 
 ## File Map
@@ -130,7 +132,15 @@ Add `test_v1_result_still_validates`,
 `test_v2_validator_requires_exact_manifest_and_coordinates`, covering a
 missing manifest point, an extra point, a missing warmup, duplicate chunk,
 wrong per-request vector, a gap before a terminal OOC row, and any row after a
-terminal OOC row. The arithmetic fixture
+terminal OOC row. Add
+`test_v2_validator_uses_frozen_manifest_for_full_and_smoke`, which requires a
+`full` run to freeze exactly the canonical 68 IDs and a `smoke` run to freeze
+exactly the canonical configured selection, then proves that observed-row
+subsets/supersets cannot redefine either expected set. Add comparison cases
+which reject a missing row when both conditions pass, an extra row when either
+condition is terminal OOC, and any duplicate or unknown comparison; accept an
+omission only with valid terminal OOC evidence for at least one paired point.
+The arithmetic fixture
 uses steady full-turn values `[10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
 17.0, 18.0, 19.0]`, then corrupts the stored median and expects
 `ValueError("aggregate statistics do not match turn samples")`.
@@ -159,6 +169,7 @@ V2_SCHEMA_VERSION = "2.0.0"
 SUPPORTED_SCHEMA_VERSIONS = frozenset({V1_SCHEMA_VERSION, V2_SCHEMA_VERSION})
 V2_ENUMS = {
     "role": frozenset({"prefill"}),
+    "run_kind": frozenset({"full", "smoke"}),
     "workload_family": frozenset({"homogeneous", "mixed", "exact_replay"}),
     "cache_condition": frozenset({"prefix_hit", "full_recompute"}),
     "composition": frozenset({"none", "similar", "random", "high_skew"}),
@@ -202,23 +213,44 @@ fields; `V2_TURN_SAMPLE_SCHEMA` contains full-turn totals;
 `V2_AGGREGATE_SCHEMA` contains timing and throughput median/p90/mean/CV/noisy;
 `V2_COMPARISON_SCHEMA` contains paired hit/miss IDs and recompute penalty; and
 `V2_PREFIX_EVIDENCE_SCHEMA` contains point/phase/ordinal/request/group,
-prime SchedulerOutput block IDs, measured SchedulerOutput block IDs, worker KV
-tensor names/shapes/capacity, intended/actual cached tokens, and completed and
-synchronized prime flags.
+prime SchedulerOutput block IDs, measured SchedulerOutput block IDs, live
+worker KV tensor names, devices, shapes, block axis and block dimension,
+verified physical IDs, intended/actual cached tokens, completed/synchronized
+prime flags, `live_cuda_tensor_proven`, and `hardware_validated`.
 Every schema carries `metadata={b"schema_version": b"2.0.0"}`.
 
 Refactor `_validate_result_dir` to read `run-config.json` first and dispatch to
 `_validate_v1_result_dir` or `_validate_v2_result_dir`. The v2 path must check
 all required files, exact schemas and metadata, all enums, run/point/comparison
 references, and deterministic IDs from `run-config.json["points"]`. Require
-exactly 68 distinct manifest IDs and require the union of successfully measured
-and terminal-OOC point IDs to equal that set. For a feasible point, require all
+`run_kind`, `canonical_full_manifest`, and `expected_manifest` to be frozen
+before execution. Recompute the canonical planner output from immutable config:
+`canonical_full_manifest` must be exactly its 68 distinct IDs; for `full`,
+`expected_manifest` must equal all 68, while for `smoke` it must equal exactly
+the canonical IDs resolved from the configured smoke selectors. Never derive
+either manifest from
+raw, turn, aggregate, comparison, or evidence rows. Require the union of
+successfully measured and terminal-OOC point IDs to equal the frozen expected
+set. For a feasible point, require all
 planned chunks for warmup ordinals `0..2` and steady ordinals `0..9`. For OOC,
 accept only a lexicographic coordinate prefix followed by exactly one terminal
 row at the next planned coordinate, with no later raw/turn/aggregate rows.
 Also validate sample IDs, exact stored per-request vectors, planner digest,
-prefix-evidence cardinality for every completed hit repetition, and recomputed statistics using
+prefix-evidence cardinality for every completed hit repetition, and recomputed
+statistics using
 `statistics.quantiles(values, n=10, method="inclusive")[8]`.
+For every hardware-validated prefix row, require completed/synchronized/live
+proof flags, only `cuda:0` device strings, valid block axes for the stored
+shapes, a positive common block dimension, and all verified physical IDs in
+that dimension. Preserve `hardware_validated=False` for CPU fixture evidence;
+serialized metadata alone is not a hardware acceptance claim.
+
+Partition the frozen expected manifest by `comparison_id`, requiring exactly
+one hit and one recompute point per pair. If both outcomes are passed, require
+exactly one comparison row whose point IDs and statistics recompute from their
+aggregates. If either outcome has a valid terminal OOC row, require zero
+comparison rows. Reject all missing, extra, duplicate, unknown, or otherwise
+unproven omissions.
 
 - [ ] **Step 4: Run focused and full Ticket 04 artifact tests**
 
@@ -440,7 +472,7 @@ git commit -m "[Benchmarks] Plan the DS4 P-side matrix" \
 - Produces: `make_prefill_chunk_row(*, run_id: str, point: PPointPlan, phase: Literal["warmup", "steady"], ordinal: int, chunk: PChunkPlan, runner_wall_time_ms: float | None, cuda_model_time_ms: float | None, allocation: dict[str, Any], status: str, error: str | None) -> dict[str, Any]`
 - Produces: `summarize_turn_samples(raw_rows: list[dict[str, Any]], points: tuple[PPointPlan, ...]) -> list[dict[str, Any]]`
 - Produces: `aggregate_turn_samples(turn_rows: list[dict[str, Any]], noisy_cv_threshold: float) -> list[dict[str, Any]]`
-- Produces: `compare_conditions(aggregate_rows: list[dict[str, Any]]) -> list[dict[str, Any]]`
+- Produces: `compare_conditions(aggregate_rows: list[dict[str, Any]], points: tuple[PPointPlan, ...], terminal_rows: list[dict[str, Any]]) -> list[dict[str, Any]]`
 - Produces: `write_v2_result_artifacts(config: dict[str, Any], raw_rows: list[dict[str, Any]], prefix_evidence_rows: list[dict[str, Any]], provenance: dict[str, Any], output_dir: Path) -> None`
 
 - [ ] **Step 1: Add failing accounting and expected-OOC tests**
@@ -454,7 +486,7 @@ def test_turn_and_comparison_statistics_are_recomputed_from_chunks() -> None:
     point_pair, raw_rows = _two_condition_rows()
     turns = profile_spine.summarize_turn_samples(raw_rows, point_pair)
     aggregates = profile_spine.aggregate_turn_samples(turns, 0.05)
-    comparisons = profile_spine.compare_conditions(aggregates)
+    comparisons = profile_spine.compare_conditions(aggregates, point_pair, [])
     assert turns[0]["runner_full_turn_time_ms"] == 10.0
     assert comparisons[0]["recompute_penalty_ms"] == 6.0
 ```
@@ -465,6 +497,10 @@ requested/allocatable block counts are retained, no aggregate is emitted for
 that point, and v2 validation succeeds. Add rejection cases for a partial
 nonterminal batch, a coordinate gap, multiple terminal rows, a terminal row
 without proven pressure/reset evidence, and any timing on a partial batch.
+Add paired-outcome fixtures: two passed conditions emit exactly one comparison;
+one or two terminal-OOC conditions emit none; a missing comparison for two
+passed conditions, an extra comparison for an OOC pair, or a comparison that
+does not reference the frozen pair fails validation.
 
 - [ ] **Step 2: Run artifact tests and verify failure**
 
@@ -485,7 +521,11 @@ Use raw chunks as the sole arithmetic source. Group by
 `(run_id, point_id, phase, ordinal)`, require chunk indices
 `0..chunk_count-1`, sum wall/CUDA/token/block fields, then derive turns.
 Aggregate only `phase == "steady" and status == "passed"`. Pair conditions by
-`comparison_id`; require exactly one hit and one recompute aggregate.
+`comparison_id`; require exactly one hit and one recompute manifest point.
+`compare_conditions` emits exactly one row only when both have passed
+aggregates. It emits no row only when a validated terminal row proves one or
+both conditions OOC; absence of an aggregate without that terminal proof is an
+error, not permission to omit the comparison.
 
 Build the expected coordinate sequence directly from each manifest point's
 `planned_chunks`: warmup ordinals 0 through 2, then steady ordinals 0 through
@@ -493,8 +533,9 @@ Build the expected coordinate sequence directly from each manifest point's
 sequence. An OOC point may equal only a strict prefix plus one terminal row at
 the next coordinate; terminal rows have null wall/CUDA timings and include
 `allocator_pressure_proven=True`, `clean_reset_proven=True`, exact planned and
-actual request vectors, required blocks, and allocatable blocks. All 68
-manifest points must resolve to one of those two states.
+actual request vectors, required blocks, and allocatable blocks. Every point in
+the frozen expected manifest must resolve to one of those two states; full has
+exactly the canonical 68 and smoke has exactly the configured canonical subset.
 
 ```python
 def _distribution(values: list[float], threshold: float) -> dict[str, Any]:
@@ -558,7 +599,10 @@ git commit -m "[Benchmarks] Add P-side profile artifacts" \
 Build CPU fakes with the same methods as the current APIs. The hit test must
 prove that equal tokens without an executed prime fail, and that mismatched,
 partial, stale, excessive, or out-of-range block IDs fail before the timed
-callback is called.
+callback is called. CPU fakes may model the expected device/shape/block-axis
+evidence contract for unit tests, but must always produce
+`hardware_validated=False`; no fake tensor or CPU tensor may satisfy the
+hardware-smoke predicate.
 
 ```python
 def test_hit_requires_executed_gpu_prime_and_matching_resident_blocks() -> None:
@@ -580,6 +624,13 @@ planned-versus-actual per-request scheduled-vector tests. Add separate cases
 for an empty SchedulerOutput, a partial request set, a partial token vector,
 preempted expected requests, and an unrelated request in Scheduler state or
 output. Every case asserts the GPU execute callback remains uncalled.
+
+Add live-tensor contract cases which reject a non-`torch.Tensor`, a CPU tensor,
+`cuda:1`, a missing configured layer tensor, an invalid block axis, and a
+physical block ID equal to or larger than the live tensor's block dimension.
+The CPU form tests the fail-closed inspection helper without claiming hardware
+validation; only the hardware-gated test may exercise the successful live
+`cuda:0` branch.
 
 For OOC classification, prove all of the following in tests: the Scheduler was
 isolated to the exact expected active request set, the empty/partial/preempted
@@ -619,9 +670,12 @@ class SchedulerBlockTableEvidence:
 class WorkerKvTensorGroupEvidence:
     group_index: int
     tensor_names: tuple[str, ...]
+    tensor_devices: tuple[str, ...]
     tensor_shapes: tuple[tuple[int, ...], ...]
-    block_capacity: int
+    block_axis: int
+    block_dimension: int
     verified_block_ids: tuple[int, ...]
+    live_cuda_tensor_proven: bool
 
 
 @dataclass(frozen=True)
@@ -634,6 +688,7 @@ class PrefixPrimeEvidence:
     worker_groups: tuple[WorkerKvTensorGroupEvidence, ...]
     prime_completed: bool
     prime_synchronized: bool
+    hardware_validated: bool
     kv_bytes: int
 
 
@@ -691,11 +746,23 @@ before marking that chunk complete. Capture final
 For the measured request, inspect `NewRequestData.num_computed_tokens` and its
 SchedulerOutput block tables after real lookup. The prefix slice must equal the
 same physical IDs persisted from the completed prime for every cache group.
-Map each ID to the corresponding
-`worker.model_runner.kv_cache_config.kv_cache_groups` entry and worker KV tensor
-names/shapes; require the ID to be below that group's tensor block capacity.
-Persist this mapping, plus `prime_completed=True` and
-`prime_synchronized=True`, in `PrefixPrimeEvidence`. Compute bytes from
+Map every cache-group entry and configured layer name to the corresponding live
+entry in the ordered `worker.model_runner.kv_caches` list using the same layer
+ordering as vLLM's `bind_kv_cache` after the synchronized prime. Require
+every mapped value to satisfy `isinstance(tensor, torch.Tensor)`,
+`tensor.is_cuda`, and `tensor.device == torch.device("cuda:0")`. Resolve and
+record the cache group's physical-block axis from its backend/live layout,
+record each
+tensor's exact device string and shape, require all tensors in the group to
+agree on the block dimension, and require every measured physical block ID to
+satisfy `0 <= block_id < tensor.shape[block_axis]` for every mapped live
+tensor. Configured capacity alone is not evidence of residency.
+
+Persist this live mapping, plus `prime_completed=True`,
+`prime_synchronized=True`, `live_cuda_tensor_proven=True`, and
+`hardware_validated=True`, in `PrefixPrimeEvidence`. The CPU fake adapter may
+construct structurally identical rows only with both proof fields false; the
+artifact writer and validator must not promote them. Compute bytes from
 `kv_cache_group.kv_cache_spec.page_size_bytes`.
 
 Classify the whole point OOC only when an empty/partial/preempted output occurs
@@ -768,15 +835,22 @@ or failed reset invalidates the worker.
 
 Add a prefix-evidence test that compares the exact prime SchedulerOutput block
 tables with the measured SchedulerOutput prefix block IDs and each worker KV
-tensor group's names, shapes, capacity, and verified IDs. Flip every proof bit
-or physical ID independently and require failure before `timed:0`.
+tensor group's live tensor names, `cuda:0` devices, shapes, physical block axis,
+block dimension, and verified IDs. Flip every proof bit or physical ID
+independently and require failure before `timed:0`. Assert the fake runtime's
+otherwise valid evidence remains `hardware_validated=False`.
 
 Add a hardware-gated test decorated with
 `pytest.mark.skipif(os.environ.get("DS4_P_PREFILL_GPU_SMOKE") != "1",
 reason="school-server GPU acceptance only")`.
 When enabled on the server, it runs the smoke config and asserts real prime
-evidence from `prefix_evidence.parquet`, GPU0 role, low-level boundary, CUDA
-Graph modes, exact smoke-manifest coordinates, and valid v2 output.
+evidence from `prefix_evidence.parquet`: every mapped value was a live
+`torch.Tensor` on `cuda:0`, every recorded block axis/dimension matches its
+runtime shape, and all physical IDs are in bounds. It also asserts
+`hardware_validated=True`, GPU0 role, low-level boundary, CUDA Graph modes,
+`run_kind == "smoke"`, the exact frozen configured smoke manifest and
+coordinates, comparison completeness, and valid v2 output. A fake or CPU
+tensor must fail this test even if its serialized metadata looks plausible.
 
 - [ ] **Step 2: Run local orchestration tests and confirm failure/skip**
 
@@ -829,7 +903,11 @@ warmup/steady output's `cudagraph_stats.runtime_mode` to be `FULL` or
 
 Return a worker result containing schema/run/role/boundary, point manifest,
 full per-repetition prime SchedulerOutput/block-to-worker-tensor evidence,
-rows, capacity, compile/CUDA flags, and status. When proven allocator pressure
+including live tensor devices, shapes, block axes/dimensions, and hardware
+proof state, plus rows, capacity, compile/CUDA flags, and status. Set
+`hardware_validated=True` only in the real GPU path after all synchronized
+`worker.model_runner.kv_caches` checks pass; fake and CPU paths keep it false.
+When proven allocator pressure
 occurs, emit one terminal row, mark the whole point OOC, perform and record a
 clean reset, and continue with the next point only after the reset invariant
 passes. Convert every unproven partial/empty/preempted/unrelated output and all
@@ -871,6 +949,7 @@ git commit -m "[Benchmarks] Execute real P-side prefix profiles" \
 **Interfaces:**
 - Produces: `python -m benchmarks.ds4_profile.prefill_profile plan|fixture|gpu-worker|assemble|validate`
 - Produces: `python -m benchmarks.ds4_profile.container.runtime p-profile [--smoke] [--print-plan] [--output-dir PATH]`
+- Produces: `freeze_expected_manifest(config: dict[str, Any], points: tuple[PPointPlan, ...], run_kind: Literal["full", "smoke"]) -> dict[str, Any]`
 
 - [ ] **Step 1: Add failing config and container-plan tests**
 
@@ -888,10 +967,15 @@ def test_p_profile_container_plan_is_gpu0_numa0_only(tmp_path: Path) -> None:
 ```
 
 Assert `--smoke` selects one homogeneous pair, one mixed pair, one exact pair,
-one multi-chunk point, and one capacity-pressure point without changing their
+one pair containing a multi-chunk condition, and one capacity-pressure pair
+without changing their
 canonical IDs, planned chunk vectors, or planner digest. Assert the full
 printed plan contains exactly the same 68 point IDs that the v2 validator later
-requires.
+requires. Assert the effective config is frozen before the worker starts with
+`run_kind`, the complete 68-ID `canonical_full_manifest`, and an
+`expected_manifest`: `full` equals all 68, while `smoke` equals exactly the
+configured selected IDs. Delete or add an observed row and prove neither
+manifest changes and validation fails.
 
 - [ ] **Step 2: Run container/config tests and verify failure**
 
@@ -929,14 +1013,20 @@ values:
 Retain the approved Qwen revision and full runtime fields from
 `profile-spine.json`. Configure compile and capture buckets
 `[128, 256, 512, 1024, 2048, 4096]` and validate observed runtime mode per row.
+Store the representative smoke selectors in the checked-in config; resolve
+them against the canonical 68-point plan before execution and fail if any
+selector is missing, ambiguous, or breaks a hit/recompute pair.
 
 The container command creates the run ID, runs existing preflight, launches
 one numactl-bound worker, assembles v2 artifacts, and returns nonzero for
 invalid output. A preflight failure writes a structurally valid skipped/invalid
 result and never calls the worker. `--print-plan` performs no model or GPU work.
-Assembly must require `prefix_evidence.parquet`; it may not reduce the manifest
-to observed rows or accept a worker result whose exact 68-ID set differs from
-the frozen effective config.
+Before launch, write an immutable effective `run-config.json` containing
+`run_kind`, the planner-recomputed `canonical_full_manifest`, and the selected
+`expected_manifest`. Assembly must require `prefix_evidence.parquet`; it may
+not reduce either manifest to observed rows. A full worker result must match
+the exact frozen 68-ID set, and a smoke worker result must match exactly the
+frozen configured selected set.
 
 - [ ] **Step 4: Run container/config tests and print-plan locally**
 
@@ -1000,9 +1090,14 @@ Document these school-server commands using the existing `DS4_RUN` array:
 The runbook requires human inspection of `prefix_evidence.parquet`: prime
 SchedulerOutput block tables actually sent to GPU0, completed and synchronized
 prime flags, measured SchedulerOutput reuse of the same physical IDs, and each
-ID's worker KV tensor-group mapping. It also checks cached-token counts,
+ID's mapping into live `worker.model_runner.kv_caches` `torch.Tensor` values on
+`cuda:0`, including recorded shape, physical block axis, and block dimension.
+It rejects fake/config-only evidence and requires `hardware_validated=True`.
+It also checks cached-token counts,
 zero-hit recompute evidence, CUDA Graph modes, OOC pressure/reset proof, the
-exact smoke/full manifest and coordinate sets, and independent v2 arithmetic validation before the full run. It retains
+declared `run_kind`, exact frozen smoke/full manifest and coordinate sets,
+paired comparison completeness, and independent v2 arithmetic validation
+before the full run. It retains
 failed smoke/full artifacts and never relabels them as accepted.
 
 - [ ] **Step 2: Run the complete lightweight local gate**
@@ -1060,17 +1155,23 @@ DS4_P_PREFILL_GPU_SMOKE=1 /opt/ds4-profile/bin/python -m pytest \
 Expected smoke result: all selected points either pass or are honestly
 `out_of_capacity`; no empty, partial, preempted, or unrelated SchedulerOutput
 was timed; every hit has persisted prime SchedulerOutput tables, synchronized
-completion, identical measured physical IDs, and worker KV tensor mappings;
+completion, identical measured physical IDs, and live `cuda:0` torch-tensor
+device/shape/block-axis evidence with in-bounds physical IDs and
+`hardware_validated=True`; `run_kind` is `smoke` and the expected manifest is
+exactly the configured canonical smoke set; every fully passed pair has exactly
+one comparison and every OOC pair has none;
 every recompute has zero cached tokens; every OOC point has allocator-pressure
 and clean-reset proof; all measured rows use `FULL` or `PIECEWISE`; independent
 validation returns zero.
 
 Run the full matrix only after smoke acceptance. Expected full result: all 68
-planned point IDs exactly match the frozen manifest and planner digest, each
+planned point IDs exactly match the frozen full manifest and planner digest,
+`run_kind` is `full`, each
 feasible point has every planned chunk for 3 warmups and 10 steady turns, OOC
 points contain only a valid coordinate prefix plus one terminal evidence row,
-recomputed aggregates/comparisons match, and provenance reports a clean exact
-source SHA and immutable image ID.
+every passed pair has exactly one recomputed comparison and every OOC pair has
+none, all hit evidence comes from live `cuda:0` tensors, and provenance reports
+a clean exact source SHA and immutable image ID.
 
 - [ ] **Step 5: Record immutable acceptance evidence in a final docs-only commit**
 
