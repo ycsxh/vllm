@@ -226,7 +226,9 @@ def observe_block_pool(manager: KVCacheManager) -> Iterator[list[PoolCall]]:
 
     pool.touch = touch  # type: ignore[method-assign]
     pool.get_new_blocks = get_new_blocks  # type: ignore[method-assign]
-    pool._maybe_evict_cached_block = maybe_evict_cached_block  # type: ignore[method-assign]
+    pool._maybe_evict_cached_block = (  # type: ignore[method-assign]
+        maybe_evict_cached_block
+    )
     pool.free_blocks = free_blocks  # type: ignore[method-assign]
     try:
         yield calls
