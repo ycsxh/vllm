@@ -116,6 +116,35 @@ The later documentation-only commit recording these results is not a different
 validated implementation. Hardware acceptance remains explicitly tied to
 `c783ea0e69138503c6f83a2f6cb41b79b75404e8` and the image ID above.
 
+## Local Codex review handoff
+
+The review PR is the draft
+[`ycsxh/vllm#3`](https://github.com/ycsxh/vllm/pull/3), from
+`codex/ticket-04-ds4-profile-spine` to the personal fork's `main`. It is not an
+upstream PR. Do not create an upstream issue, comment, review, PR, or push while
+reviewing this handoff.
+
+The PR base at creation was
+`72fe9df32ca636e93a7f2b1f3f4de074806752f3`. Review the seven Ticket 04 commits
+from `159a779bb` through the hardware-accepted implementation `c783ea0e6`, then
+review the later documentation-only acceptance commits separately. The PR body
+records the duplicate-work checks, test results, model run, invalid attempts,
+performance boundary, and AI-assistance disclosure required for human review.
+
+All three server attempts are bundled for transfer to the local development
+computer:
+
+```text
+/home/lyc/ds4-storage/results/ticket-04-review-evidence-c783ea0e6.tar.gz
+SHA-256: a3ed24494dced6c8dbbc46e3109329bcdbaf814230dd56696624981eecb7b7db
+Size: 3.9 MiB
+```
+
+The archive contains both retained invalid evidence roots and the final passed
+root. After copying it, verify the archive checksum before extracting it. A
+local reviewer must keep the invalid attempts distinct from the accepted
+`c783ea0e6` result and must not infer hardware acceptance from a skipped test.
+
 ## Transfer the implementation
 
 The branch, including the minimal fixes, has been pushed only to the personal
