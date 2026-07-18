@@ -37,6 +37,7 @@ V2_ENUMS = {
 CANONICAL_V2_PLANNER_INPUTS = {
     "schema_version": V2_SCHEMA_VERSION,
     "workload_selectors": tuple(f"canonical-{index:02d}" for index in range(34)),
+    "kv_cache_groups": ("0",),
     "seed": 20260715,
     "block_size": 16,
     "chunk_budget": 4096,
@@ -901,6 +902,7 @@ def _validate_v2_evidence(
     rows: list[dict[str, Any]],
     expected_points: dict[str, dict[str, Any]],
     outcomes: dict[str, str],
+    expected_kv_cache_groups: frozenset[str],
 ) -> None:
     observed: set[tuple[str, str, int, str, str]] = set()
     for row in rows:
@@ -944,6 +946,7 @@ def _validate_v2_evidence(
             ):
                 raise ValueError("prefix evidence has an invalid physical block ID")
 
+    expected: set[tuple[str, str, int, str, str]] = set()
     for point_id, point in expected_points.items():
         payload = point["payload"]
         if (
@@ -951,21 +954,61 @@ def _validate_v2_evidence(
             or outcomes.get(point_id) != "passed"
         ):
             continue
-        request_keys = {
+        request_keys = [
             request["request_key"] for request in payload.get("requests", [])
-        }
+        ]
         for phase in ("warmup", "steady"):
             for ordinal in range(3 if phase == "warmup" else 10):
-                present = {
-                    request_key
-                    for row_point_id, row_phase, row_ordinal, request_key, _ in observed
-                    if (row_point_id, row_phase, row_ordinal)
-                    == (point_id, phase, ordinal)
-                }
-                if present != request_keys:
-                    raise ValueError(
-                        "missing prefix evidence for a completed hit repetition"
-                    )
+                expected.update(
+                    (point_id, phase, ordinal, request_key, kv_cache_group)
+                    for request_key in request_keys
+                    for kv_cache_group in expected_kv_cache_groups
+                )
+    if observed != expected:
+        raise ValueError("prefix evidence does not match completed hit repetitions")
+
+
+_TURN_TOTAL_FIELDS = (
+    "scheduled_tokens",
+    "context_tokens",
+    "cached_tokens",
+    "new_tokens",
+    "recomputed_tokens",
+    "requested_kv_blocks",
+    "allocated_kv_blocks",
+    "requested_kv_bytes",
+    "allocated_kv_bytes",
+    "lookup_time_ms",
+    "allocation_time_ms",
+    "runner_wall_time_ms",
+    "cuda_model_time_ms",
+)
+
+
+def _validate_v2_turn_totals(
+    turns: list[dict[str, Any]], raw: list[dict[str, Any]]
+) -> None:
+    """Reconcile each full-turn record with its exact successful chunks."""
+    raw_by_turn: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for row in raw:
+        raw_by_turn.setdefault((row["phase"], row["ordinal"]), []).append(row)
+    for turn in turns:
+        chunks = raw_by_turn.get((turn["phase"], turn["ordinal"]), [])
+        if not chunks or turn["chunk_count"] != len(chunks):
+            raise ValueError("turn sample does not match raw chunk totals")
+        for field in _TURN_TOTAL_FIELDS:
+            values = [row[field] for row in chunks]
+            if any(value is None for value in values) or not _same_float(
+                turn[field], sum(values)
+            ):
+                raise ValueError("turn sample does not match raw chunk totals")
+        expected_throughput = (
+            turn["scheduled_tokens"] * 1000 / turn["runner_wall_time_ms"]
+            if turn["runner_wall_time_ms"]
+            else 0.0
+        )
+        if not _same_float(turn["throughput_tokens_per_s"], expected_throughput):
+            raise ValueError("turn sample does not match raw chunk totals")
 
 
 def _validate_v2_statistics(
@@ -1108,6 +1151,9 @@ def _validate_v2_result_dir(result_dir: Path, config: dict[str, Any]) -> None:
     ):
         _require_v2_enums(rows, name)
     expected_points = _canonical_manifest_points(config)
+    expected_kv_cache_groups = frozenset(
+        config["canonical_planner_inputs"]["kv_cache_groups"]
+    )
     canonical_full = _manifest_id_set(
         config.get("canonical_full_manifest"), "canonical_full_manifest"
     )
@@ -1286,6 +1332,7 @@ def _validate_v2_result_dir(result_dir: Path, config: dict[str, Any]) -> None:
             for row in turns
         ):
             raise ValueError("passed point has an invalid turn sample")
+        _validate_v2_turn_totals(turns, raw)
         outcomes[point_id] = "passed"
     for row in aggregate_rows:
         point_id = row["point_id"]
@@ -1300,7 +1347,12 @@ def _validate_v2_result_dir(result_dir: Path, config: dict[str, Any]) -> None:
         for row in evidence_rows
     ):
         raise ValueError("prefix evidence must describe a completed point")
-    _validate_v2_evidence(evidence_rows, expected_points, outcomes)
+    _validate_v2_evidence(
+        evidence_rows,
+        expected_points,
+        outcomes,
+        expected_kv_cache_groups,
+    )
     _validate_v2_statistics(turn_rows, aggregate_rows, expected_points, config)
     _validate_v2_comparisons(comparison_rows, aggregate_rows, outcomes, expected_points)
 

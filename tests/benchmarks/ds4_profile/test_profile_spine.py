@@ -187,7 +187,7 @@ def _write_v2_result(tmp_path: Path) -> Path:
                         allocated_kv_bytes=1,
                         runner_wall_time_ms=elapsed,
                         cuda_model_time_ms=elapsed,
-                        throughput_tokens_per_s=100.0 + ordinal,
+                        throughput_tokens_per_s=512_000.0 / elapsed,
                         runtime_mode="FULL",
                     )
                 )
@@ -207,7 +207,7 @@ def _write_v2_result(tmp_path: Path) -> Path:
                         )
                     )
         values = list(range(10, 20))
-        throughput = list(range(100, 110))
+        throughput = [512_000.0 / value for value in values]
         mean = sum(values) / len(values)
         throughput_mean = sum(throughput) / len(throughput)
         aggregate_rows.append(
@@ -223,8 +223,10 @@ def _write_v2_result(tmp_path: Path) -> Path:
                 runner_wall_time_p90_ms=18.1,
                 runner_wall_time_mean_ms=mean,
                 runner_wall_time_cv=statistics.pstdev(values) / mean,
-                throughput_median_tokens_per_s=104.5,
-                throughput_p90_tokens_per_s=108.1,
+                throughput_median_tokens_per_s=statistics.median(throughput),
+                throughput_p90_tokens_per_s=statistics.quantiles(
+                    throughput, n=10, method="inclusive"
+                )[8],
                 throughput_mean_tokens_per_s=throughput_mean,
                 throughput_cv=statistics.pstdev(throughput) / throughput_mean,
                 noisy=True,
@@ -355,6 +357,94 @@ def test_v2_validator_recomputes_aggregate_statistics(tmp_path: Path) -> None:
         ValueError, match="aggregate statistics do not match turn samples"
     ):
         profile_spine._validate_result_dir(output_dir)
+
+
+def test_v2_validator_reconciles_turn_samples_with_raw_chunks(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    output_dir = _write_v2_result(tmp_path)
+    turn_path = output_dir / "turn_samples.parquet"
+    turns = pq.read_table(turn_path)
+    turn_rows = turns.to_pylist()
+    target = next(
+        row
+        for row in turn_rows
+        if row["phase"] == "steady" and row["ordinal"] == 0
+    )
+    target["runner_wall_time_ms"] = 10.25
+    target["cuda_model_time_ms"] = 10.25
+    target["throughput_tokens_per_s"] = 512_000.0 / 10.25
+    pq.write_table(pa.Table.from_pylist(turn_rows, schema=turns.schema), turn_path)
+
+    aggregate_path = output_dir / "aggregates.parquet"
+    aggregates = pq.read_table(aggregate_path)
+    aggregate_rows = aggregates.to_pylist()
+    aggregate = next(
+        row for row in aggregate_rows if row["point_id"] == target["point_id"]
+    )
+    steady = [
+        row
+        for row in turn_rows
+        if row["point_id"] == target["point_id"] and row["phase"] == "steady"
+    ]
+    elapsed = [row["runner_wall_time_ms"] for row in steady]
+    throughput = [row["throughput_tokens_per_s"] for row in steady]
+    elapsed_mean = statistics.fmean(elapsed)
+    throughput_mean = statistics.fmean(throughput)
+    aggregate.update(
+        {
+            "runner_wall_time_median_ms": statistics.median(elapsed),
+            "runner_wall_time_p90_ms": statistics.quantiles(
+                elapsed, n=10, method="inclusive"
+            )[8],
+            "runner_wall_time_mean_ms": elapsed_mean,
+            "runner_wall_time_cv": statistics.pstdev(elapsed) / elapsed_mean,
+            "throughput_median_tokens_per_s": statistics.median(throughput),
+            "throughput_p90_tokens_per_s": statistics.quantiles(
+                throughput, n=10, method="inclusive"
+            )[8],
+            "throughput_mean_tokens_per_s": throughput_mean,
+            "throughput_cv": statistics.pstdev(throughput) / throughput_mean,
+            "noisy": statistics.pstdev(elapsed) / elapsed_mean > 0.05,
+        }
+    )
+    pq.write_table(
+        pa.Table.from_pylist(aggregate_rows, schema=aggregates.schema), aggregate_path
+    )
+
+    with pytest.raises(ValueError, match="turn sample does not match raw chunk totals"):
+        profile_spine._validate_result_dir(output_dir)
+
+
+def test_v2_validator_requires_exact_prefix_evidence_groups(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    missing_dir = _write_v2_result(tmp_path / "missing-prefix-evidence")
+    evidence_path = missing_dir / "prefix_evidence.parquet"
+    evidence = pq.read_table(evidence_path)
+    pq.write_table(
+        pa.Table.from_pylist(evidence.to_pylist()[1:], schema=evidence.schema),
+        evidence_path,
+    )
+    with pytest.raises(
+        ValueError, match="prefix evidence does not match completed hit repetitions"
+    ):
+        profile_spine._validate_result_dir(missing_dir)
+
+    extra_dir = _write_v2_result(tmp_path / "extra-prefix-evidence")
+    evidence_path = extra_dir / "prefix_evidence.parquet"
+    evidence = pq.read_table(evidence_path)
+    evidence_rows = evidence.to_pylist()
+    extra = copy.deepcopy(evidence_rows[0])
+    extra["kv_cache_group"] = "unexpected"
+    evidence_rows.append(extra)
+    pq.write_table(
+        pa.Table.from_pylist(evidence_rows, schema=evidence.schema), evidence_path
+    )
+    with pytest.raises(
+        ValueError, match="prefix evidence does not match completed hit repetitions"
+    ):
+        profile_spine._validate_result_dir(extra_dir)
 
 
 def test_v2_validator_requires_exact_manifest_and_coordinates(tmp_path: Path) -> None:

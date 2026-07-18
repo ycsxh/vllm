@@ -67,3 +67,29 @@
   - Passed.
 - `git diff --check`
   - Passed.
+
+## Review-fix follow-up II
+
+- Reconciled every passed v2 turn row against the raw chunks for its exact
+  phase/ordinal, including chunk count, token, KV allocation, timing, and
+  derived-throughput totals. Terminal out-of-capacity points remain forbidden
+  from emitting turn or aggregate rows.
+- Made prefix evidence an exact required set over point, repetition, request,
+  and the frozen `kv_cache_groups` contract; extra or missing group rows now
+  fail validation.
+- Added regressions for forged turn-plus-aggregate values and missing/extra
+  prefix-evidence cache groups.
+
+### Commands and results
+
+- `/Users/liuyuncong/GitHub/vllm/.venv/bin/python -m pytest tests/benchmarks/ds4_profile/test_profile_spine.py -k 'v1_result or v2_' -v`
+  - Blocked during collection: `ModuleNotFoundError: No module named 'torch'`
+    from `tests/conftest.py:31`.
+- Direct v1/v2 validator regression execution with an in-memory `torch` import
+  stub: passed 12 selected cases, including both new regressions.
+- `/Users/liuyuncong/GitHub/vllm/.venv/bin/python -m py_compile benchmarks/ds4_profile/profile_spine.py tests/benchmarks/ds4_profile/test_profile_spine.py`
+  - Passed.
+- `/Users/liuyuncong/GitHub/vllm/.venv/bin/ruff check benchmarks/ds4_profile/profile_spine.py tests/benchmarks/ds4_profile/test_profile_spine.py`
+  - Passed.
+- `git diff --check`
+  - Passed.
