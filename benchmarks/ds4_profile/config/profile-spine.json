@@ -18,7 +18,7 @@
   },
   "runtime": {
     "compilation": {
-      "capture_sizes": [1],
+      "capture_sizes": [1, 128],
       "compile_sizes": [1, 128],
       "cudagraph_mode": "FULL_AND_PIECEWISE",
       "mode": "VLLM_COMPILE"

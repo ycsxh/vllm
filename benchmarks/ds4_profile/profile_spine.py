@@ -105,13 +105,17 @@ def _resolve_config(config: dict[str, Any], replay: dict[str, Any]) -> dict[str,
         + 1,
     )
     compilation = runtime["compilation"]
-    required_compile_sizes = {
+    required_execution_sizes = {
         1,
         resolved["profile"]["prefill_chunk_tokens"],
     }
-    if not required_compile_sizes.issubset(compilation["compile_sizes"]):
+    if not required_execution_sizes.issubset(compilation["compile_sizes"]):
         raise ValueError(
             "compile_sizes must cover decode and the configured prefill chunk"
+        )
+    if not required_execution_sizes.issubset(compilation["capture_sizes"]):
+        raise ValueError(
+            "capture_sizes must cover decode and the configured prefill chunk"
         )
     return resolved
 

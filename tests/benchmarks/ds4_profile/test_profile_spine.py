@@ -41,6 +41,27 @@ def test_prefill_sample_detection_checks_inner_request_tokens() -> None:
     assert _has_sampled_tokens(SimpleNamespace(sampled_token_ids=[[17]]))
 
 
+def test_config_requires_cuda_graph_capture_for_both_profile_points() -> None:
+    from benchmarks.ds4_profile.profile_spine import _resolve_config
+
+    config = {
+        "profile": {"prefill_chunk_tokens": 128},
+        "runtime": {
+            "compilation": {
+                "capture_sizes": [1],
+                "compile_sizes": [1, 128],
+            }
+        },
+    }
+    replay = {
+        "execution_completion_token_ids": [2],
+        "execution_prompt_token_ids": [1],
+    }
+
+    with pytest.raises(ValueError, match="capture_sizes"):
+        _resolve_config(config, replay)
+
+
 @pytest.mark.parametrize(
     ("state_token_id", "cached_token_id"),
     [(17, None), (-1, 17)],
@@ -136,7 +157,7 @@ def _write_fixture_inputs(tmp_path: Path) -> Path:
                 },
                 "runtime": {
                     "compilation": {
-                        "capture_sizes": [1],
+                        "capture_sizes": [1, 128],
                         "compile_sizes": [1, 128],
                         "cudagraph_mode": "FULL_AND_PIECEWISE",
                         "mode": "VLLM_COMPILE",
@@ -766,7 +787,7 @@ def test_server_profile_config_pins_inputs_and_production_measurement_rules() ->
     }
     assert config["runtime"] == {
         "compilation": {
-            "capture_sizes": [1],
+            "capture_sizes": [1, 128],
             "compile_sizes": [1, 128],
             "cudagraph_mode": "FULL_AND_PIECEWISE",
             "mode": "VLLM_COMPILE",

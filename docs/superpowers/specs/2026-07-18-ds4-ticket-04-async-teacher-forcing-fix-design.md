@@ -64,6 +64,12 @@ state, incompatible GPU cache shape, or failure to replace the expected GPU
 entry will remain fail-closed errors. Such a run must preserve partial rows and
 finalize as invalid. No path may convert a skipped or invalid run into a pass.
 
+The GPU cache is an inference tensor, so its in-place replacement must execute
+inside `torch.inference_mode()`. Ticket 04 configuration validation must also
+require both capture sizes and compile sizes to cover Decode token count 1 and
+Prefill token count 128. Otherwise the 128-token point can compile successfully
+but execute with CUDA Graph runtime mode `NONE`.
+
 ## Tests and acceptance
 
 Focused tests will extend the existing Ticket 04 test module. They will cover:

@@ -248,7 +248,10 @@ def _inject_teacher_forced_token(
         raise RuntimeError(
             "async sampled-token cache does not contain the sampled token"
         )
-    prev_sampled_token_ids[req_index, 0] = injected_token_id
+    import torch
+
+    with torch.inference_mode():
+        prev_sampled_token_ids[req_index, 0] = injected_token_id
 
 
 def _assert_teacher_forced_input(

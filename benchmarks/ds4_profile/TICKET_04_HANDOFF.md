@@ -53,6 +53,21 @@ well as CPU state. A focused test must prove that the next step's real GPU
 input reads the injected token. Acceptance must be rerun from preflight through
 the hardware-gated pytest against the new exact commit and image.
 
+The first fix attempt at `383cb530b` also remains unaccepted. Its retained
+invalid run is `ticket-04/ds4-spine-20260718T143314Z-4fad469c` under the
+`ticket-04-acceptance-383cb530b` evidence root. It established two additional
+fail-closed requirements:
+
+- Updating the GPU async token cache must occur inside
+  `torch.inference_mode()` because the cache is an inference tensor.
+- CUDA Graph capture sizes must cover both the one-token Decode point and the
+  128-token Prefill point. Compile coverage alone is insufficient; capture
+  size `[1]` caused the real Prefill point to report runtime mode `NONE`.
+
+That run also finalized with six partial rows, zero aggregates,
+`hardware_validated: false`, and an Invalid report. It does not validate any
+later commit.
+
 ## Transfer the implementation
 
 The branch has not been pushed as part of this handoff. From the developer
