@@ -65,6 +65,25 @@ def _write_fixture_inputs(tmp_path: Path) -> Path:
                     "prefill_chunk_tokens": 128,
                     "warmup_repetitions": 3,
                 },
+                "runtime": {
+                    "compilation": {
+                        "capture_sizes": [1],
+                        "compile_sizes": [1, 128],
+                        "cudagraph_mode": "FULL_AND_PIECEWISE",
+                        "mode": "VLLM_COMPILE",
+                    },
+                    "dtype": "half",
+                    "enable_chunked_prefill": True,
+                    "enable_prefix_caching": True,
+                    "enforce_eager": False,
+                    "gpu_memory_utilization": 0.9,
+                    "kv_cache_dtype": "auto",
+                    "max_num_seqs": 1,
+                    "sampling": {"max_tokens": 1, "temperature": 0.0},
+                    "seed": 0,
+                    "skip_tokenizer_init": True,
+                    "tensor_parallel_size": 1,
+                },
                 "roles": {"decode": {"gpu": 1}, "prefill": {"gpu": 0}},
                 "source": {"commit": "abc123", "dirty": False},
             }
@@ -173,9 +192,10 @@ def test_fixture_records_sampled_token_discard_and_teacher_forced_injection(
     ]
     assert [row["injected_token_id"] for row in decode_steps] == list(range(302, 315))
     assert all(row["sampled_token_id"] is not None for row in decode_steps)
-    assert all(
-        row["sampled_token_id"] != row["injected_token_id"] for row in decode_steps
-    )
+    assert all(row["sampled_token_discarded"] for row in decode_steps)
+    assert all(row["new_tokens"] == 1 for row in decode_steps)
+    assert all(row["cached_tokens"] > 0 for row in decode_steps)
+    assert all(row["context_tokens"] > row["prompt_tokens"] for row in decode_steps)
     assert all(row["injected_token_id"] is None for row in rows[:2])
 
 
@@ -267,6 +287,7 @@ def test_gpu_worker_plan_targets_the_low_level_compiled_teacher_forced_path(
     assert plan["engine"]["enforce_eager"] is False
     assert plan["engine"]["compilation_mode"] == "VLLM_COMPILE"
     assert plan["engine"]["cudagraph_enabled"] is True
+    assert plan["engine"]["block_size"] == 16
     assert plan["setup_prefill_chunks"] == [256]
     assert plan["scheduled_tokens_per_step"] == 1
     assert plan["initial_teacher_forced_token_id"] == 301
@@ -306,8 +327,10 @@ def test_gpu_worker_failure_is_recorded_without_claiming_hardware_validation(
         "vllm.v1.worker.gpu_worker.Worker.execute_model"
     )
     assert worker["status"] == "failed"
-    assert worker["samples"] == []
-    assert "error" in worker
+    assert worker["samples"][0]["status"] == "failed"
+    assert worker["samples"][0]["phase"] == "startup"
+    assert worker["failure"]["point_id"] == "decode-b1-t1"
+    assert "error" in worker["failure"]
 
 
 def _write_passed_worker_results(
@@ -333,6 +356,10 @@ def _write_passed_worker_results(
         role_rows = [row for row in rows if row["role"] == role]
         for row in role_rows:
             row["runner_boundary"] = "vllm.v1.worker.gpu_worker.Worker.execute_model"
+            if row["phase"] in {"warmup", "steady"}:
+                row["cudagraph_runtime_mode"] = (
+                    "FULL" if role == "decode" else "PIECEWISE"
+                )
         worker_path = tmp_path / f"{role}.json"
         worker_path.write_text(
             json.dumps(
@@ -347,7 +374,16 @@ def _write_passed_worker_results(
                     "model_runner_implementation": "GPUModelRunner",
                     "compile_enabled": True,
                     "cudagraph_enabled": True,
-                    "cudagraph_observations": ["FULL"],
+                    "cudagraph_observations": [
+                        {
+                            "num_padded_tokens": 1 if role == "decode" else 128,
+                            "num_paddings": 0,
+                            "num_unpadded_tokens": 1 if role == "decode" else 128,
+                            "runtime_mode": (
+                                "FULL" if role == "decode" else "PIECEWISE"
+                            ),
+                        }
+                    ],
                     "samples": role_rows,
                     "status": "passed",
                 }
@@ -405,12 +441,16 @@ def test_assemble_cli_merges_both_gpu_roles_into_the_public_artifact_contract(
     assert provenance["hardware_validated"] is True
     assert provenance["status"] == "passed"
     assert provenance["preflight"]["hardware"]["driver"] == "test-driver"
+    assert provenance["run_parameters"]["runtime"]["dtype"] == "half"
+    assert provenance["run_parameters"]["runtime"]["effective_max_model_len"] == 8192
     assert {worker["role"] for worker in provenance["workers"]} == {
         "decode",
         "prefill",
     }
     report = (output_dir / "result.md").read_text()
     assert "Hardware validated: yes" in report
+    frozen_config = json.loads((output_dir / "run-config.json").read_text())
+    assert frozen_config["runtime"]["effective_max_model_len"] == 8192
 
 
 def test_assemble_cli_rejects_a_worker_with_incomplete_steady_samples(
@@ -449,6 +489,139 @@ def test_assemble_cli_rejects_a_worker_with_incomplete_steady_samples(
     provenance = json.loads((output_dir / "provenance.json").read_text())
     assert provenance["hardware_validated"] is False
     assert provenance["status"] == "invalid"
+
+
+def test_assemble_cli_rejects_missing_cudagraph_runtime_evidence(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_fixture_inputs(tmp_path)
+    worker_paths, preflight_path = _write_passed_worker_results(tmp_path, config_path)
+    decode = json.loads(worker_paths[1].read_text())
+    decode["cudagraph_observations"] = []
+    for row in decode["samples"]:
+        row["cudagraph_runtime_mode"] = None
+    worker_paths[1].write_text(json.dumps(decode))
+    output_dir = tmp_path / "invalid-cudagraph-result"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "benchmarks.ds4_profile.profile_spine",
+            "assemble",
+            "--config",
+            str(config_path),
+            "--preflight",
+            str(preflight_path),
+            "--worker-result",
+            str(worker_paths[0]),
+            "--worker-result",
+            str(worker_paths[1]),
+            "--output-dir",
+            str(output_dir),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    provenance = json.loads((output_dir / "provenance.json").read_text())
+    assert provenance["hardware_validated"] is False
+
+
+def test_assemble_accepts_a_discarded_sample_that_matches_the_injected_token(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_fixture_inputs(tmp_path)
+    worker_paths, preflight_path = _write_passed_worker_results(tmp_path, config_path)
+    decode = json.loads(worker_paths[1].read_text())
+    decode_step = next(
+        row for row in decode["samples"] if row["phase"] in {"warmup", "steady"}
+    )
+    decode_step["sampled_token_id"] = decode_step["injected_token_id"]
+    worker_paths[1].write_text(json.dumps(decode))
+    output_dir = tmp_path / "equal-token-result"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "benchmarks.ds4_profile.profile_spine",
+            "assemble",
+            "--config",
+            str(config_path),
+            "--preflight",
+            str(preflight_path),
+            "--worker-result",
+            str(worker_paths[0]),
+            "--worker-result",
+            str(worker_paths[1]),
+            "--output-dir",
+            str(output_dir),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    provenance = json.loads((output_dir / "provenance.json").read_text())
+    assert provenance["hardware_validated"] is True
+
+
+def test_assemble_cli_preserves_partial_rows_and_failed_point(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_fixture_inputs(tmp_path)
+    worker_paths, preflight_path = _write_passed_worker_results(tmp_path, config_path)
+    decode = json.loads(worker_paths[1].read_text())
+    decode["status"] = "failed"
+    decode["hardware_validated"] = False
+    decode["samples"] = decode["samples"][:5]
+    decode["samples"][-1]["status"] = "failed"
+    decode["samples"][-1]["phase"] = "setup"
+    decode["samples"][-1]["ordinal"] = 0
+    decode["samples"][-1]["sample_id"] = "fixture-run:decode-b1-t1:setup:0"
+    decode["samples"][-1]["error"] = "RuntimeError: injected failure"
+    decode["failure"] = {
+        "error": "RuntimeError: injected failure",
+        "ordinal": 0,
+        "phase": "setup",
+        "point_id": "decode-b1-t1",
+    }
+    worker_paths[1].write_text(json.dumps(decode))
+    output_dir = tmp_path / "partial-result"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "benchmarks.ds4_profile.profile_spine",
+            "assemble",
+            "--config",
+            str(config_path),
+            "--preflight",
+            str(preflight_path),
+            "--worker-result",
+            str(worker_paths[0]),
+            "--worker-result",
+            str(worker_paths[1]),
+            "--output-dir",
+            str(output_dir),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert result.returncode == 2, result.stderr
+    rows = pq.read_table(output_dir / "raw_samples.parquet").to_pylist()
+    failed = [row for row in rows if row["status"] == "failed"]
+    assert len(rows) == 20
+    assert failed[0]["point_id"] == "decode-b1-t1"
+    assert failed[0]["phase"] == "setup"
+    assert failed[0]["error"] == "RuntimeError: injected failure"
 
 
 def test_container_profile_spine_plan_binds_both_workers_and_assembles_results(
@@ -522,6 +695,25 @@ def test_server_profile_config_pins_inputs_and_production_measurement_rules() ->
         "prefill_chunk_tokens": 128,
         "warmup_repetitions": 3,
     }
+    assert config["runtime"] == {
+        "compilation": {
+            "capture_sizes": [1],
+            "compile_sizes": [1, 128],
+            "cudagraph_mode": "FULL_AND_PIECEWISE",
+            "mode": "VLLM_COMPILE",
+        },
+        "dtype": "half",
+        "enable_chunked_prefill": True,
+        "enable_prefix_caching": True,
+        "enforce_eager": False,
+        "gpu_memory_utilization": 0.9,
+        "kv_cache_dtype": "auto",
+        "max_num_seqs": 1,
+        "sampling": {"max_tokens": 1, "temperature": 0.0},
+        "seed": 0,
+        "skip_tokenizer_init": True,
+        "tensor_parallel_size": 1,
+    }
 
 
 @pytest.mark.skipif(
@@ -557,14 +749,16 @@ def test_profile_spine_executes_both_gpu_roles_without_latency_thresholds(
     ]
     assert len(decode_rows) == 13
     assert all(row["sampled_token_id"] is not None for row in decode_rows)
+    assert all(row["sampled_token_discarded"] for row in decode_rows)
     assert all(
-        row["sampled_token_id"] != row["injected_token_id"] for row in decode_rows
+        row["cudagraph_runtime_mode"] in {"FULL", "PIECEWISE"} for row in decode_rows
     )
     provenance = json.loads((output_dir / "provenance.json").read_text())
     assert provenance["hardware_validated"] is True
     assert provenance["status"] == "passed"
     assert all(worker["compile_enabled"] for worker in provenance["workers"])
     assert all(worker["cudagraph_enabled"] for worker in provenance["workers"])
+    assert all(worker["cudagraph_observations"] for worker in provenance["workers"])
     assert all(
         worker["runner_boundary"] == "vllm.v1.worker.gpu_worker.Worker.execute_model"
         for worker in provenance["workers"]

@@ -149,8 +149,16 @@ by exact replays or mixed batches.
 Ticket 04 adds a CPU-testable artifact harness and a hardware-gated path at the
 `GPUWorker`/`GPUModelRunner` boundary. It emits versioned raw sample and
 aggregate Parquet, frozen configuration, provenance, and a minimal Markdown
-result. The school-server command and acceptance procedure are documented in
+result. Raw rows distinguish prompt, context, cached, scheduled, and new-token
+counts; a hardware-valid run also records the observed CUDA Graph runtime mode
+for every warmup and steady sample. The school-server command and acceptance
+procedure are documented in
 [`container/README.md`](container/README.md#ticket-04-profile-spine).
+
+On a developer workstation, use only result validation, the focused CPU
+contract tests, and `profile-spine --print-plan`. Do not load the model or opt
+into `DS4_PROFILE_SPINE_GPU_SMOKE`; the real profile and GPU-gated pytest are
+school-server acceptance steps.
 
 Validate an existing result without loading a model:
 

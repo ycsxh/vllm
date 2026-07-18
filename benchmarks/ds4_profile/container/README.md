@@ -198,13 +198,17 @@ batch-1 128-token chunked-prefill point. The D worker prepares the selected
 exact replay, measures three warmups and ten teacher-forced decode steps, drops
 each sampled token, and injects the next predetermined execution token.
 torch.compile and CUDA graphs remain enabled; startup/capture, warmup, and
-steady-state samples remain distinguishable.
+steady-state samples remain distinguishable. Acceptance requires observed
+`FULL` or `PIECEWISE` CUDA Graph state for every measured sample; configured
+booleans alone cannot produce `hardware_validated: true`.
 
 Each run uses a new ID and writes a run-specific directory under
 `/mnt/ds4/results/ticket-04/` unless `--output-dir` is supplied. The directory
 contains `run-config.json`, `raw_samples.parquet`, `aggregates.parquet`,
 `provenance.json`, and `result.md`. Only ready preflight plus two passing worker
 records produces `hardware_validated: true`.
+If a worker fails mid-run, completed rows and a structured failed point/phase
+remain in the invalid artifact set for diagnosis.
 
 Validate a completed directory through the same image:
 

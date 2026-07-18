@@ -16,6 +16,28 @@
     "prefill_chunk_tokens": 128,
     "warmup_repetitions": 3
   },
+  "runtime": {
+    "compilation": {
+      "capture_sizes": [1],
+      "compile_sizes": [1, 128],
+      "cudagraph_mode": "FULL_AND_PIECEWISE",
+      "mode": "VLLM_COMPILE"
+    },
+    "dtype": "half",
+    "enable_chunked_prefill": true,
+    "enable_prefix_caching": true,
+    "enforce_eager": false,
+    "gpu_memory_utilization": 0.9,
+    "kv_cache_dtype": "auto",
+    "max_num_seqs": 1,
+    "sampling": {
+      "max_tokens": 1,
+      "temperature": 0.0
+    },
+    "seed": 0,
+    "skip_tokenizer_init": true,
+    "tensor_parallel_size": 1
+  },
   "roles": {
     "decode": {
       "gpu": 1

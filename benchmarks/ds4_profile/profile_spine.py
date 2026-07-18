@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import copy
 import json
 import statistics
 import sys
@@ -28,14 +29,18 @@ RAW_SAMPLE_SCHEMA = pa.schema(
         pa.field("batch_size", pa.int32(), nullable=False),
         pa.field("num_scheduled_tokens", pa.int32(), nullable=False),
         pa.field("prompt_tokens", pa.int32(), nullable=False),
+        pa.field("context_tokens", pa.int32(), nullable=False),
         pa.field("cached_tokens", pa.int32(), nullable=False),
+        pa.field("new_tokens", pa.int32(), nullable=False),
         pa.field("sampled_token_id", pa.int64()),
         pa.field("injected_token_id", pa.int64()),
+        pa.field("sampled_token_discarded", pa.bool_(), nullable=False),
         pa.field("runner_wall_time_ms", pa.float64()),
         pa.field("cuda_model_time_ms", pa.float64()),
         pa.field("derived_time_ms", pa.float64()),
         pa.field("compile_enabled", pa.bool_(), nullable=False),
         pa.field("cudagraph_enabled", pa.bool_(), nullable=False),
+        pa.field("cudagraph_runtime_mode", pa.string()),
         pa.field("error", pa.string()),
     ],
     metadata={b"schema_version": SCHEMA_VERSION.encode()},
@@ -90,6 +95,27 @@ def _load_replay(config: dict[str, Any]) -> dict[str, Any]:
     return replay
 
 
+def _resolve_config(config: dict[str, Any], replay: dict[str, Any]) -> dict[str, Any]:
+    resolved = copy.deepcopy(config)
+    runtime = resolved["runtime"]
+    runtime["effective_max_model_len"] = max(
+        8192,
+        len(replay["execution_prompt_token_ids"])
+        + len(replay["execution_completion_token_ids"])
+        + 1,
+    )
+    compilation = runtime["compilation"]
+    required_compile_sizes = {
+        1,
+        resolved["profile"]["prefill_chunk_tokens"],
+    }
+    if not required_compile_sizes.issubset(compilation["compile_sizes"]):
+        raise ValueError(
+            "compile_sizes must cover decode and the configured prefill chunk"
+        )
+    return resolved
+
+
 def make_sample_row(
     *,
     run_id: str,
@@ -99,12 +125,20 @@ def make_sample_row(
     ordinal: int,
     scheduled_tokens: int,
     prompt_tokens: int,
-    elapsed_ms: float,
+    elapsed_ms: float | None,
     sampled_token_id: int | None = None,
     injected_token_id: int | None = None,
     runner_boundary: str = "deterministic-fixture",
     cuda_model_time_ms: float | None = None,
     cached_tokens: int = 0,
+    context_tokens: int = 0,
+    new_tokens: int | None = None,
+    sampled_token_discarded: bool = False,
+    cudagraph_runtime_mode: str | None = None,
+    compile_enabled: bool = True,
+    cudagraph_enabled: bool = True,
+    status: str = "passed",
+    error: str | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -114,20 +148,24 @@ def make_sample_row(
         "role": role,
         "phase": phase,
         "ordinal": ordinal,
-        "status": "passed",
+        "status": status,
         "runner_boundary": runner_boundary,
         "batch_size": 1,
         "num_scheduled_tokens": scheduled_tokens,
         "prompt_tokens": prompt_tokens,
+        "context_tokens": context_tokens,
         "cached_tokens": cached_tokens,
+        "new_tokens": scheduled_tokens if new_tokens is None else new_tokens,
         "sampled_token_id": sampled_token_id,
         "injected_token_id": injected_token_id,
+        "sampled_token_discarded": sampled_token_discarded,
         "runner_wall_time_ms": elapsed_ms,
         "cuda_model_time_ms": cuda_model_time_ms,
         "derived_time_ms": None,
-        "compile_enabled": True,
-        "cudagraph_enabled": True,
-        "error": None,
+        "compile_enabled": compile_enabled,
+        "cudagraph_enabled": cudagraph_enabled,
+        "cudagraph_runtime_mode": cudagraph_runtime_mode,
+        "error": error,
     }
 
 
@@ -175,6 +213,16 @@ def _fixture_samples(config: dict[str, Any], replay: dict[str, Any]) -> list[dic
                         elapsed_ms=base_ms + point_offset + ordinal / 10,
                         sampled_token_id=sampled_token_id,
                         injected_token_id=injected_token_id,
+                        sampled_token_discarded=is_decode_step,
+                        context_tokens=(
+                            prompt_tokens + decode_step_index + 1
+                            if is_decode_step
+                            else scheduled_tokens
+                        ),
+                        cached_tokens=(
+                            prompt_tokens + decode_step_index if is_decode_step else 0
+                        ),
+                        cudagraph_runtime_mode=("FULL" if is_decode_step else None),
                     )
                 )
                 if is_decode_step:
@@ -186,6 +234,7 @@ def _gpu_worker_plan(
     config: dict[str, Any], replay: dict[str, Any], role: str
 ) -> dict[str, Any]:
     profile = config["profile"]
+    runtime = config["runtime"]
     prompt_token_count = len(replay["execution_prompt_token_ids"])
     max_batched_tokens = profile["max_num_batched_tokens"]
     setup_prefill_chunks = []
@@ -208,12 +257,16 @@ def _gpu_worker_plan(
         "role": role,
         "runner_boundary": "vllm.v1.worker.gpu_worker.Worker.execute_model",
         "engine": {
-            "compilation_mode": "VLLM_COMPILE",
-            "cudagraph_enabled": True,
-            "enforce_eager": False,
+            "block_size": profile["block_size"],
+            "compilation_mode": runtime["compilation"]["mode"],
+            "cudagraph_enabled": (runtime["compilation"]["cudagraph_mode"] != "NONE"),
+            "enforce_eager": runtime["enforce_eager"],
             "max_num_batched_tokens": max_batched_tokens,
-            "max_num_seqs": 1,
-            "tensor_parallel_size": 1,
+            "max_num_seqs": runtime["max_num_seqs"],
+            "tensor_parallel_size": runtime["tensor_parallel_size"],
+            "dtype": runtime["dtype"],
+            "kv_cache_dtype": runtime["kv_cache_dtype"],
+            "effective_max_model_len": runtime["effective_max_model_len"],
         },
         "sample_phases": {
             "steady": profile["measured_repetitions"],
@@ -375,14 +428,24 @@ def _validate_result_dir(result_dir: Path) -> None:
     sample_ids = [row["sample_id"] for row in raw_rows]
     if len(sample_ids) != len(set(sample_ids)):
         raise ValueError("sample_id values must be unique")
+    if any(
+        row["sample_id"]
+        != f"{row['run_id']}:{row['point_id']}:{row['phase']}:{row['ordinal']}"
+        for row in raw_rows
+    ):
+        raise ValueError("sample_id values must match their sample coordinates")
     phases = {row["phase"] for row in raw_rows}
-    if not phases.issubset({"startup", "capture", "warmup", "steady"}):
+    if not phases.issubset({"startup", "capture", "setup", "warmup", "steady"}):
         raise ValueError(f"unknown sample phase: {sorted(phases)}")
 
-    raw_point_ids = {row["point_id"] for row in raw_rows}
     aggregate_point_ids = {row["point_id"] for row in aggregate_rows}
-    if aggregate_point_ids != raw_point_ids:
-        raise ValueError("aggregate point_id values do not match raw samples")
+    passed_steady_point_ids = {
+        row["point_id"]
+        for row in raw_rows
+        if row["phase"] == "steady" and row["status"] == "passed"
+    }
+    if aggregate_point_ids != passed_steady_point_ids:
+        raise ValueError("aggregate point_id values do not match passed steady samples")
     for aggregate in aggregate_rows:
         steady_count = sum(
             row["point_id"] == aggregate["point_id"]
@@ -401,6 +464,7 @@ def _write_fixture_result(config_path: Path, output_dir: Path) -> None:
     if config.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(f"expected schema_version {SCHEMA_VERSION}")
     replay = _load_replay(config)
+    config = _resolve_config(config, replay)
     samples = _fixture_samples(config, replay)
     _write_result_artifacts(
         config=config,
@@ -442,6 +506,21 @@ def _worker_samples_valid(
         for phase, expected_count in expected_counts.items()
     ):
         return False
+    observations = worker.get("cudagraph_observations", [])
+    if not observations or any(
+        not isinstance(observation, dict)
+        or observation.get("runtime_mode") not in {"FULL", "PIECEWISE"}
+        for observation in observations
+    ):
+        return False
+    measured_samples = [
+        sample for sample in samples if sample["phase"] in {"warmup", "steady"}
+    ]
+    if any(
+        sample.get("cudagraph_runtime_mode") not in {"FULL", "PIECEWISE"}
+        for sample in measured_samples
+    ):
+        return False
     if any(
         sample.get("schema_version") != SCHEMA_VERSION
         or sample.get("run_id") != config["run_id"]
@@ -464,7 +543,7 @@ def _worker_samples_valid(
             return False
         if any(
             sample["sampled_token_id"] is None
-            or sample["sampled_token_id"] == sample["injected_token_id"]
+            or sample.get("sampled_token_discarded") is not True
             for sample in decode_samples
         ):
             return False
@@ -482,6 +561,7 @@ def _assemble_gpu_result(
     preflight = json.loads(preflight_path.read_text())
     workers = [json.loads(path.read_text()) for path in worker_paths]
     replay = _load_replay(config)
+    config = _resolve_config(config, replay)
     roles = {worker.get("role") for worker in workers}
     workers_valid = (
         roles == {"prefill", "decode"}
@@ -507,7 +587,10 @@ def _assemble_gpu_result(
         "preflight": preflight,
         "roles": config["roles"],
         "run_id": config["run_id"],
-        "run_parameters": config["profile"],
+        "run_parameters": {
+            "profile": config["profile"],
+            "runtime": config["runtime"],
+        },
         "source": config["source"],
         "status": "passed" if hardware_validated else "invalid",
         "workers": worker_summaries,
@@ -551,6 +634,7 @@ def main() -> None:
         elif args.command == "gpu-worker":
             config = json.loads(args.config.read_text())
             replay = _load_replay(config)
+            config = _resolve_config(config, replay)
             plan = _gpu_worker_plan(config, replay, args.role)
             args.output.parent.mkdir(parents=True, exist_ok=True)
             if args.inspect_plan:
@@ -561,7 +645,7 @@ def main() -> None:
                 from benchmarks.ds4_profile.gpu_profile import run_gpu_worker
 
                 worker_result = run_gpu_worker(config, replay, plan)
-                returncode = 0
+                returncode = 0 if worker_result["status"] == "passed" else 2
             except Exception as error:
                 worker_result = {
                     "schema_version": SCHEMA_VERSION,

@@ -61,6 +61,13 @@ Responsibilities:
 - keep hardware-dependent tests gated and make skipped status explicit; and
 - document the exact server command and expected result files.
 
+The local stage must stay lightweight. It must not load the Qwen model, set
+`DS4_PROFILE_SPINE_GPU_SMOKE=1`, run `profile-spine` without `--print-plan`, or
+attempt to reproduce the dual-GPU acceptance path on CPU. Those commands are
+reserved for Stage 2. During ordinary iteration, run the focused CPU contract
+test or static plan inspection; rerun the broader DS4 suite only when a change
+affects its shared contracts.
+
 Recommended checks for Ticket 04 are:
 
 ```bash
@@ -130,6 +137,11 @@ contains:
 - `aggregates.parquet`;
 - `provenance.json`; and
 - `result.md`.
+
+`run-config.json` freezes the effective engine, sampling, compile, CUDA Graph,
+cache, model-length, and measurement parameters. `raw_samples.parquet` records
+the actual CUDA Graph runtime mode and prompt/context/cached/scheduled/new-token
+counts; partial failures retain completed rows and the failed point/phase.
 
 Validate the artifact contract independently:
 

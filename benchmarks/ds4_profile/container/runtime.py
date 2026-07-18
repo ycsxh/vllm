@@ -731,30 +731,31 @@ def _gpu_smoke(config_path: Path, output_path: Path, print_plan: bool) -> int:
     return 0 if passed else 2
 
 
+def _profile_role_settings() -> dict[str, dict[str, str | int]]:
+    return {
+        "prefill": {
+            "gpu": os.environ.get("DS4_PREFILL_GPU", "0"),
+            "cpuset": os.environ.get("DS4_PREFILL_CPUSET", "0,2,4,6,8,10"),
+            "numa_node": 0,
+        },
+        "decode": {
+            "gpu": os.environ.get("DS4_DECODE_GPU", "1"),
+            "cpuset": os.environ.get("DS4_DECODE_CPUSET", "1,3,5,7,9,11"),
+            "numa_node": 1,
+        },
+    }
+
+
 def _profile_spine_worker_commands(
     profile_config_path: Path, work_dir: Path
 ) -> list[list[str]]:
-    role_settings = (
-        (
-            "prefill",
-            os.environ.get("DS4_PREFILL_GPU", "0"),
-            os.environ.get("DS4_PREFILL_CPUSET", "0,2,4,6,8,10"),
-            "0",
-        ),
-        (
-            "decode",
-            os.environ.get("DS4_DECODE_GPU", "1"),
-            os.environ.get("DS4_DECODE_CPUSET", "1,3,5,7,9,11"),
-            "1",
-        ),
-    )
     return [
         [
             "numactl",
-            f"--physcpubind={cpuset}",
-            f"--membind={node}",
+            f"--physcpubind={settings['cpuset']}",
+            f"--membind={settings['numa_node']}",
             "env",
-            f"CUDA_VISIBLE_DEVICES={gpu}",
+            f"CUDA_VISIBLE_DEVICES={settings['gpu']}",
             sys.executable,
             "-m",
             "benchmarks.ds4_profile.profile_spine",
@@ -766,7 +767,7 @@ def _profile_spine_worker_commands(
             "--output",
             str(work_dir / f"{role}.json"),
         ]
-        for role, gpu, cpuset, node in role_settings
+        for role, settings in _profile_role_settings().items()
     ]
 
 
@@ -775,28 +776,43 @@ def _effective_profile_config(profile_config_path: Path) -> dict[str, Any]:
     if not config.get("run_id"):
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         config["run_id"] = f"ds4-spine-{timestamp}-{uuid.uuid4().hex[:8]}"
+    dirty_value = os.environ.get(
+        "DS4_VLLM_DIRTY", str(config.get("source", {}).get("dirty", True))
+    ).lower()
     config["source"] = {
         "commit": os.environ.get(
             "DS4_VLLM_COMMIT", config.get("source", {}).get("commit", "unknown")
         ),
-        "dirty": os.environ.get(
-            "DS4_VLLM_DIRTY", str(config.get("source", {}).get("dirty", True))
-        ).lower()
-        == "true",
+        "dirty": (
+            dirty_value == "true" if dirty_value in {"true", "false"} else "unknown"
+        ),
     }
-    config["roles"] = {
-        "decode": {
-            "cpuset": os.environ.get("DS4_DECODE_CPUSET", "1,3,5,7,9,11"),
-            "gpu": os.environ.get("DS4_DECODE_GPU", "1"),
-            "numa_node": 1,
-        },
-        "prefill": {
-            "cpuset": os.environ.get("DS4_PREFILL_CPUSET", "0,2,4,6,8,10"),
-            "gpu": os.environ.get("DS4_PREFILL_GPU", "0"),
-            "numa_node": 0,
-        },
-    }
+    config["roles"] = _profile_role_settings()
     return config
+
+
+def _profile_spine_assemble_command(
+    config_path: Path,
+    preflight_path: Path,
+    work_dir: Path,
+    output_dir: Path,
+) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "benchmarks.ds4_profile.profile_spine",
+        "assemble",
+        "--config",
+        str(config_path),
+        "--preflight",
+        str(preflight_path),
+        "--worker-result",
+        str(work_dir / "prefill.json"),
+        "--worker-result",
+        str(work_dir / "decode.json"),
+        "--output-dir",
+        str(output_dir),
+    ]
 
 
 def _profile_spine(
@@ -812,22 +828,9 @@ def _profile_spine(
     effective_config_path = work_dir / "run-config.json"
     preflight_path = work_dir / "preflight.json"
     commands = _profile_spine_worker_commands(effective_config_path, work_dir)
-    assemble_command = [
-        sys.executable,
-        "-m",
-        "benchmarks.ds4_profile.profile_spine",
-        "assemble",
-        "--config",
-        str(effective_config_path),
-        "--preflight",
-        str(preflight_path),
-        "--worker-result",
-        str(work_dir / "prefill.json"),
-        "--worker-result",
-        str(work_dir / "decode.json"),
-        "--output-dir",
-        str(output_dir),
-    ]
+    assemble_command = _profile_spine_assemble_command(
+        effective_config_path, preflight_path, work_dir, output_dir
+    )
     if print_plan:
         print(
             shlex.join(
@@ -887,22 +890,12 @@ def _profile_spine(
             worker["command"] = command
             worker["returncode"] = returncode
             _write_json(worker_path, worker)
-        actual_assemble_command = [
-            sys.executable,
-            "-m",
-            "benchmarks.ds4_profile.profile_spine",
-            "assemble",
-            "--config",
-            str(actual_config_path),
-            "--preflight",
-            str(actual_preflight_path),
-            "--worker-result",
-            str(actual_work_dir / "prefill.json"),
-            "--worker-result",
-            str(actual_work_dir / "decode.json"),
-            "--output-dir",
-            str(output_dir),
-        ]
+        actual_assemble_command = _profile_spine_assemble_command(
+            actual_config_path,
+            actual_preflight_path,
+            actual_work_dir,
+            output_dir,
+        )
         return subprocess.run(actual_assemble_command, check=False).returncode
 
 
