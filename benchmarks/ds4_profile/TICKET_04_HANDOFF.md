@@ -2,10 +2,11 @@
 
 ## Local development status
 
-The local implementation stage is complete on branch
-`codex/ticket-04-ds4-profile-spine` at implementation commit
-`c8625b4e9f`. Ticket 04 as a whole is not complete until the school-server
-hardware acceptance below passes.
+The implementation and school-server acceptance stages are complete on branch
+`codex/ticket-04-ds4-profile-spine`. The exact hardware-accepted implementation
+commit is `c783ea0e69138503c6f83a2f6cb41b79b75404e8`. The earlier handoff commit
+`c8625b4e9f` and first fix `383cb530b` are retained as invalid attempts and must
+not be presented as passing.
 
 Local evidence recorded before handoff:
 
@@ -68,24 +69,70 @@ That run also finalized with six partial rows, zero aggregates,
 `hardware_validated: false`, and an Invalid report. It does not validate any
 later commit.
 
-## Transfer the implementation
+## Accepted school-server result
 
-The branch has not been pushed as part of this handoff. From the developer
-workstation, push only to the personal fork:
+The rerun against clean commit `c783ea0e69138503c6f83a2f6cb41b79b75404e8`
+passed on the documented dual RTX 3090 server. The immutable image ID was
+`sha256:3841fe21a5e9b94f10d60d1d6da17a54393cbb99fd0f91bcc27ae77f2aab114f`.
+The accepted evidence root is
+`/home/lyc/ds4-storage/results/ticket-04-acceptance-c783ea0e6`, and the real
+profile result is
+`ticket-04/ds4-spine-20260718T144113Z-1c85fd88` beneath that root.
 
-```bash
-git push origin codex/ticket-04-ds4-profile-spine
+Acceptance evidence:
+
+- Preflight was ready and all seven checks passed; the CPU dry run and printed
+  two-worker NUMA plan also passed.
+- Both GPU workers passed. The 30 raw rows comprise two startup, two capture,
+  six warmup, and 20 steady rows; the two aggregate rows contain ten measured
+  samples per point.
+- All 26 warmup and steady observations used CUDA Graphs: 13 Decode rows were
+  `FULL` and 13 Prefill rows were `PIECEWISE`.
+- Every Decode warmup and steady row records a sampled token, a discarded
+  sampled-token flag, and an injected token. The harness additionally checked
+  after every step that the next real GPU input consumed the previously
+  injected token.
+- Independent artifact validation returned zero. A separate parquet audit
+  asserted row counts, graph modes, teacher-forcing fields, clean source, and
+  `hardware_validated: true`.
+- The explicitly enabled hardware gate was collected and executed twice. Both
+  executions passed; the retained raw pytest log reports
+  `1 passed in 63.23s` with no skipped test.
+
+Key SHA-256 checksums:
+
+```text
+093c53e75876d95c3cc59a7464401faba9e59ffa194217520d4f28e353248fb8  raw_samples.parquet
+fdaea000520d3366d383eb155a165700335b3a49e43151f05268a823e8091b63  aggregates.parquet
+1c316450c26a5df63eb53d485421e755580bc5a4f2f4a3344a4f330a7027c22b  provenance.json
+ebb47ebc5b980a52ef3567fc2c3f1206b66e6a7943de851072ff346ba5ceb47e  result.md
+fec0465d8727b934a4944d59b33e01c43a6aad8c638f12d985880b37576c3ecd  ticket-04-validation-ds4-spine-20260718T144113Z-1c85fd88.json
+6e53d063ed5a554b5b4f5ced794ac3fa0e33d2e5a7f30ac10a9324429d335725  ticket-04-artifact-assertions.json
+78f11adff68e834ec0627aad5e14b35f33aae6b7cf34305b36273c5621e1bdc9  ticket-04-hardware-pytest-evidence.json
+2ccd864365994f3591fa487ef7c3b16705cb80f375d41491f6001ed9624d9bdb  ticket-04-hardware-pytest.log
 ```
 
-Do not push to or open a PR against `vllm-project/vllm`.
+The later documentation-only commit recording these results is not a different
+validated implementation. Hardware acceptance remains explicitly tied to
+`c783ea0e69138503c6f83a2f6cb41b79b75404e8` and the image ID above.
+
+## Transfer the implementation
+
+The branch, including the minimal fixes, has been pushed only to the personal
+fork. Do not push to or open a PR against `vllm-project/vllm`.
+
+```bash
+git push personal codex/ticket-04-ds4-profile-spine
+```
 
 On the school server, fetch the personal-fork branch and detach at the exact
 implementation commit:
 
 ```bash
-git fetch origin codex/ticket-04-ds4-profile-spine
-git switch --detach c8625b4e9f
-test "$(git rev-parse --short=10 HEAD)" = "c8625b4e9f"
+git fetch personal codex/ticket-04-ds4-profile-spine
+git switch --detach c783ea0e69138503c6f83a2f6cb41b79b75404e8
+test "$(git rev-parse HEAD)" = \
+  "c783ea0e69138503c6f83a2f6cb41b79b75404e8"
 git status --short
 ```
 
@@ -137,7 +184,7 @@ If execution fails, preserve the invalid result directory and completed sample
 rows. Record the source SHA, dirty state, image ID, command, result path, and
 error phase. Make the smallest fix on the feature branch, push the new commit
 to the personal fork, and rerun acceptance against that new exact SHA. Evidence
-from `c8625b4e9f` does not validate later code changes.
+from `c8625b4e9f` or `383cb530b` does not validate later code changes.
 
 After acceptance, return the result path, validation record, checksums, source
 SHA, dirty state, and any diagnostic patch to the local workflow. Only then is
