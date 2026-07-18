@@ -194,6 +194,79 @@ def test_replay_stops_without_mutating_an_out_of_capacity_prompt() -> None:
     assert result.event_rows[-1]["operation"] == "admission_failure"
 
 
+def test_replay_records_status_occupancy_and_lookup_timing() -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import replay_session
+
+    result = replay_session(
+        run_id="fixture-run",
+        turns=[_replay_turn(0, [1, 1, 2, 2, 3])],
+        capacity_blocks=3,
+        block_size=2,
+        max_model_len=32,
+    )
+
+    lookup_rows = [row for row in result.event_rows if row["operation"] == "lookup"]
+    allocation = next(
+        row
+        for row in result.event_rows
+        if row["event_source"] == "observer" and row["operation"] == "allocate"
+    )
+    free = next(row for row in result.event_rows if row["operation"] == "free")
+
+    assert all(row["status"] == "passed" for row in result.event_rows)
+    assert (
+        sum(row["duration_ns"] for row in lookup_rows)
+        == result.turn_rows[0]["lookup_time_ns"]
+    )
+    assert allocation["active_blocks_after"] > allocation["active_blocks_before"]
+    assert free["active_blocks_after"] == 0
+    assert free["cached_resident_blocks_after"] > 0
+    assert (
+        result.turn_rows[0]["cached_resident_blocks_after_free"]
+        == free["cached_resident_blocks_after"]
+    )
+
+
+def test_replay_flushes_observed_work_before_admission_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from benchmarks.ds4_profile import kv_cache_replay
+
+    original_allocate_slots = kv_cache_replay.KVCacheManager.allocate_slots
+
+    def allocate_then_fail(manager, *args, **kwargs):
+        assert original_allocate_slots(manager, *args, **kwargs) is not None
+        return None
+
+    monkeypatch.setattr(
+        kv_cache_replay.KVCacheManager,
+        "allocate_slots",
+        allocate_then_fail,
+    )
+    result = kv_cache_replay.replay_session(
+        run_id="fixture-run",
+        turns=[_replay_turn(0, [1, 1, 2, 2])],
+        capacity_blocks=2,
+        block_size=2,
+        max_model_len=32,
+    )
+
+    assert result.status == "out_of_capacity"
+    assert result.event_rows[-1]["operation"] == "admission_failure"
+    assert result.event_rows[-1]["status"] == "out_of_capacity"
+    assert all(row["status"] == "out_of_capacity" for row in result.event_rows)
+    assert any(
+        row["event_source"] == "observer" and row["operation"] == "allocate"
+        for row in result.event_rows
+    )
+    assert any(
+        row["event_source"] == "native" and row["operation"] == "store"
+        for row in result.event_rows
+    )
+    assert result.turn_rows[0]["active_blocks_after"] > 0
+    assert result.turn_rows[0]["cached_resident_blocks_after"] > 0
+
+
 def test_replay_separates_manager_forced_recompute_from_capacity_miss() -> None:
     from benchmarks.ds4_profile.kv_cache_replay import replay_session
 
