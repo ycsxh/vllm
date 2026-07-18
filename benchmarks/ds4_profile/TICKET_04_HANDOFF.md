@@ -124,6 +124,11 @@ The review PR is the draft
 upstream PR. Do not create an upstream issue, comment, review, PR, or push while
 reviewing this handoff.
 
+The escaped async teacher-forcing defect and both invalid acceptance attempts
+are tracked in the personal-fork-only issue
+[`ycsxh/vllm#4`](https://github.com/ycsxh/vllm/issues/4). Close it only after
+human review and merge of personal-fork PR #3; never mirror it upstream.
+
 The PR base at creation was
 `72fe9df32ca636e93a7f2b1f3f4de074806752f3`. Review the seven Ticket 04 commits
 from `159a779bb` through the hardware-accepted implementation `c783ea0e6`, then
