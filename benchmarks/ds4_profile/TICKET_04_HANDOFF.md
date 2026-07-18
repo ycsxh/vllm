@@ -130,6 +130,9 @@ from `159a779bb` through the hardware-accepted implementation `c783ea0e6`, then
 review the later documentation-only acceptance commits separately. The PR body
 records the duplicate-work checks, test results, model run, invalid attempts,
 performance boundary, and AI-assistance disclosure required for human review.
+Its personal-fork `pre-run-check` remains red by design while the draft has no
+`verified` or `ready` label; the dependent pre-commit job is therefore skipped.
+Do not add a readiness label until the human review is complete.
 
 All three server attempts are bundled for transfer to the local development
 computer:
