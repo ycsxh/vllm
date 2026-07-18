@@ -1,5 +1,9 @@
 # DS4 trajectory normalization
 
+The local-development to school-server acceptance process for this DS4
+dual-3090 project is defined in [`WORKFLOW.md`](WORKFLOW.md). It also records
+the personal-fork-only Git boundary and the inputs and outputs of each stage.
+
 This directory contains the offline ingestion step for the DS4 Agent profile.
 It consumes a local snapshot of the third-party
 `Yi30/deepseek-v4-swebench-trajectories` Hugging Face repository and never
@@ -139,3 +143,18 @@ The command writes `rendered_turns.parquet`, `workload_plan.json`, and
 `provenance.json`. Full chat histories remain only in the immutable raw
 snapshot. Execution token IDs are materialized only for the unique turns used
 by exact replays or mixed batches.
+
+## Run the Ticket 04 profile spine
+
+Ticket 04 adds a CPU-testable artifact harness and a hardware-gated path at the
+`GPUWorker`/`GPUModelRunner` boundary. It emits versioned raw sample and
+aggregate Parquet, frozen configuration, provenance, and a minimal Markdown
+result. The school-server command and acceptance procedure are documented in
+[`container/README.md`](container/README.md#ticket-04-profile-spine).
+
+Validate an existing result without loading a model:
+
+```bash
+.venv/bin/python -m benchmarks.ds4_profile.profile_spine validate \
+  --result-dir /path/to/profile-spine-result
+```

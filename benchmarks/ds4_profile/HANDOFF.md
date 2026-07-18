@@ -23,6 +23,7 @@ duplicate them here.
 - Runtime contract and operations:
   [`container/README.md`](container/README.md)
 - DS4 workflow overview: [`README.md`](README.md)
+- Cross-machine development and acceptance stages: [`WORKFLOW.md`](WORKFLOW.md)
 - Container implementation: [`container/`](container/)
 - Focused tests: [`../../tests/benchmarks/ds4_profile/`](../../tests/benchmarks/ds4_profile/)
 - Target-server evidence: `$HOME/ds4-storage/results/`

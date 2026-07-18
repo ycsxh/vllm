@@ -4,6 +4,9 @@ This workflow builds the current personal-fork checkout into a local OCI image.
 It never downloads vLLM source during the build. Docker is the validated primary
 runtime; the Apptainer notes at the end are a conversion route only.
 
+The Git synchronization and local/server responsibility boundary for this DS4
+project is defined in [`../WORKFLOW.md`](../WORKFLOW.md).
+
 ## Host prerequisites
 
 The validated target is Ubuntu 22.04 on x86_64 with two NVIDIA GeForce RTX 3090
@@ -54,7 +57,8 @@ Use paths owned by the experiment account. The examples below assume:
 │   ├── runtime/
 │   └── uv/
 ├── config/
-│   └── container-contract.json
+│   ├── container-contract.json
+│   └── profile-spine.json
 ├── results/
 ├── snapshot/4da61f3d06b48b6817a62b99e9c47035c8e59787/
 ├── ticket-01/
@@ -62,9 +66,10 @@ Use paths owned by the experiment account. The examples below assume:
 └── tokenizers/
 ```
 
-Copy `benchmarks/ds4_profile/config/container-contract.json` into `config/`.
-Keep the immutable raw snapshot and Ticket 01/02 directories read-only. The
-wrapper mounts them as:
+Copy `benchmarks/ds4_profile/config/container-contract.json` and
+`benchmarks/ds4_profile/config/profile-spine.json` into `config/`. Keep the
+immutable raw snapshot and Ticket 01/02 directories read-only. The wrapper
+mounts them as:
 
 | Host input | Container path | Mode |
 | --- | --- | --- |
@@ -168,20 +173,51 @@ pinned artifacts. It never overwrites the mounted Ticket directories.
 NUMA-bound workers concurrently, loads the smallest selected exact replay,
 loads the pinned Qwen model independently on each GPU, and performs one
 `vllm.LLM.generate` model-runner point per role. Only two passing worker records
-produce `hardware_validated: true`.
+produce `hardware_validated: true`. This is the retained Ticket 03 container
+smoke; it is not the Ticket 04 low-level profile acceptance.
 
-Subsequent profile tickets can run an explicit command through the same image
-and mounts while recording its exact exit status:
+## Ticket 04 profile spine
+
+Inspect the exact low-level worker and assembly commands without loading a
+model:
+
+```bash
+"${DS4_RUN[@]}" profile-spine --print-plan
+```
+
+Run the Ticket 04 acceptance path:
+
+```bash
+"${DS4_RUN[@]}" profile-spine
+```
+
+The command reruns preflight, starts the P and D workers concurrently with the
+documented GPU/NUMA bindings, and executes through
+`vllm.v1.worker.gpu_worker.Worker.execute_model`. The P worker measures one
+batch-1 128-token chunked-prefill point. The D worker prepares the selected
+exact replay, measures three warmups and ten teacher-forced decode steps, drops
+each sampled token, and injects the next predetermined execution token.
+torch.compile and CUDA graphs remain enabled; startup/capture, warmup, and
+steady-state samples remain distinguishable.
+
+Each run uses a new ID and writes a run-specific directory under
+`/mnt/ds4/results/ticket-04/` unless `--output-dir` is supplied. The directory
+contains `run-config.json`, `raw_samples.parquet`, `aggregates.parquet`,
+`provenance.json`, and `result.md`. Only ready preflight plus two passing worker
+records produces `hardware_validated: true`.
+
+Validate a completed directory through the same image:
 
 ```bash
 "${DS4_RUN[@]}" exec \
-  --output /mnt/ds4/results/profile-invocation.json \
-  -- /opt/ds4-profile/bin/python -m benchmarks.ds4_profile.PROFILE_MODULE
+  --output /mnt/ds4/results/ticket-04-validation.json \
+  -- /opt/ds4-profile/bin/python -m benchmarks.ds4_profile.profile_spine \
+  validate --result-dir /mnt/ds4/results/ticket-04/RUN_ID
 ```
 
-Replace `PROFILE_MODULE` only with the implemented profile entry point from a
-later ticket. Ticket 03 does not invent results for profile stages that do not
-yet exist.
+Set `DS4_PROFILE_SPINE_GPU_SMOKE=1` only on the documented dual-3090 host when
+running the hardware-gated pytest. The test asserts execution and artifact
+invariants, not latency thresholds.
 
 ## Results and restart behavior
 
@@ -192,7 +228,7 @@ Keep these evidence files with the experiment:
 - `preflight.json` and `gpu-smoke-preflight.json`
 - `cpu-dry-run/provenance.json`
 - `gpu-smoke.json`, `gpu-smoke-prefill.json`, and `gpu-smoke-decode.json`
-- later profile invocation and artifact files
+- the Ticket 04 run directory and independent validation record
 
 All expensive state is outside the disposable container. After a disconnect,
 restart the same command in `tmux`: Docker reuses build layers, Hugging Face
