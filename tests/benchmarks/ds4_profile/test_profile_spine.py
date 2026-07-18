@@ -93,49 +93,14 @@ def _write_v2_result(tmp_path: Path) -> Path:
     from benchmarks.ds4_profile import profile_spine
 
     output_dir = tmp_path / "v2-result"
-    output_dir.mkdir()
-    points = []
-    for index in range(34):
-        for cache_condition in ("prefix_hit", "full_recompute"):
-            payload = {
-                "workload_family": "homogeneous",
-                "selector": f"fixture-{index}",
-                "requests": [{
-                    "request_key": "r0",
-                    "trajectory_id": None,
-                    "turn_index": None,
-                    "reasoning_mode": None,
-                    "context_tokens": 512,
-                    "cached_tokens": 0,
-                    "new_tokens": 512,
-                    "token_digest": f"{index:064x}",
-                }],
-                "composition": "none",
-                "seed": 1,
-                "batch_size": 1,
-                "chunk_budget": 4096,
-                "cache_condition": cache_condition,
-                "block_size": 16,
-                "homogeneous_prefix_tokens": 4096,
-                "capacity_target": "native",
-                "planner_digest": "b" * 64,
-                "planned_chunks": [{
-                    "chunk_index": 0,
-                    "scheduled_tokens_by_request": [["r0", 512]],
-                }],
-            }
-            points.append(
-                {
-                    "point_id": profile_spine.make_point_id(payload),
-                    "comparison_id": profile_spine.make_comparison_id(payload),
-                    "canonical_payload": payload,
-                }
-            )
+    output_dir.mkdir(parents=True)
+    points = profile_spine.canonical_v2_points()
     point_ids = [point["point_id"] for point in points]
     config = {
         "schema_version": "2.0.0",
         "run_id": "v2-fixture",
         "run_kind": "full",
+        "canonical_planner_inputs": profile_spine.canonical_v2_planner_inputs(),
         "points": points,
         "canonical_full_manifest": point_ids,
         "expected_manifest": point_ids,
@@ -262,6 +227,7 @@ def _write_v2_result(tmp_path: Path) -> Path:
                 throughput_p90_tokens_per_s=108.1,
                 throughput_mean_tokens_per_s=throughput_mean,
                 throughput_cv=statistics.pstdev(throughput) / throughput_mean,
+                noisy=True,
             )
         )
     comparison_rows = []
@@ -334,6 +300,47 @@ def test_v2_validator_rejects_each_unknown_enum(tmp_path: Path) -> None:
         profile_spine._validate_result_dir(output_dir)
 
 
+@pytest.mark.parametrize(
+    ("field", "path"),
+    [
+        ("role", "raw_samples.parquet"),
+        ("workload_family", "raw_samples.parquet"),
+        ("cache_condition", "raw_samples.parquet"),
+        ("composition", "raw_samples.parquet"),
+        ("phase", "raw_samples.parquet"),
+        ("row_kind", "raw_samples.parquet"),
+        ("runtime_mode", "raw_samples.parquet"),
+        ("status", "raw_samples.parquet"),
+        ("allocation_state", "raw_samples.parquet"),
+    ],
+)
+def test_v2_validator_rejects_every_artifact_enum(
+    tmp_path: Path, field: str, path: str
+) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    output_dir = _write_v2_result(tmp_path)
+    table = pq.read_table(output_dir / path)
+    rows = table.to_pylist()
+    rows[0][field] = "unknown"
+    pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), output_dir / path)
+
+    with pytest.raises(ValueError, match=f"unknown {field}"):
+        profile_spine._validate_result_dir(output_dir)
+
+
+def test_v2_validator_rejects_unknown_run_kind(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    output_dir = _write_v2_result(tmp_path)
+    config = json.loads((output_dir / "run-config.json").read_text())
+    config["run_kind"] = "unknown"
+    (output_dir / "run-config.json").write_text(json.dumps(config))
+
+    with pytest.raises(ValueError, match="unknown run_kind"):
+        profile_spine._validate_result_dir(output_dir)
+
+
 def test_v2_validator_recomputes_aggregate_statistics(tmp_path: Path) -> None:
     from benchmarks.ds4_profile import profile_spine
 
@@ -362,6 +369,249 @@ def test_v2_validator_requires_exact_manifest_and_coordinates(tmp_path: Path) ->
     )
     with pytest.raises(ValueError, match="exact planned chunk coordinates"):
         profile_spine._validate_result_dir(output_dir)
+
+    output_dir = _write_v2_result(tmp_path / "duplicate-chunk")
+    raw = pq.read_table(output_dir / "raw_samples.parquet")
+    rows = raw.to_pylist()
+    rows.append(copy.deepcopy(rows[0]))
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=raw.schema),
+        output_dir / "raw_samples.parquet",
+    )
+    with pytest.raises(ValueError, match="sample_id values must be unique"):
+        profile_spine._validate_result_dir(output_dir)
+
+    output_dir = _write_v2_result(tmp_path / "wrong-vector")
+    raw = pq.read_table(output_dir / "raw_samples.parquet")
+    rows = raw.to_pylist()
+    rows[0]["actual_scheduled_tokens_by_request"][0]["scheduled_tokens"] = 511
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=raw.schema),
+        output_dir / "raw_samples.parquet",
+    )
+    with pytest.raises(ValueError, match="raw chunk does not match the planned vector"):
+        profile_spine._validate_result_dir(output_dir)
+
+    output_dir = _write_v2_result(tmp_path / "extra-point")
+    raw = pq.read_table(output_dir / "raw_samples.parquet")
+    rows = raw.to_pylist()
+    rows[0]["point_id"] = "p2-extra"
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=raw.schema),
+        output_dir / "raw_samples.parquet",
+    )
+    with pytest.raises(ValueError, match="raw sample references an unknown point"):
+        profile_spine._validate_result_dir(output_dir)
+
+
+def _filter_v2_result_to_selectors(output_dir: Path, selectors: set[str]) -> None:
+    config = json.loads((output_dir / "run-config.json").read_text())
+    selected = {
+        point["point_id"]
+        for point in config["points"]
+        if point["canonical_payload"]["selector"] in selectors
+    }
+    comparison_ids = {
+        point["comparison_id"]
+        for point in config["points"]
+        if point["point_id"] in selected
+    }
+    for name in (
+        "raw_samples.parquet",
+        "turn_samples.parquet",
+        "aggregates.parquet",
+        "prefix_evidence.parquet",
+    ):
+        table = pq.read_table(output_dir / name)
+        rows = [row for row in table.to_pylist() if row["point_id"] in selected]
+        pq.write_table(
+            pa.Table.from_pylist(rows, schema=table.schema), output_dir / name
+        )
+    table = pq.read_table(output_dir / "comparisons.parquet")
+    rows = [
+        row for row in table.to_pylist() if row["comparison_id"] in comparison_ids
+    ]
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=table.schema),
+        output_dir / "comparisons.parquet",
+    )
+    config["run_kind"] = "smoke"
+    config["smoke_selectors"] = sorted(selectors)
+    config["expected_manifest"] = sorted(selected)
+    (output_dir / "run-config.json").write_text(json.dumps(config))
+
+
+def test_v2_validator_uses_frozen_manifest_for_full_and_smoke(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    full_dir = _write_v2_result(tmp_path / "full")
+    full_config = json.loads((full_dir / "run-config.json").read_text())
+    full_config["canonical_full_manifest"] = full_config["canonical_full_manifest"][:-1]
+    (full_dir / "run-config.json").write_text(json.dumps(full_config))
+    with pytest.raises(ValueError, match="canonical 68-point manifest"):
+        profile_spine._validate_result_dir(full_dir)
+
+    full_dir = _write_v2_result(tmp_path / "full-subset")
+    full_config = json.loads((full_dir / "run-config.json").read_text())
+    full_config["expected_manifest"] = full_config["expected_manifest"][:-1]
+    (full_dir / "run-config.json").write_text(json.dumps(full_config))
+    with pytest.raises(ValueError, match="full expected_manifest"):
+        profile_spine._validate_result_dir(full_dir)
+
+    smoke_dir = _write_v2_result(tmp_path / "smoke")
+    _filter_v2_result_to_selectors(smoke_dir, {"canonical-00"})
+    profile_spine._validate_result_dir(smoke_dir)
+    raw = pq.read_table(smoke_dir / "raw_samples.parquet")
+    rows = raw.to_pylist()
+    pq.write_table(
+        pa.Table.from_pylist(rows[1:], schema=raw.schema),
+        smoke_dir / "raw_samples.parquet",
+    )
+    with pytest.raises(ValueError, match="exact planned chunk coordinates"):
+        profile_spine._validate_result_dir(smoke_dir)
+
+    smoke_dir = _write_v2_result(tmp_path / "smoke-superset")
+    _filter_v2_result_to_selectors(smoke_dir, {"canonical-00"})
+    config = json.loads((smoke_dir / "run-config.json").read_text())
+    config["expected_manifest"].extend(config["canonical_full_manifest"][2:4])
+    (smoke_dir / "run-config.json").write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="smoke expected_manifest"):
+        profile_spine._validate_result_dir(smoke_dir)
+
+
+def _make_v2_point_terminal_ooc(output_dir: Path) -> str:
+    config = json.loads((output_dir / "run-config.json").read_text())
+    point = config["points"][0]
+    point_id = point["point_id"]
+    comparison_id = point["comparison_id"]
+    raw_path = output_dir / "raw_samples.parquet"
+    raw = pq.read_table(raw_path)
+    rows = []
+    for row in raw.to_pylist():
+        if row["point_id"] != point_id:
+            rows.append(row)
+        elif not rows or rows[-1]["point_id"] != point_id:
+            row["row_kind"] = "terminal"
+            row["status"] = "out_of_capacity"
+            row["allocation_state"] = "out_of_capacity"
+            rows.append(row)
+    pq.write_table(pa.Table.from_pylist(rows, schema=raw.schema), raw_path)
+    for name in (
+        "turn_samples.parquet",
+        "aggregates.parquet",
+        "prefix_evidence.parquet",
+    ):
+        table = pq.read_table(output_dir / name)
+        rows = [row for row in table.to_pylist() if row["point_id"] != point_id]
+        pq.write_table(
+            pa.Table.from_pylist(rows, schema=table.schema), output_dir / name
+        )
+    table = pq.read_table(output_dir / "comparisons.parquet")
+    rows = [
+        row for row in table.to_pylist() if row["comparison_id"] != comparison_id
+    ]
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=table.schema),
+        output_dir / "comparisons.parquet",
+    )
+    return comparison_id
+
+
+def test_v2_validator_hardens_comparison_and_ooc_contracts(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    missing_dir = _write_v2_result(tmp_path / "missing-comparison")
+    comparisons = pq.read_table(missing_dir / "comparisons.parquet")
+    pq.write_table(
+        pa.Table.from_pylist(comparisons.to_pylist()[1:], schema=comparisons.schema),
+        missing_dir / "comparisons.parquet",
+    )
+    with pytest.raises(ValueError, match="missing a comparison"):
+        profile_spine._validate_result_dir(missing_dir)
+
+    duplicate_dir = _write_v2_result(tmp_path / "duplicate-comparison")
+    comparisons = pq.read_table(duplicate_dir / "comparisons.parquet")
+    rows = comparisons.to_pylist()
+    pq.write_table(
+        pa.Table.from_pylist(
+            rows + [copy.deepcopy(rows[0])], schema=comparisons.schema
+        ),
+        duplicate_dir / "comparisons.parquet",
+    )
+    with pytest.raises(ValueError, match="duplicate or unknown comparison"):
+        profile_spine._validate_result_dir(duplicate_dir)
+
+    unknown_dir = _write_v2_result(tmp_path / "unknown-comparison")
+    comparisons = pq.read_table(unknown_dir / "comparisons.parquet")
+    rows = comparisons.to_pylist()
+    rows[0]["comparison_id"] = "pc2-unknown"
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=comparisons.schema),
+        unknown_dir / "comparisons.parquet",
+    )
+    with pytest.raises(ValueError, match="duplicate or unknown comparison"):
+        profile_spine._validate_result_dir(unknown_dir)
+
+    ooc_dir = _write_v2_result(tmp_path / "ooc-comparison")
+    comparison_id = _make_v2_point_terminal_ooc(ooc_dir)
+    profile_spine._validate_result_dir(ooc_dir)
+    comparisons = pq.read_table(ooc_dir / "comparisons.parquet")
+    config = json.loads((ooc_dir / "run-config.json").read_text())
+    pair = [
+        point
+        for point in config["points"]
+        if point["comparison_id"] == comparison_id
+    ]
+    rows = comparisons.to_pylist()
+    rows.append(
+        _v2_row(
+            profile_spine.V2_COMPARISON_SCHEMA,
+            schema_version="2.0.0",
+            run_id="v2-fixture",
+            comparison_id=comparison_id,
+            prefix_hit_point_id=pair[0]["point_id"],
+            full_recompute_point_id=pair[1]["point_id"],
+        )
+    )
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=comparisons.schema),
+        ooc_dir / "comparisons.parquet",
+    )
+    with pytest.raises(ValueError, match="out-of-capacity comparison pair"):
+        profile_spine._validate_result_dir(ooc_dir)
+
+
+def test_v2_validator_rejects_ooc_coordinate_gaps_and_later_rows(
+    tmp_path: Path,
+) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    gap_dir = _write_v2_result(tmp_path / "ooc-gap")
+    _make_v2_point_terminal_ooc(gap_dir)
+    raw_path = gap_dir / "raw_samples.parquet"
+    raw = pq.read_table(raw_path)
+    rows = raw.to_pylist()
+    rows[0]["ordinal"] = 1
+    rows[0]["sample_id"] = f"v2-fixture:{rows[0]['point_id']}:warmup:1:0"
+    pq.write_table(pa.Table.from_pylist(rows, schema=raw.schema), raw_path)
+    with pytest.raises(ValueError, match="coordinate prefix"):
+        profile_spine._validate_result_dir(gap_dir)
+
+    later_dir = _write_v2_result(tmp_path / "ooc-later")
+    _make_v2_point_terminal_ooc(later_dir)
+    raw_path = later_dir / "raw_samples.parquet"
+    raw = pq.read_table(raw_path)
+    rows = raw.to_pylist()
+    later = copy.deepcopy(rows[0])
+    later["ordinal"] = 1
+    later["sample_id"] = f"v2-fixture:{later['point_id']}:warmup:1:0"
+    later["row_kind"] = "chunk"
+    later["status"] = "passed"
+    later["allocation_state"] = "allocated"
+    rows.append(later)
+    pq.write_table(pa.Table.from_pylist(rows, schema=raw.schema), raw_path)
+    with pytest.raises(ValueError, match="coordinate prefix"):
+        profile_spine._validate_result_dir(later_dir)
 
 
 def _fake_gpu_worker(

@@ -31,6 +31,17 @@ V2_ENUMS = {
     "allocation_state": frozenset({"allocated", "out_of_capacity", "failed"}),
 }
 
+# Task 2 consumes this contract to generate the executable planner output.  Task
+# 1 deliberately keeps it small and data-only so validation can independently
+# recompute the frozen manifest without trusting emitted rows or point records.
+CANONICAL_V2_PLANNER_INPUTS = {
+    "schema_version": V2_SCHEMA_VERSION,
+    "workload_selectors": tuple(f"canonical-{index:02d}" for index in range(34)),
+    "seed": 20260715,
+    "block_size": 16,
+    "chunk_budget": 4096,
+}
+
 # Kept as an alias for the Ticket 04 writer and its public helper functions.
 SCHEMA_VERSION = V1_SCHEMA_VERSION
 
@@ -107,6 +118,55 @@ def make_comparison_id(payload: dict[str, Any]) -> str:
     comparison.pop("cache_condition")
     comparison.pop("planned_chunks")
     return _identifier("pc2", comparison)
+
+
+def canonical_v2_planner_inputs() -> dict[str, Any]:
+    """Return the immutable inputs used to derive the v2 68-point manifest."""
+    return copy.deepcopy(CANONICAL_V2_PLANNER_INPUTS)
+
+
+def canonical_v2_points() -> list[dict[str, Any]]:
+    """Return the Task 2 planner contract's deterministic v2 point records."""
+    points = []
+    inputs = canonical_v2_planner_inputs()
+    for selector in inputs["workload_selectors"]:
+        for cache_condition in ("prefix_hit", "full_recompute"):
+            planned_chunks = [{
+                "chunk_index": 0,
+                "scheduled_tokens_by_request": [["r0", 512]],
+            }]
+            payload = {
+                "workload_family": "homogeneous",
+                "selector": selector,
+                "requests": [{
+                    "request_key": "r0",
+                    "trajectory_id": None,
+                    "turn_index": None,
+                    "reasoning_mode": None,
+                    "context_tokens": 4608,
+                    "cached_tokens": 4096,
+                    "new_tokens": 512,
+                    "token_digest": hashlib.sha256(selector.encode()).hexdigest(),
+                }],
+                "composition": "none",
+                "seed": inputs["seed"],
+                "batch_size": 1,
+                "chunk_budget": inputs["chunk_budget"],
+                "cache_condition": cache_condition,
+                "block_size": inputs["block_size"],
+                "homogeneous_prefix_tokens": 4096,
+                "capacity_target": "native",
+                "planner_digest": hashlib.sha256(
+                    canonical_payload_json(inputs).encode()
+                ).hexdigest(),
+                "planned_chunks": planned_chunks,
+            }
+            points.append({
+                "point_id": make_point_id(payload),
+                "comparison_id": make_comparison_id(payload),
+                "canonical_payload": payload,
+            })
+    return points
 
 
 _V2_METADATA = {b"schema_version": V2_SCHEMA_VERSION.encode()}
@@ -735,6 +795,28 @@ def _manifest_points(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return resolved
 
 
+def _canonical_manifest_points(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Validate the frozen point records against immutable planner inputs."""
+    planner_inputs = config.get("canonical_planner_inputs")
+    if not isinstance(planner_inputs, dict) or (
+        canonical_payload_json(planner_inputs)
+        != canonical_payload_json(canonical_v2_planner_inputs())
+    ):
+        raise ValueError("v2 run-config has noncanonical planner inputs")
+    points = _manifest_points(config)
+    canonical = canonical_v2_points()
+    canonical_by_id = {
+        point["point_id"]: {
+            "payload": point["canonical_payload"],
+            "comparison_id": point["comparison_id"],
+        }
+        for point in canonical
+    }
+    if points != canonical_by_id:
+        raise ValueError("v2 points do not match canonical planner inputs")
+    return canonical_by_id
+
+
 def _manifest_id_set(value: Any, name: str) -> set[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError(f"{name} must be a list of point IDs")
@@ -947,7 +1029,12 @@ def _validate_v2_comparisons(
     pairs: dict[str, dict[str, str]] = {}
     for point_id, point in expected_points.items():
         condition = point["payload"].get("cache_condition")
-        pairs.setdefault(point["comparison_id"], {})[condition] = point_id
+        pair = pairs.setdefault(point["comparison_id"], {})
+        if condition in pair:
+            raise ValueError(
+                "manifest comparison pairs must contain one hit and one recompute"
+            )
+        pair[condition] = point_id
     if any(set(pair) != {"prefix_hit", "full_recompute"} for pair in pairs.values()):
         raise ValueError(
             "manifest comparison pairs must contain one hit and one recompute"
@@ -1020,7 +1107,7 @@ def _validate_v2_result_dir(result_dir: Path, config: dict[str, Any]) -> None:
         (evidence_rows, "prefix_evidence.parquet"),
     ):
         _require_v2_enums(rows, name)
-    expected_points = _manifest_points(config)
+    expected_points = _canonical_manifest_points(config)
     canonical_full = _manifest_id_set(
         config.get("canonical_full_manifest"), "canonical_full_manifest"
     )
