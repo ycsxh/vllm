@@ -12,6 +12,134 @@ assert os.environ["PYTHONHASHSEED"] == "0"
 assert os.environ["VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES"] == "0"
 
 
+def _replay_turn(index: int, tokens: list[int], trajectory_id: str = "task:no_think"):
+    from benchmarks.ds4_profile.kv_cache_replay import ReplayTurn
+
+    return ReplayTurn(
+        trajectory_id=trajectory_id,
+        task_id="task",
+        reasoning_mode="no_think",
+        turn_index=index,
+        prompt_token_ids=tuple(tokens),
+        prompt_tokens=len(tokens),
+        exact_lcp_tokens=0,
+        reusable_prefix_tokens=0,
+        global_prefix_tokens=2,
+        task_prefix_tokens=4,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _stable_hash_seed(monkeypatch: pytest.MonkeyPatch) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import _initialize_hashing
+
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
+    monkeypatch.setenv("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES", "0")
+    _initialize_hashing()
+
+
+def test_hash_initialization_is_once_and_equal_prefixes_hash_identically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from benchmarks.ds4_profile import kv_cache_replay
+
+    original = kv_cache_replay.init_none_hash
+    calls = []
+
+    def counting_init(hash_fn) -> None:
+        calls.append(hash_fn)
+        original(hash_fn)
+
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
+    monkeypatch.setattr(kv_cache_replay, "_HASHING_INITIALIZED", False)
+    monkeypatch.setattr(kv_cache_replay, "init_none_hash", counting_init)
+    kv_cache_replay._initialize_hashing()
+    kv_cache_replay._initialize_hashing()
+    first = kv_cache_replay.make_request(_replay_turn(0, [1, 1, 2, 2]), 2, "first")
+    second = kv_cache_replay.make_request(_replay_turn(1, [1, 1, 9, 9]), 2, "second")
+
+    assert calls == [kv_cache_replay.sha256]
+    assert first.block_hashes[0] == second.block_hashes[0]
+
+
+def test_native_events_preserve_byte_sha_hashes() -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import make_manager, make_request
+    from vllm.distributed.kv_events import BlockStored
+
+    manager = make_manager(capacity_blocks=2, block_size=2, max_model_len=32)
+    request = make_request(_replay_turn(0, [1, 1, 2, 2]), 2, "request")
+    hit, hit_tokens, _ = manager.get_computed_blocks(request)
+    assert (
+        manager.allocate_slots(request, request.num_tokens, hit_tokens, hit) is not None
+    )
+
+    hashes = [
+        value
+        for event in manager.take_events()
+        if isinstance(event, BlockStored)
+        for value in event.block_hashes or []
+    ]
+    assert hashes
+    assert all(isinstance(value, bytes) and len(value) == 32 for value in hashes)
+
+
+def test_real_manager_hashes_only_full_blocks_and_reserves_null_block() -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import make_manager, make_request
+
+    request = make_request(_replay_turn(0, [1, 1, 2, 2, 3]), 2, "request")
+    manager = make_manager(capacity_blocks=3, block_size=2, max_model_len=32)
+
+    assert len(request.block_hashes) == 2
+    assert manager.block_pool.num_gpu_blocks == 4
+    assert manager.block_pool.null_block.is_null
+
+
+def test_observer_records_touch_before_allocate_and_reverse_free() -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import (
+        make_manager,
+        make_request,
+        observe_block_pool,
+    )
+    from vllm.distributed.kv_events import BlockRemoved
+
+    manager = make_manager(capacity_blocks=3, block_size=2, max_model_len=32)
+    first = make_request(_replay_turn(0, [1, 1, 2, 2, 3]), 2, "first")
+    hit, hit_tokens, _ = manager.get_computed_blocks(first)
+    assert manager.allocate_slots(first, first.num_tokens, hit_tokens, hit) is not None
+    first_ids = manager.get_block_ids("first")[0]
+    manager.free(first)
+    manager.take_events()
+
+    second = make_request(_replay_turn(1, [1, 1, 9, 9, 8]), 2, "second")
+    hit, hit_tokens, _ = manager.get_computed_blocks(second)
+    with observe_block_pool(manager) as calls:
+        assert (
+            manager.allocate_slots(
+                second, second.num_tokens - hit_tokens, hit_tokens, hit
+            )
+            is not None
+        )
+        second_ids = manager.get_block_ids("second")[0]
+        manager.free(second)
+    native_events = manager.take_events()
+
+    operations = [call.operation for call in calls]
+    assert operations[0] == "touch"
+    assert operations.index("allocate") > max(
+        index for index, operation in enumerate(operations) if operation == "evict"
+    )
+    assert operations[-1] == "free"
+    eviction_calls = [call for call in calls if call.operation == "evict"]
+    removed = [event for event in native_events if isinstance(event, BlockRemoved)]
+    assert all(call.duration_ns >= 0 for call in eviction_calls)
+    assert sum(call.evicted is True for call in eviction_calls) == sum(
+        len(event.block_hashes) for event in removed
+    )
+    free = next(call for call in calls if call.operation == "free")
+    assert free.block_ids == tuple(reversed(second_ids))
+    assert first_ids[-1] not in second_ids or len(set(first_ids)) < len(first_ids)
+
+
 def _turn_row(
     trajectory_id: str,
     turn_index: int,
