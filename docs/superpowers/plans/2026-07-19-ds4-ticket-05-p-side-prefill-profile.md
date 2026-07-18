@@ -18,19 +18,20 @@
 - Enforce at most 4096 scheduled tokens across a batch and at most 8 active sequences.
 - Consume the pinned Ticket 02 selections unchanged: 15 homogeneous, 9 mixed, and 10 exact workloads, each with `prefix_hit` and `full_recompute`, totaling 68 points.
 - Homogeneous requests use distinct deterministic 4096-token block-aligned prefixes; checked-in configuration uses 3 warmups, 10 steady samples, and a 5% noisy-CV threshold.
-- A hit repetition must execute the prefix on GPU0, synchronize, and verify actual Scheduler/KV block IDs, cached-token count, and GPU cache capacity before timing. Equal token IDs alone are never hit evidence.
+- A hit repetition must persist the prime SchedulerOutput block tables sent to GPU0, execute and synchronize every prime chunk, and verify that the measured SchedulerOutput reuses those same physical block IDs in every worker KV tensor group before timing. Equal token IDs alone are never hit evidence.
 - Recompute repetitions begin in a fresh cache epoch and must verify zero cached tokens before timing.
 - Time only `vllm.v1.worker.gpu_worker.Worker.execute_model`; record Scheduler, allocation, cache reset, and prime work separately.
 - Main results require torch.compile and CUDA Graph runtime mode `FULL` or `PIECEWISE`; `NONE` invalidates a measured point.
 - New artifacts use schema `2.0.0`; validation of accepted Ticket 04 schema `1.0.0` remains supported without cross-version coercion.
-- An actual Scheduler allocation refusal is `out_of_capacity` and may be a valid observed point. Unexpected CUDA/runtime, reset, residency, schema, or arithmetic failures invalidate the run.
+- Empty, partial, or preempted Scheduler output is never timed. The whole point is `out_of_capacity` only when the expected batch was isolated, allocator pressure is proven from required versus allocatable blocks, and cleanup returns to a verified empty reset epoch; every other mismatch invalidates the run.
+- The v2 validator requires the exact 68-point manifest ID set and exact planned phase/repetition/chunk coordinates. The only shortened coordinate sequence it accepts is a strict prefix ending in one structurally valid terminal `out_of_capacity` row.
 - Do not add latency thresholds to correctness or hardware-gated tests.
 
 ## File Map
 
 - Create `benchmarks/ds4_profile/prefill_profile.py`: immutable workload plans, chunk planning, Scheduler/KV adapter, GPU0 runner, v2 worker result, and CLI.
 - Create `benchmarks/ds4_profile/config/p-prefill-profile.json`: frozen Ticket 05 runtime, artifact, matrix, compile/capture, and sampling settings.
-- Modify `benchmarks/ds4_profile/profile_spine.py:16-63,292-325,361-464,613-684`: schema-version dispatch, canonical IDs, v2 schemas, independent aggregation/comparison validation, and shared validation CLI.
+- Modify `benchmarks/ds4_profile/profile_spine.py:16-63,292-325,361-464,613-684`: schema-version dispatch, chunk-aware canonical IDs, v2 timing and prefix-evidence schemas, exact-cardinality validation, independent aggregate/comparison validation, and shared validation CLI.
 - Modify `benchmarks/ds4_profile/gpu_profile.py:14-89,173-212`: expose reusable executor initialization, synchronized execution, and CUDA Graph observation without changing Ticket 04 behavior.
 - Modify `benchmarks/ds4_profile/container/runtime.py:734-901,902-990`: add a P-only GPU0/NUMA0 orchestration command.
 - Create `tests/benchmarks/ds4_profile/test_prefill_profile.py`: CPU planner, cache-state-machine, artifact, container-plan, and hardware-gated contracts.
@@ -51,7 +52,7 @@
 - Produces: `make_point_id(payload: dict[str, Any]) -> str`
 - Produces: `make_comparison_id(payload: dict[str, Any]) -> str`
 - Produces: `_validate_result_dir(result_dir: Path) -> None`, dispatching exact schema versions `1.0.0` and `2.0.0`
-- Produces: `V2_RAW_SAMPLE_SCHEMA`, `V2_TURN_SAMPLE_SCHEMA`, `V2_AGGREGATE_SCHEMA`, and `V2_COMPARISON_SCHEMA`
+- Produces: `V2_RAW_SAMPLE_SCHEMA`, `V2_TURN_SAMPLE_SCHEMA`, `V2_AGGREGATE_SCHEMA`, `V2_COMPARISON_SCHEMA`, and `V2_PREFIX_EVIDENCE_SCHEMA`
 
 - [ ] **Step 1: Add failing identifier and version-dispatch tests**
 
@@ -84,6 +85,13 @@ def test_v2_point_id_covers_every_workload_dimension() -> None:
         "block_size": 16,
         "homogeneous_prefix_tokens": 4096,
         "capacity_target": "native",
+        "planner_digest": "b" * 64,
+        "planned_chunks": [
+            {
+                "chunk_index": 0,
+                "scheduled_tokens_by_request": [["r0", 512]],
+            }
+        ],
     }
     original = profile_spine.make_point_id(payload)
     changed = copy.deepcopy(payload)
@@ -92,15 +100,37 @@ def test_v2_point_id_covers_every_workload_dimension() -> None:
     assert profile_spine.make_point_id(changed) != original
     assert profile_spine.make_comparison_id(payload) == (
         profile_spine.make_comparison_id(
-            {**payload, "cache_condition": "full_recompute"}
+            {
+                **payload,
+                "cache_condition": "full_recompute",
+                "planned_chunks": [
+                    {
+                        "chunk_index": 0,
+                        "scheduled_tokens_by_request": [["r0", 4096]],
+                    },
+                    {
+                        "chunk_index": 1,
+                        "scheduled_tokens_by_request": [["r0", 512]],
+                    },
+                ],
+            }
         )
     )
+    changed_chunk = copy.deepcopy(payload)
+    changed_chunk["planned_chunks"][0]["scheduled_tokens_by_request"][0][1] = 511
+    assert profile_spine.make_point_id(changed_chunk) != original
+    changed_planner = {**payload, "planner_digest": "c" * 64}
+    assert profile_spine.make_point_id(changed_planner) != original
 ```
 
 Add `test_v1_result_still_validates`,
 `test_v2_validator_rejects_unknown_schema_version`,
 `test_v2_validator_rejects_each_unknown_enum`, and
-`test_v2_validator_recomputes_aggregate_statistics`. The arithmetic fixture
+`test_v2_validator_recomputes_aggregate_statistics`. Add
+`test_v2_validator_requires_exact_manifest_and_coordinates`, covering a
+missing manifest point, an extra point, a missing warmup, duplicate chunk,
+wrong per-request vector, a gap before a terminal OOC row, and any row after a
+terminal OOC row. The arithmetic fixture
 uses steady full-turn values `[10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
 17.0, 18.0, 19.0]`, then corrupts the stored median and expects
 `ValueError("aggregate statistics do not match turn samples")`.
@@ -156,21 +186,38 @@ def make_point_id(payload: dict[str, Any]) -> str:
 def make_comparison_id(payload: dict[str, Any]) -> str:
     comparison = copy.deepcopy(payload)
     comparison.pop("cache_condition")
+    comparison.pop("planned_chunks")
     return _identifier("pc2", comparison)
 ```
 
-Define the four v2 Arrow schemas with the field names and nullability from the
-approved design. `V2_RAW_SAMPLE_SCHEMA` contains chunk timing and token/block
+`planned_chunks` is condition-specific and therefore participates in
+`point_id` but is intentionally removed with `cache_condition` from the paired
+`comparison_id`; planner digest and all condition-independent workload
+dimensions remain in the comparison payload.
+
+Define the five v2 Arrow schemas with the field names and nullability from the
+approved design. `V2_RAW_SAMPLE_SCHEMA` contains planned/actual request-token
+vectors, preempted/unrelated request IDs, allocator/reset proof, chunk timing, and token/block
 fields; `V2_TURN_SAMPLE_SCHEMA` contains full-turn totals;
 `V2_AGGREGATE_SCHEMA` contains timing and throughput median/p90/mean/CV/noisy;
-`V2_COMPARISON_SCHEMA` contains paired hit/miss IDs and recompute penalty.
+`V2_COMPARISON_SCHEMA` contains paired hit/miss IDs and recompute penalty; and
+`V2_PREFIX_EVIDENCE_SCHEMA` contains point/phase/ordinal/request/group,
+prime SchedulerOutput block IDs, measured SchedulerOutput block IDs, worker KV
+tensor names/shapes/capacity, intended/actual cached tokens, and completed and
+synchronized prime flags.
 Every schema carries `metadata={b"schema_version": b"2.0.0"}`.
 
 Refactor `_validate_result_dir` to read `run-config.json` first and dispatch to
 `_validate_v1_result_dir` or `_validate_v2_result_dir`. The v2 path must check
 all required files, exact schemas and metadata, all enums, run/point/comparison
-references, deterministic IDs from `run-config.json["points"]`, sample IDs,
-and recomputed statistics using
+references, and deterministic IDs from `run-config.json["points"]`. Require
+exactly 68 distinct manifest IDs and require the union of successfully measured
+and terminal-OOC point IDs to equal that set. For a feasible point, require all
+planned chunks for warmup ordinals `0..2` and steady ordinals `0..9`. For OOC,
+accept only a lexicographic coordinate prefix followed by exactly one terminal
+row at the next planned coordinate, with no later raw/turn/aggregate rows.
+Also validate sample IDs, exact stored per-request vectors, planner digest,
+prefix-evidence cardinality for every completed hit repetition, and recomputed statistics using
 `statistics.quantiles(values, n=10, method="inclusive")[8]`.
 
 - [ ] **Step 4: Run focused and full Ticket 04 artifact tests**
@@ -203,6 +250,7 @@ git commit -m "[Benchmarks] Harden DS4 profile artifact contracts" \
 **Interfaces:**
 - Consumes: `make_point_id(payload)` and `make_comparison_id(payload)` from Task 1
 - Produces: `PRequestPlan`, `PChunkPlan`, and `PPointPlan` frozen dataclasses
+- Produces: `make_planner_digest(workload_plan: dict[str, Any], rendered_turns: list[dict[str, Any]], *, block_size: int, token_budget: int, homogeneous_prefix_tokens: int, seed: int) -> str`
 - Produces: `build_prefill_points(workload_plan: dict[str, Any], rendered_turns: list[dict[str, Any]], *, block_size: int, token_budget: int, homogeneous_prefix_tokens: int, seed: int) -> tuple[PPointPlan, ...]`
 - Produces: `plan_chunks(point: PPointPlan, token_budget: int) -> tuple[PChunkPlan, ...]`
 
@@ -227,6 +275,20 @@ def test_planner_expands_the_pinned_matrix_to_68_points() -> None:
         for point in points
         for chunk in point.chunks
     )
+    assert len({point.planner_digest for point in points}) == 1
+    assert all(
+        point.canonical_payload["planned_chunks"]
+        == [
+            {
+                "chunk_index": chunk.chunk_index,
+                "scheduled_tokens_by_request": sorted(
+                    chunk.scheduled_tokens_by_request.items()
+                ),
+            }
+            for chunk in point.chunks
+        ]
+        for point in points
+    )
 
 
 def test_homogeneous_prefixes_are_4096_tokens_and_request_distinct() -> None:
@@ -245,7 +307,8 @@ def test_homogeneous_prefixes_are_4096_tokens_and_request_distinct() -> None:
 Also assert deterministic IDs, mixed request order, exact replay selection,
 `full_recompute` context lengths, active-request removal, and rejection of a
 plan whose workload exceeds eight sequences or whose block-aligned prefix is
-not divisible by 16.
+not divisible by 16. Mutate one planned chunk vector and the planner algorithm
+version independently; each mutation must change `point_id`.
 
 - [ ] **Step 2: Run planner tests and verify failure**
 
@@ -298,6 +361,7 @@ class PPointPlan:
     seed: int
     batch_size: int
     cache_condition: CacheCondition
+    planner_digest: str
     requests: tuple[PRequestPlan, ...]
     chunks: tuple[PChunkPlan, ...]
     canonical_payload: dict[str, Any]
@@ -313,6 +377,38 @@ For each chunk, set `cap = token_budget // active_request_count` and schedule
 `min(remaining, cap)` in request order. Remove completed requests and continue
 until all intended timed tokens are consumed. Hit remaining lengths equal
 `new_tokens`; recompute remaining lengths equal `context_tokens`.
+
+Compute one planner digest before expanding points:
+
+```python
+def make_planner_digest(
+    workload_plan: dict[str, Any],
+    rendered_turns: list[dict[str, Any]],
+    *,
+    block_size: int,
+    token_budget: int,
+    homogeneous_prefix_tokens: int,
+    seed: int,
+) -> str:
+    payload = {
+        "planner_schema": "ds4-p-prefill-plan-v1",
+        "workload_plan": workload_plan,
+        "rendered_turns": rendered_turns,
+        "block_size": block_size,
+        "token_budget": token_budget,
+        "homogeneous_prefix_tokens": homogeneous_prefix_tokens,
+        "seed": seed,
+        "chunk_algorithm": "equal-active-cap-v1",
+        "homogeneous_token_algorithm": "sha256-legal-pool-v1",
+    }
+    return hashlib.sha256(canonical_payload_json(payload).encode()).hexdigest()
+```
+
+Plan chunks before computing identifiers. Store the planner digest and the
+ordered list of every `chunk_index` plus sorted per-request scheduled-token
+vector in the canonical point payload. `make_point_id` therefore changes if
+the inputs, planner algorithm, chunk count, request order, or any planned token
+allocation changes.
 
 - [ ] **Step 4: Run planner tests**
 
@@ -345,7 +441,7 @@ git commit -m "[Benchmarks] Plan the DS4 P-side matrix" \
 - Produces: `summarize_turn_samples(raw_rows: list[dict[str, Any]], points: tuple[PPointPlan, ...]) -> list[dict[str, Any]]`
 - Produces: `aggregate_turn_samples(turn_rows: list[dict[str, Any]], noisy_cv_threshold: float) -> list[dict[str, Any]]`
 - Produces: `compare_conditions(aggregate_rows: list[dict[str, Any]]) -> list[dict[str, Any]]`
-- Produces: `write_v2_result_artifacts(config, raw_rows, provenance, output_dir) -> None`
+- Produces: `write_v2_result_artifacts(config: dict[str, Any], raw_rows: list[dict[str, Any]], prefix_evidence_rows: list[dict[str, Any]], provenance: dict[str, Any], output_dir: Path) -> None`
 
 - [ ] **Step 1: Add failing accounting and expected-OOC tests**
 
@@ -363,9 +459,12 @@ def test_turn_and_comparison_statistics_are_recomputed_from_chunks() -> None:
     assert comparisons[0]["recompute_penalty_ms"] == 6.0
 ```
 
-Add an OOC fixture with one passed chunk and one terminal row. Assert the turn
-status is `out_of_capacity`, requested/available block counts are retained, no
-aggregate is emitted for that point, and v2 validation succeeds.
+Add an OOC fixture whose rows are an exact coordinate prefix followed by one
+terminal row. Assert the whole point status is `out_of_capacity`,
+requested/allocatable block counts are retained, no aggregate is emitted for
+that point, and v2 validation succeeds. Add rejection cases for a partial
+nonterminal batch, a coordinate gap, multiple terminal rows, a terminal row
+without proven pressure/reset evidence, and any timing on a partial batch.
 
 - [ ] **Step 2: Run artifact tests and verify failure**
 
@@ -388,6 +487,15 @@ Use raw chunks as the sole arithmetic source. Group by
 Aggregate only `phase == "steady" and status == "passed"`. Pair conditions by
 `comparison_id`; require exactly one hit and one recompute aggregate.
 
+Build the expected coordinate sequence directly from each manifest point's
+`planned_chunks`: warmup ordinals 0 through 2, then steady ordinals 0 through
+9, each with every planned chunk in order. A passed point must equal the full
+sequence. An OOC point may equal only a strict prefix plus one terminal row at
+the next coordinate; terminal rows have null wall/CUDA timings and include
+`allocator_pressure_proven=True`, `clean_reset_proven=True`, exact planned and
+actual request vectors, required blocks, and allocatable blocks. All 68
+manifest points must resolve to one of those two states.
+
 ```python
 def _distribution(values: list[float], threshold: float) -> dict[str, Any]:
     mean = statistics.fmean(values)
@@ -401,7 +509,7 @@ def _distribution(values: list[float], threshold: float) -> dict[str, Any]:
     }
 ```
 
-Write all v2 files into a sibling temporary directory, call the same v2
+Write `prefix_evidence.parquet` and all other v2 files into a sibling temporary directory, call the same v2
 validator against staging, create the final directory only after validation,
 and move each file into it. Invalid but structurally complete runs use the same
 schemas and explicit status; an interrupted staging directory is never passed.
@@ -438,10 +546,11 @@ git commit -m "[Benchmarks] Add P-side profile artifacts" \
 
 **Interfaces:**
 - Consumes: vLLM `Scheduler.add_request`, `schedule`, `update_from_output`, `finish_requests`, `reset_prefix_cache`; `KVCacheManager.get_block_ids` and `get_computed_blocks`
-- Produces: `PrefixPrimeEvidence` and `AllocationEvidence` frozen dataclasses
+- Produces: `SchedulerBlockTableEvidence`, `WorkerKvTensorGroupEvidence`, `PrefixPrimeEvidence`, `AllocationEvidence`, and `ScheduledChunk` frozen dataclasses
 - Produces: `VllmSchedulerCacheAdapter.reset_epoch() -> None`
-- Produces: `VllmSchedulerCacheAdapter.prime(point, phase, ordinal) -> tuple[PrefixPrimeEvidence, ...]`
-- Produces: `VllmSchedulerCacheAdapter.schedule_chunk(point, chunk) -> tuple[Any, AllocationEvidence]`
+- Produces: `VllmSchedulerCacheAdapter.prime(point: PPointPlan, phase: str, ordinal: int) -> tuple[PrefixPrimeEvidence, ...]`
+- Produces: `VllmSchedulerCacheAdapter.schedule_chunk(point: PPointPlan, chunk: PChunkPlan) -> ScheduledChunk`
+- Produces: `VllmSchedulerCacheAdapter.classify_out_of_capacity(point: PPointPlan, chunk: PChunkPlan, scheduled: ScheduledChunk) -> AllocationEvidence | None`
 - Produces: `VllmSchedulerCacheAdapter.verify_recompute_miss(point, scheduler_output) -> None`
 
 - [ ] **Step 1: Write failing fake-cache state-machine tests**
@@ -466,8 +575,18 @@ def test_hit_requires_executed_gpu_prime_and_matching_resident_blocks() -> None:
     assert fake.timed_execute_calls == 0
 ```
 
-Add reset failure, nonempty running queue, zero-hit recompute, allocator refusal,
-and exact planned-versus-actual per-request scheduled-vector tests.
+Add reset failure, nonempty running queue, zero-hit recompute, and exact
+planned-versus-actual per-request scheduled-vector tests. Add separate cases
+for an empty SchedulerOutput, a partial request set, a partial token vector,
+preempted expected requests, and an unrelated request in Scheduler state or
+output. Every case asserts the GPU execute callback remains uncalled.
+
+For OOC classification, prove all of the following in tests: the Scheduler was
+isolated to the exact expected active request set, the empty/partial/preempted
+output contains no unrelated request, `required_blocks > allocatable_blocks`,
+no GPU timing occurred, cleanup flushed every request, and the subsequent
+cache reset reported zero live requests and only the null block in use. If any
+predicate is false, expect an invalid-result exception rather than OOC.
 
 - [ ] **Step 2: Run cache-adapter tests and verify failure**
 
@@ -488,26 +607,60 @@ so planner/artifact tests stay lightweight:
 
 ```python
 @dataclass(frozen=True)
+class SchedulerBlockTableEvidence:
+    chunk_index: int
+    request_key: str
+    block_ids_by_group: tuple[tuple[int, ...], ...]
+    execution_completed: bool
+    gpu_synchronized: bool
+
+
+@dataclass(frozen=True)
+class WorkerKvTensorGroupEvidence:
+    group_index: int
+    tensor_names: tuple[str, ...]
+    tensor_shapes: tuple[tuple[int, ...], ...]
+    block_capacity: int
+    verified_block_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class PrefixPrimeEvidence:
     request_key: str
     intended_cached_tokens: int
     actual_cached_tokens: int
-    primed_block_ids: tuple[tuple[int, ...], ...]
-    hit_block_ids: tuple[tuple[int, ...], ...]
-    gpu_block_capacity: int
+    prime_scheduler_outputs: tuple[SchedulerBlockTableEvidence, ...]
+    measured_block_ids_by_group: tuple[tuple[int, ...], ...]
+    worker_groups: tuple[WorkerKvTensorGroupEvidence, ...]
+    prime_completed: bool
+    prime_synchronized: bool
     kv_bytes: int
 
 
 @dataclass(frozen=True)
 class AllocationEvidence:
-    state: Literal["allocated", "out_of_capacity"]
+    state: Literal["allocated", "out_of_capacity", "failed"]
     requested_blocks: int
     allocated_blocks: int
-    available_blocks: int
+    allocatable_blocks: int
     requested_bytes: int
     allocated_bytes: int
     lookup_time_ms: float
     allocation_time_ms: float
+    allocator_pressure_proven: bool
+    clean_reset_proven: bool
+
+
+@dataclass(frozen=True)
+class ScheduledChunk:
+    scheduler_output: Any
+    expected_request_ids: tuple[str, ...]
+    actual_request_ids: tuple[str, ...]
+    expected_tokens_by_request: dict[str, int]
+    actual_tokens_by_request: dict[str, int]
+    preempted_request_ids: tuple[str, ...]
+    unrelated_request_ids: tuple[str, ...]
+    allocation: AllocationEvidence
 ```
 
 Construct real requests as
@@ -516,24 +669,43 @@ temperature=0.0), None)`. Before each scheduler call, set
 `scheduler.max_num_scheduled_tokens` and
 `scheduler.scheduler_config.long_prefill_token_threshold` from the planned
 chunk, then assert `SchedulerOutput.num_scheduled_tokens` exactly equals the
-planned vector and its total is at most 4096.
+planned vector, its request-ID set exactly equals the planned active request
+set, and its total is at most 4096. Before calling `schedule`, require
+`scheduler.requests`, running, and waiting state to contain no unrelated
+request. Empty, partial, preempted, or unrelated output returns a
+`ScheduledChunk` for fail-closed classification but may never reach
+`execute_model`.
 
 For reset, finish all known requests with
 `RequestStatus.FINISHED_ABORTED`, execute one zero-token SchedulerOutput to
 flush `finished_req_ids` from the worker, assert no running/waiting requests,
 then require `scheduler.reset_prefix_cache()` to return `True`.
 
-For a prime, schedule and execute every prefix chunk untimed, synchronize GPU0,
-capture `scheduler.kv_cache_manager.get_block_ids(request_id)` before the final
-`update_from_output`, then finish/free the prime. For the measured request,
-inspect `NewRequestData.num_computed_tokens` and block IDs after real lookup,
-compare them with captured prime IDs for every cache group, and require every
-ID to be below each GPU cache group's configured block capacity. Compute bytes
-from `kv_cache_group.kv_cache_spec.page_size_bytes`.
+For every prime chunk, persist the exact block tables in
+`SchedulerOutput.scheduled_new_reqs[*].block_ids` and
+`scheduled_cached_reqs.new_block_ids` that are sent to the worker. Execute the
+prime output untimed, call Scheduler `update_from_output`, and synchronize GPU0
+before marking that chunk complete. Capture final
+`scheduler.kv_cache_manager.get_block_ids(request_id)` before finish/free.
 
-Classify allocation refusal only when the Scheduler cannot allocate the
-planned chunk after all unrelated requests are absent; record free and required
-blocks without changing the point.
+For the measured request, inspect `NewRequestData.num_computed_tokens` and its
+SchedulerOutput block tables after real lookup. The prefix slice must equal the
+same physical IDs persisted from the completed prime for every cache group.
+Map each ID to the corresponding
+`worker.model_runner.kv_cache_config.kv_cache_groups` entry and worker KV tensor
+names/shapes; require the ID to be below that group's tensor block capacity.
+Persist this mapping, plus `prime_completed=True` and
+`prime_synchronized=True`, in `PrefixPrimeEvidence`. Compute bytes from
+`kv_cache_group.kv_cache_spec.page_size_bytes`.
+
+Classify the whole point OOC only when an empty/partial/preempted output occurs
+with the exact isolated expected batch and an allocator snapshot proves
+`required_blocks > allocatable_blocks`. Do not time any fraction of that
+batch. Finish and flush all point requests, require a successful prefix-cache
+reset, and verify the clean epoch before setting
+`allocator_pressure_proven=True` and `clean_reset_proven=True`. A partial
+output without proven pressure, any unrelated request, or failed cleanup/reset
+is `invalid` and stops the run.
 
 - [ ] **Step 4: Run all adapter CPU contracts**
 
@@ -586,11 +758,25 @@ def test_hit_repetition_primes_and_verifies_before_any_timed_chunk() -> None:
     assert result["status"] == "passed"
 ```
 
+Add `test_empty_partial_preempted_or_unrelated_scheduler_output_is_never_timed`
+with four parametrized SchedulerOutput shapes. Add
+`test_allocator_pressure_marks_the_whole_point_ooc_after_clean_reset`, which
+asserts the terminal row is emitted at the failed planned coordinate, all
+later repetitions for that point are skipped, and the next point begins only
+after a verified empty reset epoch. Add the inverse cases: insufficient proof
+or failed reset invalidates the worker.
+
+Add a prefix-evidence test that compares the exact prime SchedulerOutput block
+tables with the measured SchedulerOutput prefix block IDs and each worker KV
+tensor group's names, shapes, capacity, and verified IDs. Flip every proof bit
+or physical ID independently and require failure before `timed:0`.
+
 Add a hardware-gated test decorated with
 `pytest.mark.skipif(os.environ.get("DS4_P_PREFILL_GPU_SMOKE") != "1",
 reason="school-server GPU acceptance only")`.
 When enabled on the server, it runs the smoke config and asserts real prime
-evidence, GPU0 role, low-level boundary, CUDA Graph modes, and valid v2 output.
+evidence from `prefix_evidence.parquet`, GPU0 role, low-level boundary, CUDA
+Graph modes, exact smoke-manifest coordinates, and valid v2 output.
 
 - [ ] **Step 2: Run local orchestration tests and confirm failure/skip**
 
@@ -634,15 +820,21 @@ Initialize one runtime and one real Scheduler using the same constructor
 arguments as `vllm/v1/engine/core.py:150-158`, including
 `StructuredOutputManager(vllm_config)` and resolved scheduler/hash block sizes.
 For each point and repetition, execute the ordered state machine from Step 1.
-Populate raw chunk rows only after the cache invariant has passed. Require every
+Before every GPU call, require exact equality between the planned and actual
+request-ID/token vector and require no unrelated request in Scheduler state or
+output. Populate raw chunk rows only after the cache invariant has passed; no
+partial batch is timed or written as a passed chunk. Require every
 warmup/steady output's `cudagraph_stats.runtime_mode` to be `FULL` or
 `PIECEWISE`.
 
 Return a worker result containing schema/run/role/boundary, point manifest,
-prime evidence summaries, rows, capacity, compile/CUDA flags, and status.
-Convert only real allocator refusal to `out_of_capacity`; convert all other
-exceptions to a structured failed row and stop the worker. Always shut down the
-executor in `finally`.
+full per-repetition prime SchedulerOutput/block-to-worker-tensor evidence,
+rows, capacity, compile/CUDA flags, and status. When proven allocator pressure
+occurs, emit one terminal row, mark the whole point OOC, perform and record a
+clean reset, and continue with the next point only after the reset invariant
+passes. Convert every unproven partial/empty/preempted/unrelated output and all
+other exceptions to a structured failed row and stop the worker. Always shut
+down the executor in `finally`.
 
 - [ ] **Step 5: Run lightweight tests and Ticket 04 regression tests**
 
@@ -697,7 +889,9 @@ def test_p_profile_container_plan_is_gpu0_numa0_only(tmp_path: Path) -> None:
 
 Assert `--smoke` selects one homogeneous pair, one mixed pair, one exact pair,
 one multi-chunk point, and one capacity-pressure point without changing their
-canonical IDs.
+canonical IDs, planned chunk vectors, or planner digest. Assert the full
+printed plan contains exactly the same 68 point IDs that the v2 validator later
+requires.
 
 - [ ] **Step 2: Run container/config tests and verify failure**
 
@@ -740,6 +934,9 @@ The container command creates the run ID, runs existing preflight, launches
 one numactl-bound worker, assembles v2 artifacts, and returns nonzero for
 invalid output. A preflight failure writes a structurally valid skipped/invalid
 result and never calls the worker. `--print-plan` performs no model or GPU work.
+Assembly must require `prefix_evidence.parquet`; it may not reduce the manifest
+to observed rows or accept a worker result whose exact 68-ID set differs from
+the frozen effective config.
 
 - [ ] **Step 4: Run container/config tests and print-plan locally**
 
@@ -800,9 +997,12 @@ Document these school-server commands using the existing `DS4_RUN` array:
   --output-dir /mnt/ds4/results/ticket-05/full
 ```
 
-The runbook requires human inspection of actual prime block IDs/residency,
-cached-token counts, zero-hit recompute evidence, CUDA Graph modes, OOC rows,
-and independent v2 arithmetic validation before the full run. It retains
+The runbook requires human inspection of `prefix_evidence.parquet`: prime
+SchedulerOutput block tables actually sent to GPU0, completed and synchronized
+prime flags, measured SchedulerOutput reuse of the same physical IDs, and each
+ID's worker KV tensor-group mapping. It also checks cached-token counts,
+zero-hit recompute evidence, CUDA Graph modes, OOC pressure/reset proof, the
+exact smoke/full manifest and coordinate sets, and independent v2 arithmetic validation before the full run. It retains
 failed smoke/full artifacts and never relabels them as accepted.
 
 - [ ] **Step 2: Run the complete lightweight local gate**
@@ -858,14 +1058,19 @@ DS4_P_PREFILL_GPU_SMOKE=1 /opt/ds4-profile/bin/python -m pytest \
 ```
 
 Expected smoke result: all selected points either pass or are honestly
-`out_of_capacity`; every hit has executed-prime and resident-block evidence;
-every recompute has zero cached tokens; all measured rows use `FULL` or
-`PIECEWISE`; independent validation returns zero.
+`out_of_capacity`; no empty, partial, preempted, or unrelated SchedulerOutput
+was timed; every hit has persisted prime SchedulerOutput tables, synchronized
+completion, identical measured physical IDs, and worker KV tensor mappings;
+every recompute has zero cached tokens; every OOC point has allocator-pressure
+and clean-reset proof; all measured rows use `FULL` or `PIECEWISE`; independent
+validation returns zero.
 
 Run the full matrix only after smoke acceptance. Expected full result: all 68
-planned point IDs are present, each feasible point has 3 warmups and 10 steady
-turns, OOC points retain terminal evidence, recomputed aggregates/comparisons
-match, and provenance reports a clean exact source SHA and immutable image ID.
+planned point IDs exactly match the frozen manifest and planner digest, each
+feasible point has every planned chunk for 3 warmups and 10 steady turns, OOC
+points contain only a valid coordinate prefix plus one terminal evidence row,
+recomputed aggregates/comparisons match, and provenance reports a clean exact
+source SHA and immutable image ID.
 
 - [ ] **Step 5: Record immutable acceptance evidence in a final docs-only commit**
 
