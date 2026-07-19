@@ -264,21 +264,11 @@ class VllmSchedulerCacheAdapter:
 
     def _allocation_snapshot(
         self,
-        expected_tokens: dict[str, int],
-        actual_tokens: dict[str, int],
-        free_before: int,
-        free_after: int,
+        allocator_refusal: tuple[int, int] | None,
         elapsed_ms: float,
     ) -> AllocationEvidence:
         manager = self.scheduler.kv_cache_manager
-        block_size = int(getattr(manager, "block_size", CANONICAL_BLOCK_SIZE))
-        allocated = max(0, free_before - free_after)
-        unscheduled_lower_bound = sum(
-            (max(0, tokens - actual_tokens.get(request_id, 0)) + block_size - 1)
-            // block_size
-            for request_id, tokens in expected_tokens.items()
-        )
-        requested = allocated + unscheduled_lower_bound
+        requested, allocatable = allocator_refusal or (0, 0)
         page_bytes = self._kv_page_bytes()
         block_bytes = (
             sum(page_bytes)
@@ -288,15 +278,79 @@ class VllmSchedulerCacheAdapter:
         return AllocationEvidence(
             state="allocated",
             requested_blocks=requested,
-            allocated_blocks=allocated,
-            allocatable_blocks=free_before,
+            allocated_blocks=0,
+            allocatable_blocks=allocatable,
             requested_bytes=requested * block_bytes,
-            allocated_bytes=allocated * block_bytes,
+            allocated_bytes=0,
             lookup_time_ms=elapsed_ms,
             allocation_time_ms=elapsed_ms,
-            allocator_pressure_proven=False,
+            allocator_pressure_proven=(
+                allocator_refusal is not None and requested > allocatable
+            ),
             clean_reset_proven=False,
         )
+
+    def _schedule_with_allocator_evidence(
+        self,
+    ) -> tuple[Any, tuple[int, int] | None]:
+        """Capture exact manager values when ``allocate_slots`` refuses."""
+        manager = self.scheduler.kv_cache_manager
+        original_allocate = manager.allocate_slots
+        refusals: list[tuple[int, int]] = []
+
+        def tracked_allocate(*args: Any, **kwargs: Any) -> Any:
+            coordinator = manager.coordinator
+            original_required = coordinator.get_num_blocks_to_allocate
+            required_calls: list[int] = []
+
+            def tracked_required(*call_args: Any, **call_kwargs: Any) -> int:
+                required = int(original_required(*call_args, **call_kwargs))
+                required_calls.append(required)
+                return required
+
+            coordinator.get_num_blocks_to_allocate = tracked_required
+            try:
+                allocated = original_allocate(*args, **kwargs)
+            finally:
+                coordinator.get_num_blocks_to_allocate = original_required
+            if allocated is None:
+                if not required_calls:
+                    raise RuntimeError(
+                        "allocator refusal omitted its required-block calculation"
+                    )
+                request = args[0]
+                has_scheduled = bool(kwargs.get("has_scheduled_reqs", True))
+                try:
+                    from vllm.v1.request import RequestStatus
+
+                    waiting = request.status in (
+                        RequestStatus.WAITING,
+                        RequestStatus.PREEMPTED,
+                    )
+                except ImportError:
+                    waiting = False
+                watermark = (
+                    int(manager.watermark_blocks) if has_scheduled and waiting else 0
+                )
+                full_gate_refusal = bool(
+                    kwargs.get("full_sequence_must_fit", False)
+                    and len(required_calls) == 1
+                )
+                reserved = (
+                    0 if full_gate_refusal else int(kwargs.get("reserved_blocks", 0))
+                )
+                available = max(
+                    0, int(manager.block_pool.get_num_free_blocks()) - reserved
+                )
+                refusals.append((required_calls[-1] + watermark, available))
+            return allocated
+
+        manager.allocate_slots = tracked_allocate
+        try:
+            output = self.scheduler.schedule()
+        finally:
+            manager.allocate_slots = original_allocate
+        return output, refusals[-1] if refusals else None
 
     def reset_epoch(self) -> None:
         """Abort and flush every request, then prove an empty cache epoch."""
@@ -513,12 +567,9 @@ class VllmSchedulerCacheAdapter:
         self.scheduler.scheduler_config.long_prefill_token_threshold = max(
             expected.values()
         )
-        pool = self.scheduler.kv_cache_manager.block_pool
-        free_before = int(pool.get_num_free_blocks())
         started = perf_counter()
-        output = self.scheduler.schedule()
+        output, allocator_refusal = self._schedule_with_allocator_evidence()
         elapsed_ms = (perf_counter() - started) * 1000
-        free_after = int(pool.get_num_free_blocks())
         actual, _ = self._scheduled_vectors(output)
         actual_ids = tuple(actual)
         preempted = tuple(
@@ -527,9 +578,7 @@ class VllmSchedulerCacheAdapter:
         unrelated = tuple(
             sorted(set(actual_ids) - set(expected_ids) | set(unrelated_state))
         )
-        allocation = self._allocation_snapshot(
-            expected, actual, free_before, free_after, elapsed_ms
-        )
+        allocation = self._allocation_snapshot(allocator_refusal, elapsed_ms)
         return ScheduledChunk(
             scheduler_output=output,
             expected_request_ids=expected_ids,
@@ -620,7 +669,7 @@ class VllmSchedulerCacheAdapter:
                 "partial SchedulerOutput was not isolated to the expected batch"
             )
         allocation = scheduled.allocation
-        if allocation.requested_blocks <= allocation.allocatable_blocks:
+        if not allocation.allocator_pressure_proven:
             raise RuntimeError("partial SchedulerOutput lacks allocator-pressure proof")
         self.reset_epoch()
         return AllocationEvidence(

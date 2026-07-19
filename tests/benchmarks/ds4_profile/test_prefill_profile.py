@@ -5,6 +5,7 @@ import copy
 from collections import Counter
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -145,6 +146,38 @@ class _FakeBlockPool:
         return self.free_blocks
 
 
+class _FakeCoordinator:
+    def __init__(self, required_blocks: int = 1) -> None:
+        self.required_blocks = required_blocks
+
+    def get_num_blocks_to_allocate(self, *_args, **_kwargs) -> int:
+        return self.required_blocks
+
+
+class _FakeKvCacheManager:
+    block_size = 16
+    watermark_blocks = 0
+
+    def __init__(self, free_blocks: int) -> None:
+        self.block_pool = _FakeBlockPool(free_blocks)
+        self.coordinator = _FakeCoordinator()
+        self.owner: Any = None
+
+    def allocate_slots(self, request, _num_new_tokens, **_kwargs):
+        required = self.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id
+        )
+        if required > self.block_pool.get_num_free_blocks():
+            return None
+        if self.owner is not None and self.owner.allocate_during_schedule:
+            self.block_pool.free_blocks -= required
+        return ([0],)
+
+    def get_block_ids(self, _request_id):
+        assert self.owner is not None
+        return (list(range((self.owner.prime_progress + 15) // 16)),)
+
+
 class _FakeScheduler:
     def __init__(self, output, *, free_blocks: int = 120) -> None:
         self.output = output
@@ -160,14 +193,12 @@ class _FakeScheduler:
                 ),
             )
         )
-        self.kv_cache_manager = SimpleNamespace(
-            block_size=16,
-            block_pool=_FakeBlockPool(free_blocks),
-            get_block_ids=self.get_block_ids,
-        )
+        self.kv_cache_manager = _FakeKvCacheManager(free_blocks)
+        self.kv_cache_manager.owner = self
         self.reset_succeeds = True
         self.prime_request = None
         self.prime_progress = 0
+        self.allocate_during_schedule = False
 
     def schedule(self):
         if self.prime_request is not None:
@@ -181,6 +212,11 @@ class _FakeScheduler:
                     computed_tokens=self.prime_progress - scheduled,
                     block_ids=blocks,
                 )
+        expected_total = getattr(self, "max_num_scheduled_tokens", 0)
+        if self.output.total_num_scheduled_tokens < expected_total:
+            self.kv_cache_manager.allocate_slots(
+                SimpleNamespace(request_id="r0", status="waiting"), expected_total
+            )
         return self.output
 
     def add_request(self, request) -> None:
@@ -204,9 +240,6 @@ class _FakeScheduler:
         if self.reset_succeeds:
             self.kv_cache_manager.block_pool.free_blocks = 127
         return self.reset_succeeds
-
-    def get_block_ids(self, _request_id):
-        return (list(range((self.prime_progress + 15) // 16)),)
 
 
 class _FakeExecutor:
@@ -548,6 +581,20 @@ def test_allocator_ooc_requires_pressure_and_clean_reset() -> None:
     assert allocation.allocator_pressure_proven
     assert allocation.clean_reset_proven
     assert executor.timed_execute_calls == 0
+
+
+def test_allocator_ooc_records_authoritative_manager_requirement() -> None:
+    point = _adapter_point()
+    adapter, _ = _adapter(_fake_output({}, active_ids=("r0",)), free_blocks=2)
+    adapter.scheduler.kv_cache_manager.coordinator.required_blocks = 3
+
+    scheduled = adapter.schedule_chunk(point, point.chunks[0])
+    allocation = adapter.classify_out_of_capacity(point, point.chunks[0], scheduled)
+
+    assert allocation is not None
+    assert allocation.requested_blocks == 3
+    assert allocation.allocatable_blocks == 2
+    assert allocation.allocated_blocks == 0
 
 
 def test_partial_output_without_allocator_pressure_is_invalid() -> None:
