@@ -1,0 +1,41 @@
+{
+  "artifacts": {
+    "manifest": "/mnt/ds4/raw/manifest.json",
+    "normalized_turns": "/mnt/ds4/ticket-01/turns.parquet",
+    "normalized_provenance": "/mnt/ds4/ticket-01/provenance.json",
+    "rendered_turns": "/mnt/ds4/ticket-02/rendered_turns.parquet",
+    "workload_provenance": "/mnt/ds4/ticket-02/provenance.json"
+  },
+  "environment": {
+    "PYTHONHASHSEED": "0",
+    "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES": "0"
+  },
+  "replay": {
+    "batch_size": 1,
+    "block_size": 16,
+    "hash_function": "sha256",
+    "kv_event_hash_format": "bytes",
+    "max_model_len": 65536,
+    "order": "serial"
+  },
+  "run_id": null,
+  "schema_version": "1.0.0",
+  "selection": {
+    "capacity_blocks": null,
+    "input_set_sha256": null,
+    "planning_sha256": null,
+    "reasoning_mode": null,
+    "status": "unselected",
+    "turn_manifest_sha256": null,
+    "trajectory_id": null
+  },
+  "source": {
+    "commit": "unknown",
+    "dirty": true
+  },
+  "tokenizer": {
+    "repo_id": "deepseek-ai/DeepSeek-V4-Flash",
+    "revision": "60d8d70770c6776ff598c94bb586a859a38244f1",
+    "path": "/mnt/ds4/tokenizers/deepseek-v4-flash/60d8d70770c6776ff598c94bb586a859a38244f1"
+  }
+}

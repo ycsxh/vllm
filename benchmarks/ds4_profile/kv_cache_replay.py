@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import hashlib
+import json
 import os
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import perf_counter_ns
 from typing import Any, Literal
@@ -96,6 +97,14 @@ class ReplayResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class InputRecord:
+    logical_name: str
+    path: str
+    size_bytes: int
+    sha256: str
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as file:
@@ -104,10 +113,75 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def collect_input_records(config: dict[str, Any]) -> list[InputRecord]:
+    artifact_names = (
+        ("manifest", "manifest"),
+        ("ticket_01_data", "normalized_turns"),
+        ("ticket_01_provenance", "normalized_provenance"),
+        ("ticket_02_data", "rendered_turns"),
+        ("ticket_02_provenance", "workload_provenance"),
+    )
+    paths = [
+        (logical_name, Path(config["artifacts"][config_name]))
+        for logical_name, config_name in artifact_names
+    ]
+    tokenizer_dir = Path(config["tokenizer"]["path"])
+    tokenizer_files = sorted(
+        (path for path in tokenizer_dir.rglob("*") if path.is_file()),
+        key=lambda path: path.relative_to(tokenizer_dir).as_posix(),
+    )
+    if not tokenizer_files:
+        raise ValueError("tokenizer directory contains no regular files")
+    paths.extend(
+        (
+            f"tokenizer:{path.relative_to(tokenizer_dir).as_posix()}",
+            path,
+        )
+        for path in tokenizer_files
+    )
+    logical_names = [logical_name for logical_name, _ in paths]
+    if len(logical_names) != len(set(logical_names)):
+        raise ValueError("duplicate input logical name")
+    return [
+        InputRecord(
+            logical_name=logical_name,
+            path=str(path),
+            size_bytes=path.stat().st_size,
+            sha256=_sha256(path),
+        )
+        for logical_name, path in paths
+    ]
+
+
+def verify_input_records(records: Sequence[InputRecord]) -> None:
+    logical_names = [record.logical_name for record in records]
+    if len(logical_names) != len(set(logical_names)):
+        raise ValueError("duplicate input logical name")
+    for record in records:
+        path = Path(record.path)
+        if path.stat().st_size != record.size_bytes or _sha256(path) != record.sha256:
+            raise ValueError(f"input SHA-256 mismatch for {record.logical_name}")
+
+
 def _canonical_hash(value: bytes | int) -> str:
     if isinstance(value, bytes):
         return f"sha256:{value.hex()}"
     raise ValueError("Ticket 07 requires byte-valued SHA-256 KV event hashes")
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _with_canonical_sha256(payload: dict[str, Any]) -> dict[str, Any]:
+    without_digest = {key: value for key, value in payload.items() if key != "sha256"}
+    return without_digest | {"sha256": _canonical_json_sha256(without_digest)}
 
 
 def _initialize_hashing() -> None:
@@ -366,6 +440,34 @@ def _prefix_source(
 def _turn_hashes(turn: ReplayTurn, block_size: int) -> tuple[str, ...]:
     request = make_request(turn, block_size, f"prepass:{turn.turn_index}")
     return tuple(_canonical_hash(value) for value in request.block_hashes)
+
+
+def _selected_turn_manifest(
+    turns: Sequence[ReplayTurn], block_size: int
+) -> list[dict[str, Any]]:
+    ordered = sorted(turns, key=lambda turn: turn.turn_index)
+    if not ordered:
+        return []
+    trajectory_ids = {turn.trajectory_id for turn in ordered}
+    if len(trajectory_ids) != 1:
+        raise ValueError("selected turns contain multiple trajectories")
+    turn_indices = [turn.turn_index for turn in ordered]
+    if turn_indices != list(range(len(ordered))):
+        raise ValueError("selected turn indices contain duplicates or gaps")
+    return [
+        {
+            "trajectory_id": turn.trajectory_id,
+            "turn_index": turn.turn_index,
+            "prompt_tokens": turn.prompt_tokens,
+            "prompt_token_ids_sha256": _canonical_json_sha256(
+                list(turn.prompt_token_ids)
+            ),
+            "block_hashes_sha256": _canonical_json_sha256(
+                list(_turn_hashes(turn, block_size))
+            ),
+        }
+        for turn in ordered
+    ]
 
 
 def _future_accesses(
@@ -926,3 +1028,126 @@ def replay_session(
     return ReplayResult(
         "passed", event_rows, turn_rows, _native_eviction_count(event_rows)
     )
+
+
+def _select_candidate(candidates: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    reasoning_rank = {"no_think": 0, "think_high": 1}
+    eligible = [item for item in candidates if item["status"] == "eligible"]
+    if not eligible:
+        raise ValueError("no full trajectory admits all turns with eviction pressure")
+    return min(
+        eligible,
+        key=lambda item: (
+            item["capacity_blocks"],
+            reasoning_rank[item["reasoning_mode"]],
+            item["trajectory_id"],
+        ),
+    )
+
+
+def build_selection_plan(
+    config: dict[str, Any], turns: Sequence[ReplayTurn]
+) -> dict[str, Any]:
+    _initialize_hashing()
+    block_size = config["replay"]["block_size"]
+    inputs = collect_input_records(config)
+    verify_input_records(inputs)
+    input_rows = sorted(
+        (asdict(record) for record in inputs),
+        key=lambda row: row["logical_name"],
+    )
+    input_set_sha256 = _canonical_json_sha256(input_rows)
+    candidates: list[dict[str, Any]] = []
+    for trajectory_id in sorted({turn.trajectory_id for turn in turns}):
+        session = sorted(
+            (turn for turn in turns if turn.trajectory_id == trajectory_id),
+            key=lambda turn: turn.turn_index,
+        )
+        selected_turns = _selected_turn_manifest(session, block_size)
+        reasoning_modes = {turn.reasoning_mode for turn in session}
+        if len(reasoning_modes) != 1:
+            raise ValueError(f"trajectory {trajectory_id} mixes reasoning modes")
+        capacity = max(
+            (turn.prompt_tokens + block_size - 1) // block_size for turn in session
+        )
+        result = replay_session(
+            run_id=f"planning:{trajectory_id}",
+            turns=session,
+            capacity_blocks=capacity,
+            block_size=block_size,
+            max_model_len=config["replay"]["max_model_len"],
+        )
+        eligible = result.status == "passed" and result.eviction_count > 0
+        reason = result.error
+        if result.status == "passed" and result.eviction_count == 0:
+            reason = "no native eviction pressure"
+        candidates.append(
+            {
+                "trajectory_id": trajectory_id,
+                "reasoning_mode": session[0].reasoning_mode,
+                "turn_count": len(session),
+                "capacity_blocks": capacity,
+                "eviction_count": result.eviction_count,
+                "turns": selected_turns,
+                "turn_manifest_sha256": _canonical_json_sha256(selected_turns),
+                "status": "eligible" if eligible else "rejected",
+                "reason": reason,
+            }
+        )
+    selected = {
+        **_select_candidate(candidates),
+        "input_set_sha256": input_set_sha256,
+    }
+    return _with_canonical_sha256(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "status": "selected",
+            "selected": selected,
+            "candidates": candidates,
+            "inputs": input_rows,
+        }
+    )
+
+
+def verify_pinned_selection(config: dict[str, Any], plan: dict[str, Any]) -> None:
+    selection = config["selection"]
+    if selection.get("status") != "pinned":
+        raise ValueError("replay requires a pinned selection")
+    expected_plan_sha256 = _canonical_json_sha256(
+        {key: value for key, value in plan.items() if key != "sha256"}
+    )
+    if plan.get("sha256") != expected_plan_sha256:
+        raise ValueError("planning SHA-256 mismatch")
+    if plan.get("schema_version") != SCHEMA_VERSION or plan.get("status") != (
+        "selected"
+    ):
+        raise ValueError("invalid selection planning record")
+
+    try:
+        records = [InputRecord(**row) for row in plan["inputs"]]
+        selected = plan["selected"]
+        selected_turns = selected["turns"]
+    except (KeyError, TypeError) as error:
+        raise ValueError("invalid selection planning record") from error
+    verify_input_records(records)
+    if "artifacts" in config and "tokenizer" in config:
+        current_records = collect_input_records(config)
+        if current_records != records:
+            raise ValueError("planning input paths do not match pinned config")
+    input_rows = [asdict(record) for record in records]
+    input_set_sha256 = _canonical_json_sha256(input_rows)
+    turn_manifest_sha256 = _canonical_json_sha256(selected_turns)
+    pinned_fields = (
+        "trajectory_id",
+        "reasoning_mode",
+        "capacity_blocks",
+        "input_set_sha256",
+        "turn_manifest_sha256",
+    )
+    if (
+        selected.get("input_set_sha256") != input_set_sha256
+        or selected.get("turn_manifest_sha256") != turn_manifest_sha256
+        or selection.get("planning_sha256") != plan["sha256"]
+        or any(selection.get(field) != selected.get(field) for field in pinned_fields)
+    ):
+        raise ValueError("pinned selection does not match planning record")

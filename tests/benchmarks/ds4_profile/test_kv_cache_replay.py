@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import hashlib
+import json
 import os
 from pathlib import Path
 
@@ -342,6 +344,248 @@ def test_replay_pairs_duplicate_hash_evictions_by_occurrence() -> None:
     assert result.status == "passed"
     assert len(evictions) == 3
     assert len({row["observer_call_index"] for row in evictions}) == 3
+
+
+def test_selection_uses_capacity_mode_and_trajectory_stable_key() -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import _select_candidate
+
+    selected = _select_candidate(
+        [
+            {
+                "trajectory_id": "z:think_high",
+                "reasoning_mode": "think_high",
+                "capacity_blocks": 12,
+                "status": "eligible",
+            },
+            {
+                "trajectory_id": "b:no_think",
+                "reasoning_mode": "no_think",
+                "capacity_blocks": 12,
+                "status": "eligible",
+            },
+            {
+                "trajectory_id": "a:no_think",
+                "reasoning_mode": "no_think",
+                "capacity_blocks": 13,
+                "status": "eligible",
+            },
+        ]
+    )
+
+    assert selected["trajectory_id"] == "b:no_think"
+
+
+def test_input_records_cover_data_provenance_and_every_tokenizer_file(
+    tmp_path: Path,
+) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import (
+        collect_input_records,
+        verify_input_records,
+    )
+
+    tokenizer = tmp_path / "tokenizer"
+    tokenizer.mkdir()
+    files = {
+        "manifest": tmp_path / "manifest.json",
+        "normalized_turns": tmp_path / "turns.parquet",
+        "normalized_provenance": tmp_path / "ticket-01-provenance.json",
+        "rendered_turns": tmp_path / "rendered.parquet",
+        "workload_provenance": tmp_path / "ticket-02-provenance.json",
+    }
+    for index, path in enumerate(files.values()):
+        path.write_bytes(f"input-{index}".encode())
+    (tokenizer / "tokenizer.json").write_text("tokenizer")
+    (tokenizer / "tokenizer_config.json").write_text("config")
+    config = {
+        "artifacts": {name: str(path) for name, path in files.items()},
+        "tokenizer": {"path": str(tokenizer)},
+    }
+
+    records = collect_input_records(config)
+    verify_input_records(records)
+
+    assert {record.logical_name for record in records} == {
+        "manifest",
+        "ticket_01_data",
+        "ticket_01_provenance",
+        "ticket_02_data",
+        "ticket_02_provenance",
+        "tokenizer:tokenizer.json",
+        "tokenizer:tokenizer_config.json",
+    }
+    (tokenizer / "tokenizer.json").write_text("tampered")
+    with pytest.raises(ValueError, match="input SHA-256 mismatch"):
+        verify_input_records(records)
+
+
+def test_selected_turn_manifest_is_ordered_and_content_addressed() -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import _selected_turn_manifest
+
+    turns = [
+        _replay_turn(1, [1, 1, 2, 2, 3]),
+        _replay_turn(0, [1, 1, 9, 9]),
+    ]
+
+    manifest = _selected_turn_manifest(turns, block_size=2)
+
+    expected_token_hash = hashlib.sha256(
+        json.dumps([1, 1, 9, 9], separators=(",", ":")).encode()
+    ).hexdigest()
+    assert [row["turn_index"] for row in manifest] == [0, 1]
+    assert set(manifest[0]) == {
+        "trajectory_id",
+        "turn_index",
+        "prompt_tokens",
+        "prompt_token_ids_sha256",
+        "block_hashes_sha256",
+    }
+    assert manifest[0]["prompt_token_ids_sha256"] == expected_token_hash
+    assert len(manifest[0]["block_hashes_sha256"]) == 64
+
+
+def test_selection_plan_uses_real_replay_and_is_deterministic(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import build_selection_plan
+
+    tokenizer = tmp_path / "tokenizer"
+    tokenizer.mkdir()
+    (tokenizer / "tokenizer.json").write_text("tokenizer")
+    artifacts = {}
+    for name in (
+        "manifest",
+        "normalized_turns",
+        "normalized_provenance",
+        "rendered_turns",
+        "workload_provenance",
+    ):
+        path = tmp_path / name
+        path.write_text(name)
+        artifacts[name] = str(path)
+    config = {
+        "artifacts": artifacts,
+        "tokenizer": {"path": str(tokenizer)},
+        "replay": {"block_size": 2, "max_model_len": 32},
+    }
+    turns = [
+        _replay_turn(0, [1, 1, 2, 2, 3]),
+        _replay_turn(1, [1, 1, 9, 9, 8, 8]),
+        _replay_turn(2, [1, 1, 2, 2, 7]),
+    ]
+
+    first = build_selection_plan(config, turns)
+    second = build_selection_plan(config, turns)
+
+    assert first == second
+    assert first["selected"]["trajectory_id"] == "task:no_think"
+    assert first["selected"]["capacity_blocks"] == 3
+    assert first["selected"]["eviction_count"] > 0
+    assert (
+        first["selected"]["input_set_sha256"]
+        == hashlib.sha256(
+            json.dumps(first["inputs"], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+    assert (
+        first["sha256"]
+        == hashlib.sha256(
+            json.dumps(
+                {key: value for key, value in first.items() if key != "sha256"},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+    )
+
+
+def test_verify_pinned_selection_rejects_drift() -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import (
+        _canonical_json_sha256,
+        _with_canonical_sha256,
+        verify_pinned_selection,
+    )
+
+    input_set_sha256 = _canonical_json_sha256([])
+    turn_manifest_sha256 = _canonical_json_sha256([])
+    plan = _with_canonical_sha256(
+        {
+            "schema_version": "1.0.0",
+            "status": "selected",
+            "inputs": [],
+            "candidates": [],
+            "selected": {
+                "trajectory_id": "task:no_think",
+                "reasoning_mode": "no_think",
+                "capacity_blocks": 11,
+                "input_set_sha256": input_set_sha256,
+                "turns": [],
+                "turn_manifest_sha256": turn_manifest_sha256,
+            },
+        }
+    )
+    config = {
+        "selection": {
+            "status": "pinned",
+            "trajectory_id": "task:no_think",
+            "reasoning_mode": "no_think",
+            "capacity_blocks": 10,
+            "input_set_sha256": input_set_sha256,
+            "planning_sha256": plan["sha256"],
+            "turn_manifest_sha256": turn_manifest_sha256,
+        }
+    }
+
+    with pytest.raises(ValueError, match="pinned selection does not match"):
+        verify_pinned_selection(config, plan)
+
+
+def test_verify_pinned_selection_rejects_config_input_path_drift(
+    tmp_path: Path,
+) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import (
+        build_selection_plan,
+        verify_pinned_selection,
+    )
+
+    tokenizer = tmp_path / "tokenizer"
+    tokenizer.mkdir()
+    (tokenizer / "tokenizer.json").write_text("tokenizer")
+    artifacts = {}
+    for name in (
+        "manifest",
+        "normalized_turns",
+        "normalized_provenance",
+        "rendered_turns",
+        "workload_provenance",
+    ):
+        path = tmp_path / name
+        path.write_text(name)
+        artifacts[name] = str(path)
+    config = {
+        "artifacts": artifacts,
+        "tokenizer": {"path": str(tokenizer)},
+        "replay": {"block_size": 2, "max_model_len": 32},
+    }
+    turns = [
+        _replay_turn(0, [1, 1, 2, 2, 3]),
+        _replay_turn(1, [1, 1, 9, 9, 8, 8]),
+        _replay_turn(2, [1, 1, 2, 2, 7]),
+    ]
+    plan = build_selection_plan(config, turns)
+    selected = plan["selected"]
+    config["selection"] = {
+        "status": "pinned",
+        "trajectory_id": selected["trajectory_id"],
+        "reasoning_mode": selected["reasoning_mode"],
+        "capacity_blocks": selected["capacity_blocks"],
+        "input_set_sha256": selected["input_set_sha256"],
+        "planning_sha256": plan["sha256"],
+        "turn_manifest_sha256": selected["turn_manifest_sha256"],
+    }
+    replacement = tmp_path / "replacement-manifest"
+    replacement.write_text("manifest")
+    config["artifacts"]["manifest"] = str(replacement)
+
+    with pytest.raises(ValueError, match="planning input paths do not match"):
+        verify_pinned_selection(config, plan)
 
 
 def _turn_row(
