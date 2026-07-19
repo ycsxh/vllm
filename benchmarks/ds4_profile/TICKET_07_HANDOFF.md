@@ -92,8 +92,13 @@ The two focused Ruff hooks passed for the Python checkpoint:
   tests/benchmarks/ds4_profile/test_kv_cache_replay.py
 ```
 
-The complete selected-file pre-commit gate and container tests were not run;
-do not report them as passing.
+The complete selected-file pre-commit command covering the replay module,
+config, focused tests, Ticket 07 docs, design, and plan passed. Executed hooks
+were Ruff check/format, typos, Markdown lint, mypy 3.10, SPDX, import/API and
+configuration checks, plus the repository's other applicable local hooks;
+non-applicable language/workflow hooks reported `Skipped`. Container tests
+were not run because Task 6 was not implemented and planning had already
+failed closed.
 
 ## Fail-closed planning evidence
 
@@ -131,6 +136,21 @@ The planning record was produced by `load_full_turns` followed by
 `build_selection_plan` using the immutable school-server manifest, Ticket
 01/02 artifacts and provenance, and pinned DS4 tokenizer. Triton reported zero
 active drivers and disabled itself. No GPU execution occurred.
+
+## Final branch review
+
+The two-axis review used fixed point
+`65de0de0ab4a5799284e97b823e673d5ac73ef05`.
+
+- Standards: no hard violation. Judgement-call findings were the 1,861-line
+  replay module's divergent responsibilities and the large dictionary-shaped
+  event data clump.
+- Spec: no-selection correctly follows the approved fail-closed rule. Missing
+  work remains the public CLI, real hash timing, independently reconstructed
+  physical occupancy, reliable partial invalid/OOC artifacts, CPU-only
+  container registration, and all pinned container acceptance evidence.
+- Scope: no vLLM core, Ticket 05, GPU profile spine, or GPU/HBM behavior was
+  modified or claimed.
 
 ## Required decision before resuming
 
