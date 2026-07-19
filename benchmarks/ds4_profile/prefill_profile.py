@@ -121,6 +121,16 @@ class ScheduledChunk:
     allocation: AllocationEvidence
 
 
+@dataclass(frozen=True)
+class _AllocatorSnapshot:
+    requested_blocks: int
+    allocated_blocks: int
+    allocatable_blocks: int
+    requested_bytes: int
+    allocated_bytes: int
+    refusal_proven: bool
+
+
 class VllmSchedulerCacheAdapter:
     """Version-specific boundary around Scheduler and live KV cache state."""
 
@@ -264,56 +274,75 @@ class VllmSchedulerCacheAdapter:
 
     def _allocation_snapshot(
         self,
-        allocator_refusal: tuple[int, int] | None,
+        allocator: _AllocatorSnapshot,
         elapsed_ms: float,
     ) -> AllocationEvidence:
-        manager = self.scheduler.kv_cache_manager
-        requested, allocatable = allocator_refusal or (0, 0)
-        page_bytes = self._kv_page_bytes()
-        block_bytes = (
-            sum(page_bytes)
-            if page_bytes
-            else int(getattr(manager, "kv_block_bytes", 0))
-        )
         return AllocationEvidence(
             state="allocated",
-            requested_blocks=requested,
-            allocated_blocks=0,
-            allocatable_blocks=allocatable,
-            requested_bytes=requested * block_bytes,
-            allocated_bytes=0,
+            requested_blocks=allocator.requested_blocks,
+            allocated_blocks=allocator.allocated_blocks,
+            allocatable_blocks=allocator.allocatable_blocks,
+            requested_bytes=allocator.requested_bytes,
+            allocated_bytes=allocator.allocated_bytes,
             lookup_time_ms=elapsed_ms,
             allocation_time_ms=elapsed_ms,
-            allocator_pressure_proven=(
-                allocator_refusal is not None and requested > allocatable
-            ),
+            allocator_pressure_proven=allocator.refusal_proven,
             clean_reset_proven=False,
         )
 
     def _schedule_with_allocator_evidence(
         self,
-    ) -> tuple[Any, tuple[int, int] | None]:
+    ) -> tuple[Any, _AllocatorSnapshot]:
         """Capture exact manager values when ``allocate_slots`` refuses."""
         manager = self.scheduler.kv_cache_manager
         original_allocate = manager.allocate_slots
-        refusals: list[tuple[int, int]] = []
+        page_bytes = self._kv_page_bytes()
+        allocated_blocks = 0
+        allocated_bytes = 0
+        requested_blocks = 0
+        requested_bytes = 0
+        refusal: tuple[int, int, int] | None = None
 
         def tracked_allocate(*args: Any, **kwargs: Any) -> Any:
             coordinator = manager.coordinator
             original_required = coordinator.get_num_blocks_to_allocate
             required_calls: list[int] = []
+            required_group_calls: list[tuple[int, ...]] = []
 
             def tracked_required(*call_args: Any, **call_kwargs: Any) -> int:
-                required = int(original_required(*call_args, **call_kwargs))
+                group_counts: list[int] = []
+                originals = []
+                for single_manager in coordinator.single_type_managers:
+                    original_group = single_manager.get_num_blocks_to_allocate
+                    originals.append((single_manager, original_group))
+
+                    def tracked_group(
+                        *group_args: Any,
+                        _original: Callable[..., Any] = original_group,
+                        **group_kwargs: Any,
+                    ) -> int:
+                        count = int(_original(*group_args, **group_kwargs))
+                        group_counts.append(count)
+                        return count
+
+                    single_manager.get_num_blocks_to_allocate = tracked_group
+                try:
+                    required = int(original_required(*call_args, **call_kwargs))
+                finally:
+                    for single_manager, original_group in originals:
+                        single_manager.get_num_blocks_to_allocate = original_group
                 required_calls.append(required)
+                required_group_calls.append(tuple(group_counts))
                 return required
 
             coordinator.get_num_blocks_to_allocate = tracked_required
             try:
-                allocated = original_allocate(*args, **kwargs)
+                allocation_result = original_allocate(*args, **kwargs)
             finally:
                 coordinator.get_num_blocks_to_allocate = original_required
-            if allocated is None:
+            nonlocal allocated_blocks, allocated_bytes
+            nonlocal requested_blocks, requested_bytes, refusal
+            if allocation_result is None:
                 if not required_calls:
                     raise RuntimeError(
                         "allocator refusal omitted its required-block calculation"
@@ -342,15 +371,59 @@ class VllmSchedulerCacheAdapter:
                 available = max(
                     0, int(manager.block_pool.get_num_free_blocks()) - reserved
                 )
-                refusals.append((required_calls[-1] + watermark, available))
-            return allocated
+                group_required = required_group_calls[-1]
+                group_bytes = sum(
+                    count * page_bytes[index]
+                    for index, count in enumerate(group_required)
+                )
+                refusal = (
+                    required_calls[-1] + watermark,
+                    available,
+                    group_bytes,
+                )
+            else:
+                groups = getattr(allocation_result, "blocks", allocation_result)
+                group_allocated = tuple(len(group) for group in groups)
+                allocated_count = sum(group_allocated)
+                allocation_bytes = sum(
+                    count * page_bytes[index]
+                    for index, count in enumerate(group_allocated)
+                )
+                required = required_calls[-1]
+                required_for_groups = required_group_calls[-1]
+                allocated_blocks += allocated_count
+                allocated_bytes += allocation_bytes
+                requested_blocks += required
+                requested_bytes += sum(
+                    count * page_bytes[index]
+                    for index, count in enumerate(required_for_groups)
+                )
+            return allocation_result
 
         manager.allocate_slots = tracked_allocate
         try:
             output = self.scheduler.schedule()
         finally:
             manager.allocate_slots = original_allocate
-        return output, refusals[-1] if refusals else None
+        free_blocks = int(manager.block_pool.get_num_free_blocks())
+        if refusal is None:
+            return output, _AllocatorSnapshot(
+                requested_blocks=requested_blocks,
+                allocated_blocks=allocated_blocks,
+                allocatable_blocks=allocated_blocks + free_blocks,
+                requested_bytes=requested_bytes,
+                allocated_bytes=allocated_bytes,
+                refusal_proven=False,
+            )
+        refused_blocks, available_blocks, refused_bytes = refusal
+        return output, _AllocatorSnapshot(
+            requested_blocks=allocated_blocks + refused_blocks,
+            allocated_blocks=allocated_blocks,
+            allocatable_blocks=allocated_blocks + available_blocks,
+            requested_bytes=allocated_bytes + refused_bytes,
+            allocated_bytes=allocated_bytes,
+            refusal_proven=refused_blocks > available_blocks,
+        )
 
     def reset_epoch(self) -> None:
         """Abort and flush every request, then prove an empty cache epoch."""
@@ -568,7 +641,7 @@ class VllmSchedulerCacheAdapter:
             expected.values()
         )
         started = perf_counter()
-        output, allocator_refusal = self._schedule_with_allocator_evidence()
+        output, allocator = self._schedule_with_allocator_evidence()
         elapsed_ms = (perf_counter() - started) * 1000
         actual, _ = self._scheduled_vectors(output)
         actual_ids = tuple(actual)
@@ -578,7 +651,7 @@ class VllmSchedulerCacheAdapter:
         unrelated = tuple(
             sorted(set(actual_ids) - set(expected_ids) | set(unrelated_state))
         )
-        allocation = self._allocation_snapshot(allocator_refusal, elapsed_ms)
+        allocation = self._allocation_snapshot(allocator, elapsed_ms)
         return ScheduledChunk(
             scheduler_output=output,
             expected_request_ids=expected_ids,
