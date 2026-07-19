@@ -692,7 +692,7 @@ class _OrchestrationAdapter:
         preempted: tuple[str, ...] = ()
         unrelated: tuple[str, ...] = ()
         if self.outcome in {"empty", "ooc"} or (
-            self.outcome == "late_ooc" and chunk.chunk_index == 1
+            self.outcome in {"late_ooc", "late_invalid"} and chunk.chunk_index == 1
         ):
             actual = {}
         elif self.outcome == "partial_tokens":
@@ -837,6 +837,22 @@ def test_later_allocator_pressure_preserves_only_completed_chunk_timing() -> Non
     ]
     assert result["rows"][0]["runner_wall_time_ms"] == 1.0
     assert result["rows"][1]["runner_wall_time_ms"] is None
+    assert events.count("timed:0") == 1
+
+
+def test_later_invalid_output_preserves_completed_and_failed_coordinates() -> None:
+    events: list[str] = []
+    result = prefill_profile.run_point_repetition(
+        _artifact_point("prefix_hit"),
+        phase="steady",
+        ordinal=0,
+        adapter=_OrchestrationAdapter(events, "late_invalid"),
+        execute_timed=_timed_executor(events),
+    )
+
+    assert result["status"] == "failed"
+    assert [row["status"] for row in result["rows"]] == ["passed", "failed"]
+    assert [row["chunk_index"] for row in result["rows"]] == [0, 1]
     assert events.count("timed:0") == 1
 
 

@@ -957,6 +957,7 @@ def _run_point_repetition_impl(
     adapter: Any,
     execute_timed: Callable[[Any], tuple[Any, float | None, float | None]],
     failure_coordinate: list[PChunkPlan],
+    completed_rows: list[dict[str, Any]],
     run_id: str = "unit-run",
 ) -> dict[str, Any]:
     """Run one reset-isolated point repetition in fail-closed order."""
@@ -967,7 +968,7 @@ def _run_point_repetition_impl(
     adapter.reset_epoch()
     prime_evidence = adapter.prime(point, phase, ordinal)
     adapter.add_measurement_requests(point)
-    rows = []
+    rows = completed_rows
     for chunk in point.chunks:
         failure_coordinate[0] = chunk
         scheduled = adapter.schedule_chunk(point, chunk)
@@ -1045,6 +1046,7 @@ def run_point_repetition(
 ) -> dict[str, Any]:
     """Run one repetition and preserve a structured failure coordinate."""
     failure_coordinate = [point.chunks[0]]
+    completed_rows: list[dict[str, Any]] = []
     try:
         return _run_point_repetition_impl(
             point,
@@ -1054,6 +1056,7 @@ def run_point_repetition(
             execute_timed=execute_timed,
             run_id=run_id,
             failure_coordinate=failure_coordinate,
+            completed_rows=completed_rows,
         )
     except Exception as error:
         chunk = failure_coordinate[0]
@@ -1096,7 +1099,7 @@ def run_point_repetition(
         )
         return {
             "status": "failed",
-            "rows": [row],
+            "rows": [*completed_rows, row],
             "prefix_evidence": (),
             "error": error_text,
         }
