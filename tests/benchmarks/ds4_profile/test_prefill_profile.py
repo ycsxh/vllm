@@ -3,6 +3,9 @@
 
 import copy
 import json
+import os
+import subprocess
+import sys
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -1945,3 +1948,55 @@ def test_comparison_requires_canonical_terminal_coordinates(
             (hit, recompute),
             [terminal],
         )
+
+
+@pytest.mark.skipif(
+    os.environ.get("DS4_P_PREFILL_GPU_SMOKE") != "1",
+    reason="requires the documented dual-RTX-3090 container runtime",
+)
+def test_p_prefill_gpu_smoke_proves_live_gpu0_prefix_residency(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "p-prefill-smoke"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "benchmarks.ds4_profile.container.runtime",
+            "p-profile",
+            "--smoke",
+            "--output-dir",
+            str(output_dir),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    profile_spine._validate_result_dir(output_dir)
+    config = json.loads((output_dir / "run-config.json").read_text())
+    provenance = json.loads((output_dir / "provenance.json").read_text())
+    raw_rows = pq.read_table(output_dir / "raw_samples.parquet").to_pylist()
+    evidence = pq.read_table(output_dir / "prefix_evidence.parquet").to_pylist()
+    assert config["run_kind"] == "smoke"
+    assert len(config["canonical_full_manifest"]) == 68
+    assert len(config["expected_manifest"]) == 10
+    assert {row["point_id"] for row in raw_rows} == set(config["expected_manifest"])
+    assert provenance["validation_state"] == "remote_verified"
+    assert provenance["hardware_validated"] is True
+    assert evidence
+    assert all(row["hardware_validated"] for row in evidence)
+    assert all(row["prime_completed"] for row in evidence)
+    assert all(row["prime_synchronized"] for row in evidence)
+    assert all(row["live_cuda_tensor_proven"] for row in evidence)
+    assert all(set(row["live_kv_tensor_devices"]) == {"cuda:0"} for row in evidence)
+    assert all(
+        row["prime_scheduler_block_ids"]
+        == row["measured_scheduler_block_ids"]
+        == row["verified_physical_block_ids"]
+        for row in evidence
+    )
+    measured = [row for row in raw_rows if row["runner_wall_time_ms"] is not None]
+    assert measured
+    assert all(row["runtime_mode"] in {"FULL", "PIECEWISE"} for row in measured)

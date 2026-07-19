@@ -171,3 +171,35 @@ server then returns to the merged personal-fork `main` for the next ticket.
 If hardware validation changes code, push the updated feature branch and rerun
 against its new exact commit. Evidence from an older commit does not validate a
 newer one.
+
+## Ticket 05 smoke-first acceptance
+
+Use the same immutable Ticket 02 inputs and container contract. Inspect the
+plan first, then run the representative five-pair smoke set before the full 68
+points:
+
+```bash
+"${DS4_RUN[@]}" preflight
+"${DS4_RUN[@]}" p-profile --print-plan
+"${DS4_RUN[@]}" p-profile --smoke \
+  --output-dir /mnt/ds4/results/ticket-05/smoke
+"${DS4_RUN[@]}" exec \
+  --output /mnt/ds4/results/ticket-05-smoke-validation.json \
+  -- /opt/ds4-profile/bin/python -m benchmarks.ds4_profile.prefill_profile \
+  validate --result-dir /mnt/ds4/results/ticket-05/smoke
+"${DS4_RUN[@]}" p-profile \
+  --output-dir /mnt/ds4/results/ticket-05/full
+```
+
+Do not start the full run until the smoke artifact validates independently.
+Retain every failed directory under a distinct path. A retry never changes a
+failed artifact's `remote_failed` state.
+
+For every prefix hit, inspect `prefix_evidence.parquet`: the completed and
+synchronized prime block tables sent to GPU0 must equal the measured physical
+block IDs, and those IDs must be in bounds for the recorded live
+`worker.model_runner.kv_caches` tensors on `cuda:0`. Token IDs, Scheduler block
+IDs, mocks, or configured capacity alone are not HBM evidence. Reject timed
+partial/preempted outputs, recompute rows with nonzero cached tokens, measured
+rows outside `FULL`/`PIECEWISE`, incomplete comparison pairs, and OOC rows
+without allocator-pressure and clean-reset proof.

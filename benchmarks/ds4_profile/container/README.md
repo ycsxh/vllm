@@ -223,6 +223,47 @@ Set `DS4_PROFILE_SPINE_GPU_SMOKE=1` only on the documented dual-3090 host when
 running the hardware-gated pytest. The test asserts execution and artifact
 invariants, not latency thresholds.
 
+## Ticket 05 P-side prefill profile
+
+Use a Ticket 05-specific image tag and result root; do not reuse Ticket 04 or
+Ticket 07 paths. The P-only command binds one worker to GPU0 and NUMA0. It
+freezes all 68 canonical IDs even for smoke, while smoke selects exactly ten
+IDs (five complete hit/recompute pairs).
+
+```bash
+"${DS4_RUN[@]}" preflight
+"${DS4_RUN[@]}" p-profile --print-plan
+"${DS4_RUN[@]}" p-profile --smoke \
+  --output-dir /mnt/ds4/results/ticket-05/smoke
+"${DS4_RUN[@]}" exec \
+  --output /mnt/ds4/results/ticket-05-smoke-validation.json \
+  -- /opt/ds4-profile/bin/python -m benchmarks.ds4_profile.prefill_profile \
+  validate --result-dir /mnt/ds4/results/ticket-05/smoke
+"${DS4_RUN[@]}" p-profile \
+  --output-dir /mnt/ds4/results/ticket-05/full
+```
+
+Budget 3–8 hours for the full matrix; long-context recompute and native KV
+capacity pressure can extend it. Inspect smoke artifacts before starting it:
+
+- `run-config.json` declares `run_kind: smoke`, retains the 68-ID canonical
+  manifest, and selects exactly the configured ten IDs.
+- `prefix_evidence.parquet` proves each prime completed and synchronized, the
+  measured SchedulerOutput reused the exact physical block IDs sent to GPU0,
+  and every ID maps in bounds into recorded live `torch.Tensor` KV caches on
+  `cuda:0` with device, shape, block axis, and block dimension.
+- Prefix-hit cached counts match intent; recompute cached counts are zero.
+- No partial, preempted, unrelated, or empty SchedulerOutput entered GPU
+  timing. Only `GPUWorker.execute_model` is timed.
+- Every measured row reports `FULL` or `PIECEWISE`. Every OOC terminal has
+  authoritative allocator-pressure and clean-reset proof.
+- Every passed pair has exactly one comparison; a validated OOC pair has none.
+- `provenance.json` is `remote_verified` with `hardware_validated: true`.
+
+`remote_pending` is awaiting independent validation. `remote_failed` is
+diagnostic evidence and must never be relabeled accepted. Keep failed and
+partial directories and their checksums.
+
 ## Results and restart behavior
 
 Keep these evidence files with the experiment:

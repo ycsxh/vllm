@@ -168,3 +168,21 @@ Validate an existing result without loading a model:
 .venv/bin/python -m benchmarks.ds4_profile.profile_spine validate \
   --result-dir /path/to/profile-spine-result
 ```
+
+## Run the Ticket 05 P-side profile
+
+Ticket 05 expands the pinned Ticket 02 plan into 34 workloads and paired
+prefix-hit/full-recompute conditions: 68 immutable points. Every Scheduler
+step is capped at 4096 scheduled tokens and eight sequences. Homogeneous
+prefixes are 4096 tokens with block size 16.
+
+Local work is limited to the focused CPU suites, schema validation, and
+`p-profile --print-plan`. The real smoke and full matrix run only on the
+documented dual-RTX-3090 server. The container command uses GPU0/NUMA0 only,
+freezes the full and selected manifests before launching the worker, preserves
+failed/partial artifacts as `remote_failed`, and runs the independent v2
+validator after assembly.
+
+See [the container runbook](container/README.md#ticket-05-p-side-prefill-profile)
+and [the current handoff](TICKET_05_HANDOFF.md). A result is accepted only when
+`provenance.json` says `remote_verified` and `hardware_validated: true`.
