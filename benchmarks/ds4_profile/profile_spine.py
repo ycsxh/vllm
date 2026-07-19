@@ -1292,6 +1292,7 @@ def _validate_v2_evidence(
     expected_points: dict[str, dict[str, Any]],
     outcomes: dict[str, str],
     expected_kv_cache_groups: frozenset[str],
+    raw_rows: list[dict[str, Any]],
 ) -> None:
     observed: set[tuple[str, str, int, str, str]] = set()
     for row in rows:
@@ -1336,24 +1337,42 @@ def _validate_v2_evidence(
                 raise ValueError("prefix evidence has an invalid physical block ID")
 
     expected: set[tuple[str, str, int, str, str]] = set()
+    allowed_ooc: set[tuple[str, str, int, str, str]] = set()
+    terminal_repetition = {
+        row["point_id"]: (row["phase"], row["ordinal"])
+        for row in raw_rows
+        if row["status"] == "out_of_capacity"
+    }
     for point_id, point in expected_points.items():
         payload = point["payload"]
-        if (
-            payload.get("cache_condition") != "prefix_hit"
-            or outcomes.get(point_id) != "passed"
-        ):
+        outcome = outcomes.get(point_id)
+        if payload.get("cache_condition") != "prefix_hit" or outcome not in {
+            "passed",
+            "out_of_capacity",
+        }:
             continue
         request_keys = [
             request["request_key"] for request in payload.get("requests", [])
         ]
         for phase in ("warmup", "steady"):
             for ordinal in range(3 if phase == "warmup" else 10):
-                expected.update(
+                keys = {
                     (point_id, phase, ordinal, request_key, kv_cache_group)
                     for request_key in request_keys
                     for kv_cache_group in expected_kv_cache_groups
-                )
-    if observed != expected:
+                }
+                if outcome == "passed":
+                    expected.update(keys)
+                else:
+                    terminal_phase, terminal_ordinal = terminal_repetition[point_id]
+                    coordinate = (0 if phase == "warmup" else 1, ordinal)
+                    terminal_coordinate = (
+                        0 if terminal_phase == "warmup" else 1,
+                        terminal_ordinal,
+                    )
+                    if coordinate <= terminal_coordinate:
+                        allowed_ooc.update(keys)
+    if not expected <= observed or not observed <= expected | allowed_ooc:
         raise ValueError("prefix evidence does not match completed hit repetitions")
 
 
@@ -1805,7 +1824,7 @@ def _validate_v2_result_dir(result_dir: Path, config: dict[str, Any]) -> None:
             raise ValueError("aggregate does not match its manifest point")
     if any(
         row["point_id"] not in expected_points
-        or outcomes.get(row["point_id"]) != "passed"
+        or outcomes.get(row["point_id"]) not in {"passed", "out_of_capacity"}
         for row in evidence_rows
     ):
         raise ValueError("prefix evidence must describe a completed point")
@@ -1814,6 +1833,7 @@ def _validate_v2_result_dir(result_dir: Path, config: dict[str, Any]) -> None:
         expected_points,
         outcomes,
         expected_kv_cache_groups,
+        raw_rows,
     )
     _validate_v2_statistics(turn_rows, aggregate_rows, expected_points, config)
     _validate_v2_comparisons(comparison_rows, aggregate_rows, outcomes, expected_points)

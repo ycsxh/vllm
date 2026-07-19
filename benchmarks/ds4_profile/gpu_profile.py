@@ -87,28 +87,28 @@ def initialize_gpu_runtime(config: dict[str, Any]) -> GpuRuntime:
     vllm_config = _create_vllm_config(config)
     started = time.perf_counter()
     executor = UniProcExecutor(vllm_config)
-    register_all_kvcache_specs(vllm_config)
-    kv_cache_specs = executor.get_kv_cache_specs()
-    available_memory = executor.determine_available_memory()
-    kv_cache_configs = get_kv_cache_configs(
-        vllm_config, kv_cache_specs, available_memory
-    )
-    scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
-    vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
-    groups = scheduler_kv_cache_config.kv_cache_groups
-    if groups:
-        vllm_config.cache_config.block_size = min(
-            group.kv_cache_spec.block_size for group in groups
-        )
-        capacity, concurrency = get_kv_cache_capacity(
-            vllm_config, scheduler_kv_cache_config
-        )
-        vllm_config.cache_config.kv_cache_size_tokens = capacity
-        vllm_config.cache_config.kv_cache_max_concurrency = concurrency
-    vllm_config.validate_block_size()
-    startup_ms = (time.perf_counter() - started) * 1000
-
     try:
+        register_all_kvcache_specs(vllm_config)
+        kv_cache_specs = executor.get_kv_cache_specs()
+        available_memory = executor.determine_available_memory()
+        kv_cache_configs = get_kv_cache_configs(
+            vllm_config, kv_cache_specs, available_memory
+        )
+        scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+        vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
+        groups = scheduler_kv_cache_config.kv_cache_groups
+        if groups:
+            vllm_config.cache_config.block_size = min(
+                group.kv_cache_spec.block_size for group in groups
+            )
+            capacity, concurrency = get_kv_cache_capacity(
+                vllm_config, scheduler_kv_cache_config
+            )
+            vllm_config.cache_config.kv_cache_size_tokens = capacity
+            vllm_config.cache_config.kv_cache_max_concurrency = concurrency
+        vllm_config.validate_block_size()
+        startup_ms = (time.perf_counter() - started) * 1000
+
         capture_started = time.perf_counter()
         executor.initialize_from_config(kv_cache_configs)
         capture_ms = (time.perf_counter() - capture_started) * 1000

@@ -804,7 +804,9 @@ def _request_chunk_accounting(
     recomputed_tokens = 0
     requests = {request.request_key: request for request in point.requests}
     for request_key, scheduled_tokens in chunk.scheduled_tokens_by_request.items():
-        request = requests[request_key]
+        request = requests.get(request_key)
+        if request is None:
+            continue
         prior_tokens = sum(
             prior.scheduled_tokens_by_request.get(request_key, 0)
             for prior in point.chunks[: chunk.chunk_index]
@@ -958,6 +960,8 @@ def _run_point_repetition_impl(
     execute_timed: Callable[[Any], tuple[Any, float | None, float | None]],
     failure_coordinate: list[PChunkPlan],
     completed_rows: list[dict[str, Any]],
+    completed_evidence: list[PrefixPrimeEvidence],
+    failure_scheduled: list[ScheduledChunk | None],
     run_id: str = "unit-run",
 ) -> dict[str, Any]:
     """Run one reset-isolated point repetition in fail-closed order."""
@@ -967,11 +971,13 @@ def _run_point_repetition_impl(
     )
     adapter.reset_epoch()
     prime_evidence = adapter.prime(point, phase, ordinal)
+    completed_evidence.extend(prime_evidence)
     adapter.add_measurement_requests(point)
     rows = completed_rows
     for chunk in point.chunks:
         failure_coordinate[0] = chunk
         scheduled = adapter.schedule_chunk(point, chunk)
+        failure_scheduled[0] = scheduled
         out_of_capacity = adapter.classify_out_of_capacity(point, chunk, scheduled)
         if out_of_capacity is not None:
             allocation = _allocation_payload(
@@ -1047,6 +1053,8 @@ def run_point_repetition(
     """Run one repetition and preserve a structured failure coordinate."""
     failure_coordinate = [point.chunks[0]]
     completed_rows: list[dict[str, Any]] = []
+    completed_evidence: list[PrefixPrimeEvidence] = []
+    failure_scheduled: list[ScheduledChunk | None] = [None]
     try:
         return _run_point_repetition_impl(
             point,
@@ -1057,6 +1065,8 @@ def run_point_repetition(
             run_id=run_id,
             failure_coordinate=failure_coordinate,
             completed_rows=completed_rows,
+            completed_evidence=completed_evidence,
+            failure_scheduled=failure_scheduled,
         )
     except Exception as error:
         chunk = failure_coordinate[0]
@@ -1066,22 +1076,38 @@ def run_point_repetition(
         ) & ((1 << 63) - 1)
         page_bytes = adapter._kv_page_bytes()
         block_bytes = page_bytes[0] if page_bytes else 0
+        scheduled = failure_scheduled[0]
+        actual_tokens = {} if scheduled is None else scheduled.actual_tokens_by_request
         allocation = {
             "state": "failed",
-            "actual_scheduled_tokens_by_request": {},
-            "preempted_request_ids": (),
-            "unrelated_request_ids": (),
+            "actual_scheduled_tokens_by_request": actual_tokens,
+            "preempted_request_ids": (
+                () if scheduled is None else scheduled.preempted_request_ids
+            ),
+            "unrelated_request_ids": (
+                () if scheduled is None else scheduled.unrelated_request_ids
+            ),
             "cache_epoch": cache_epoch,
             "cache_reset_completed": False,
             "cache_reset_empty": False,
             "allocator_pressure_proven": False,
             "clean_reset_proven": False,
-            "requested_blocks": 0,
-            "allocatable_blocks": 0,
-            "allocated_blocks": 0,
+            "requested_blocks": (
+                0 if scheduled is None else scheduled.allocation.requested_blocks
+            ),
+            "allocatable_blocks": (
+                0 if scheduled is None else scheduled.allocation.allocatable_blocks
+            ),
+            "allocated_blocks": (
+                0 if scheduled is None else scheduled.allocation.allocated_blocks
+            ),
             "kv_block_bytes": block_bytes,
-            "lookup_time_ms": 0.0,
-            "allocation_time_ms": 0.0,
+            "lookup_time_ms": (
+                0.0 if scheduled is None else scheduled.allocation.lookup_time_ms
+            ),
+            "allocation_time_ms": (
+                0.0 if scheduled is None else scheduled.allocation.allocation_time_ms
+            ),
             "runtime_mode": None,
         }
         error_text = f"{type(error).__name__}: {error}"
@@ -1100,7 +1126,7 @@ def run_point_repetition(
         return {
             "status": "failed",
             "rows": [*completed_rows, row],
-            "prefix_evidence": (),
+            "prefix_evidence": tuple(completed_evidence),
             "error": error_text,
         }
 
@@ -1133,7 +1159,7 @@ def _flatten_prefix_evidence(
                 "phase": phase,
                 "ordinal": ordinal,
                 "request_key": evidence.request_key,
-                "kv_cache_group": f"group-{group_index}",
+                "kv_cache_group": str(group_index),
                 "prime_scheduler_block_ids": list(prime_block_ids),
                 "measured_scheduler_block_ids": list(block_ids),
                 "live_kv_tensor_names": list(worker_group.tensor_names),
@@ -1207,7 +1233,6 @@ def run_prefill_matrix(
             ("steady", ordinal) for ordinal in range(profile["measured_repetitions"])
         )
         for point in points:
-            point_evidence_start = len(prefix_evidence)
             for phase, ordinal in (*repetitions, *steady):
                 failure_point = point
                 failure_phase = phase
@@ -1221,12 +1246,6 @@ def run_prefill_matrix(
                     run_id=config["run_id"],
                 )
                 rows.extend(result["rows"])
-                if result["status"] == "failed":
-                    raise RuntimeError(result["error"])
-                if result["status"] == "out_of_capacity":
-                    del prefix_evidence[point_evidence_start:]
-                    status = "out_of_capacity"
-                    break
                 for item in result["prefix_evidence"]:
                     prefix_evidence.extend(
                         _flatten_prefix_evidence(
@@ -1237,6 +1256,11 @@ def run_prefill_matrix(
                             item,
                         )
                     )
+                if result["status"] == "failed":
+                    raise RuntimeError(result["error"])
+                if result["status"] == "out_of_capacity":
+                    status = "out_of_capacity"
+                    break
     except Exception as caught:
         status = "failed"
         error = f"{type(caught).__name__}: {caught}"

@@ -842,17 +842,20 @@ def test_later_allocator_pressure_preserves_only_completed_chunk_timing() -> Non
 
 def test_later_invalid_output_preserves_completed_and_failed_coordinates() -> None:
     events: list[str] = []
+    adapter: Any = _OrchestrationAdapter(events, "late_invalid")
+    adapter.prime = lambda _point, _phase, _ordinal: (_prime_evidence(),)
     result = prefill_profile.run_point_repetition(
         _artifact_point("prefix_hit"),
         phase="steady",
         ordinal=0,
-        adapter=_OrchestrationAdapter(events, "late_invalid"),
+        adapter=adapter,
         execute_timed=_timed_executor(events),
     )
 
     assert result["status"] == "failed"
     assert [row["status"] for row in result["rows"]] == ["passed", "failed"]
     assert [row["chunk_index"] for row in result["rows"]] == [0, 1]
+    assert len(result["prefix_evidence"]) == 1
     assert events.count("timed:0") == 1
 
 
@@ -893,7 +896,7 @@ def test_prefix_evidence_is_flattened_to_the_v2_group_schema() -> None:
             "phase": "steady",
             "ordinal": 0,
             "request_key": "r0",
-            "kv_cache_group": "group-0",
+            "kv_cache_group": "0",
             "prime_scheduler_block_ids": [10],
             "measured_scheduler_block_ids": [10],
             "live_kv_tensor_names": ["layer.0"],
@@ -974,6 +977,36 @@ def test_execute_worker_step_times_only_execute_model(
     ]
     assert wall_ms is not None
     assert cuda_ms == 0.5
+
+
+def test_initialize_gpu_runtime_shuts_down_on_kv_setup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from benchmarks.ds4_profile import gpu_profile
+    from vllm.v1.core import single_type_kv_cache_manager
+    from vllm.v1.executor import uniproc_executor
+
+    events = []
+
+    class Executor:
+        def __init__(self, _config) -> None:
+            events.append("init")
+
+        def shutdown(self) -> None:
+            events.append("shutdown")
+
+    monkeypatch.setattr(gpu_profile, "_create_vllm_config", lambda _config: object())
+    monkeypatch.setattr(uniproc_executor, "UniProcExecutor", Executor)
+    monkeypatch.setattr(
+        single_type_kv_cache_manager,
+        "register_all_kvcache_specs",
+        lambda _config: (_ for _ in ()).throw(RuntimeError("kv setup failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="kv setup failed"):
+        gpu_profile.initialize_gpu_runtime({})
+
+    assert events == ["init", "shutdown"]
 
 
 def test_run_prefill_matrix_uses_public_runtime_and_always_shuts_down(

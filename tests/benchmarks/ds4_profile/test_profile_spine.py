@@ -597,7 +597,9 @@ def test_v2_validator_uses_frozen_manifest_for_full_and_smoke(tmp_path: Path) ->
         profile_spine._validate_result_dir(smoke_dir)
 
 
-def _make_v2_point_terminal_ooc(output_dir: Path) -> str:
+def _make_v2_point_terminal_ooc(
+    output_dir: Path, *, preserve_prefix_evidence: bool = False
+) -> str:
     config = json.loads((output_dir / "run-config.json").read_text())
     point = config["points"][0]
     point_id = point["point_id"]
@@ -631,7 +633,17 @@ def _make_v2_point_terminal_ooc(output_dir: Path) -> str:
         "prefix_evidence.parquet",
     ):
         table = pq.read_table(output_dir / name)
-        rows = [row for row in table.to_pylist() if row["point_id"] != point_id]
+        rows = [
+            row
+            for row in table.to_pylist()
+            if row["point_id"] != point_id
+            or (
+                name == "prefix_evidence.parquet"
+                and preserve_prefix_evidence
+                and row["phase"] == "warmup"
+                and row["ordinal"] == 0
+            )
+        ]
         pq.write_table(
             pa.Table.from_pylist(rows, schema=table.schema), output_dir / name
         )
@@ -642,6 +654,17 @@ def _make_v2_point_terminal_ooc(output_dir: Path) -> str:
         output_dir / "comparisons.parquet",
     )
     return comparison_id
+
+
+def test_v2_validator_preserves_completed_prefix_evidence_for_ooc(
+    tmp_path: Path,
+) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    output_dir = _write_v2_result(tmp_path / "ooc-prefix-evidence")
+    _make_v2_point_terminal_ooc(output_dir, preserve_prefix_evidence=True)
+
+    profile_spine._validate_result_dir(output_dir)
 
 
 def test_v2_validator_hardens_comparison_and_ooc_contracts(tmp_path: Path) -> None:
