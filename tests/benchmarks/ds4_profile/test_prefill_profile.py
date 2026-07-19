@@ -662,6 +662,212 @@ def test_partial_output_without_allocator_pressure_is_invalid() -> None:
     assert executor.execute_calls == 0
 
 
+class _OrchestrationAdapter:
+    def __init__(self, events: list[str], outcome: str = "complete") -> None:
+        self.events = events
+        self.outcome = outcome
+
+    def reset_epoch(self) -> None:
+        self.events.append("reset")
+
+    def prime(self, _point, _phase, _ordinal):
+        self.events.append("prime_gpu0")
+        return ()
+
+    def add_measurement_requests(self, _point) -> None:
+        pass
+
+    def schedule_chunk(self, point, chunk):
+        expected = dict(chunk.scheduled_tokens_by_request)
+        actual = dict(expected)
+        preempted: tuple[str, ...] = ()
+        unrelated: tuple[str, ...] = ()
+        if self.outcome in {"empty", "ooc"}:
+            actual = {}
+        elif self.outcome == "partial_tokens":
+            actual["r0"] -= 1
+        elif self.outcome == "preempted":
+            preempted = ("r0",)
+        elif self.outcome == "unrelated":
+            actual["other"] = 1
+            unrelated = ("other",)
+        allocation = prefill_profile.AllocationEvidence(
+            state="allocated",
+            requested_blocks=1,
+            allocated_blocks=1,
+            allocatable_blocks=8,
+            requested_bytes=64,
+            allocated_bytes=64,
+            lookup_time_ms=0.1,
+            allocation_time_ms=0.1,
+            allocator_pressure_proven=False,
+            clean_reset_proven=False,
+        )
+        return prefill_profile.ScheduledChunk(
+            scheduler_output=SimpleNamespace(),
+            expected_request_ids=tuple(expected),
+            actual_request_ids=tuple(actual),
+            expected_tokens_by_request=expected,
+            actual_tokens_by_request=actual,
+            preempted_request_ids=preempted,
+            unrelated_request_ids=unrelated,
+            allocation=allocation,
+        )
+
+    def classify_out_of_capacity(self, _point, _chunk, scheduled):
+        if self.outcome != "ooc":
+            return None
+        self.events.append("clean_reset")
+        return replace(
+            scheduled.allocation,
+            state="out_of_capacity",
+            requested_blocks=9,
+            allocated_blocks=0,
+            allocatable_blocks=8,
+            requested_bytes=576,
+            allocated_bytes=0,
+            allocator_pressure_proven=True,
+            clean_reset_proven=True,
+        )
+
+    def require_complete_chunk(self, scheduled) -> None:
+        prefill_profile.VllmSchedulerCacheAdapter.require_complete_chunk(scheduled)
+
+    def verify_hit(self, _point, _output) -> None:
+        self.events.append("verify_resident")
+
+    def verify_recompute_miss(self, _point, _output) -> None:
+        self.events.append("verify_miss")
+
+    def update_after_execute(self, _scheduler_output, _model_output) -> None:
+        self.events.append("update")
+
+    def _kv_page_bytes(self):
+        return (64,)
+
+
+def _timed_executor(events: list[str]):
+    def execute(_scheduler_output):
+        events.append("timed:0")
+        output = SimpleNamespace(cudagraph_stats=SimpleNamespace(runtime_mode="FULL"))
+        return output, 1.0, 0.5
+
+    return execute
+
+
+def test_hit_repetition_primes_and_verifies_before_any_timed_chunk() -> None:
+    events: list[str] = []
+    result = prefill_profile.run_point_repetition(
+        _adapter_point(),
+        phase="steady",
+        ordinal=0,
+        adapter=_OrchestrationAdapter(events),
+        execute_timed=_timed_executor(events),
+    )
+
+    assert events[:4] == ["reset", "prime_gpu0", "verify_resident", "timed:0"]
+    assert result["status"] == "passed"
+
+
+@pytest.mark.parametrize(
+    "outcome", ["empty", "partial_tokens", "preempted", "unrelated"]
+)
+def test_incomplete_repetition_output_is_never_timed(outcome: str) -> None:
+    events: list[str] = []
+
+    with pytest.raises(RuntimeError):
+        prefill_profile.run_point_repetition(
+            _adapter_point(),
+            phase="steady",
+            ordinal=0,
+            adapter=_OrchestrationAdapter(events, outcome),
+            execute_timed=_timed_executor(events),
+        )
+
+    assert not any(event.startswith("timed:") for event in events)
+
+
+def test_allocator_pressure_emits_one_untimed_terminal_row() -> None:
+    events: list[str] = []
+    result = prefill_profile.run_point_repetition(
+        _adapter_point(),
+        phase="warmup",
+        ordinal=0,
+        adapter=_OrchestrationAdapter(events, "ooc"),
+        execute_timed=_timed_executor(events),
+    )
+
+    assert result["status"] == "out_of_capacity"
+    assert len(result["rows"]) == 1
+    assert result["rows"][0]["row_kind"] == "terminal"
+    assert result["rows"][0]["runner_wall_time_ms"] is None
+    assert events == ["reset", "prime_gpu0", "clean_reset"]
+
+
+def test_execute_worker_step_times_only_execute_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from benchmarks.ds4_profile import gpu_profile
+
+    events = []
+
+    class FakeEvent:
+        def __init__(self, index: int) -> None:
+            self.index = index
+
+        def record(self) -> None:
+            events.append(f"record:{self.index}")
+
+        def synchronize(self) -> None:
+            events.append(f"event_sync:{self.index}")
+
+        def elapsed_time(self, _other) -> float:
+            return 0.5
+
+    event_count = 0
+
+    def make_event(**_kwargs):
+        nonlocal event_count
+        event = FakeEvent(event_count)
+        event_count += 1
+        return event
+
+    class Executor:
+        def execute_model(self, _output):
+            events.append("execute")
+            return None
+
+        def sample_tokens(self, _hidden):
+            events.append("sample")
+            return SimpleNamespace()
+
+    monkeypatch.setattr(torch, "Event", make_event)
+    monkeypatch.setattr(
+        torch.accelerator,
+        "synchronize",
+        lambda *_args, **_kwargs: events.append("accelerator_sync"),
+    )
+    runtime = gpu_profile.GpuRuntime(
+        Executor(), None, None, None, startup_ms=0.0, capture_ms=0.0
+    )
+
+    _, wall_ms, cuda_ms = gpu_profile.execute_worker_step(
+        runtime, SimpleNamespace(), timed=True
+    )
+
+    assert events == [
+        "accelerator_sync",
+        "record:0",
+        "execute",
+        "record:1",
+        "event_sync:1",
+        "sample",
+        "accelerator_sync",
+    ]
+    assert wall_ms is not None
+    assert cuda_ms == 0.5
+
+
 def test_planner_expands_the_pinned_matrix_to_68_points() -> None:
     points = _build_pinned_points()
 

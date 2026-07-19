@@ -4,11 +4,22 @@
 import math
 import os
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from benchmarks.ds4_profile.profile_spine import make_sample_row
 
 _ASYNC_TOKEN_PLACEHOLDER = -1
+
+
+@dataclass(frozen=True)
+class GpuRuntime:
+    executor: Any
+    worker: Any
+    vllm_config: Any
+    kv_cache_config: Any
+    startup_ms: float
+    capture_ms: float
 
 
 def _create_vllm_config(config: dict[str, Any]):
@@ -61,7 +72,8 @@ def _create_vllm_config(config: dict[str, Any]):
     return vllm_config
 
 
-def _initialize_executor(config: dict[str, Any]):
+def initialize_gpu_runtime(config: dict[str, Any]) -> GpuRuntime:
+    """Initialize the low-level executor and its configured KV cache."""
     from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
     from vllm.v1.core.single_type_kv_cache_manager import (
         register_all_kvcache_specs,
@@ -86,7 +98,21 @@ def _initialize_executor(config: dict[str, Any]):
     except Exception:
         executor.shutdown()
         raise
-    return executor, startup_ms, capture_ms
+    worker = executor.driver_worker.worker
+    return GpuRuntime(
+        executor=executor,
+        worker=worker,
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_configs[0],
+        startup_ms=startup_ms,
+        capture_ms=capture_ms,
+    )
+
+
+def _initialize_executor(config: dict[str, Any]):
+    """Retain the Ticket 04 initialization tuple contract."""
+    runtime = initialize_gpu_runtime(config)
+    return runtime.executor, runtime.startup_ms, runtime.capture_ms
 
 
 def _block_ids(worker: Any, token_count: int) -> tuple[list[int], ...]:
@@ -170,21 +196,45 @@ def _cached_request_output(
     )
 
 
-def _execute_timed(executor: Any, scheduler_output: Any):
+def execute_worker_step(
+    runtime: GpuRuntime, scheduler_output: Any, *, timed: bool
+) -> tuple[Any, float | None, float | None]:
+    """Execute one worker step, timing only ``execute_model`` when requested."""
     import torch
 
     torch.accelerator.synchronize()
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
+    if not timed:
+        output = runtime.executor.execute_model(scheduler_output)
+        if output is None:
+            output = runtime.executor.sample_tokens(None)
+        torch.accelerator.synchronize()
+        return output, None, None
+
+    start_event = torch.Event(enable_timing=True)
+    end_event = torch.Event(enable_timing=True)
     wall_started = time.perf_counter()
     start_event.record()
-    output = executor.execute_model(scheduler_output)
-    if output is None:
-        output = executor.sample_tokens(None)
+    output = runtime.executor.execute_model(scheduler_output)
     end_event.record()
-    torch.accelerator.synchronize()
+    end_event.synchronize()
     wall_ms = (time.perf_counter() - wall_started) * 1000
+    if output is None:
+        output = runtime.executor.sample_tokens(None)
+    torch.accelerator.synchronize()
     return output, wall_ms, start_event.elapsed_time(end_event)
+
+
+def _execute_timed(executor: Any, scheduler_output: Any):
+    worker = executor.driver_worker.worker
+    runtime = GpuRuntime(
+        executor=executor,
+        worker=worker,
+        vllm_config=worker.vllm_config,
+        kv_cache_config=worker.model_runner.kv_cache_config,
+        startup_ms=0.0,
+        capture_ms=0.0,
+    )
+    return execute_worker_step(runtime, scheduler_output, timed=True)
 
 
 def _sampled_token_id(output: Any) -> int:

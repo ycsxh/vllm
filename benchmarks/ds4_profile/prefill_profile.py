@@ -5,7 +5,7 @@
 
 import hashlib
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from time import perf_counter
 from typing import Any, Literal
 
@@ -161,7 +161,7 @@ class VllmSchedulerCacheAdapter:
         executor: Any,
         worker: Any,
         *,
-        block_axes: tuple[int, ...],
+        block_axes: tuple[int, ...] | None = None,
     ) -> "VllmSchedulerCacheAdapter":
         """Create the real adapter while keeping vLLM imports lazy."""
         import torch
@@ -184,6 +184,23 @@ class VllmSchedulerCacheAdapter:
             for layer_name in tensor.shared_by
         )
         layer_order = tuple(sorted(insertion_order, key=extract_layer_index))
+        if block_axes is None:
+            tensors = dict(zip(layer_order, worker.model_runner.kv_caches))
+            resolved_axes = []
+            for group in scheduler.kv_cache_config.kv_cache_groups:
+                mapped = tuple(tensors[name] for name in group.layer_names)
+                candidates = {
+                    axis
+                    for axis in range(mapped[0].ndim)
+                    if all(
+                        int(tensor.shape[axis]) == scheduler.kv_cache_config.num_blocks
+                        for tensor in mapped
+                    )
+                }
+                if len(candidates) != 1:
+                    raise RuntimeError("could not resolve one live physical block axis")
+                resolved_axes.append(candidates.pop())
+            block_axes = tuple(resolved_axes)
         return cls(
             scheduler,
             executor,
@@ -452,6 +469,23 @@ class VllmSchedulerCacheAdapter:
         if used != 1:
             raise RuntimeError("prefix cache reset left live KV blocks")
         self._prime_evidence.clear()
+
+    def add_measurement_requests(self, point: PPointPlan) -> None:
+        """Add the exact measured batch to an otherwise empty Scheduler."""
+        if self.request_factory is None:
+            raise RuntimeError("measurement requires a real request factory")
+        if self._scheduler_request_ids() or self._queue_request_ids():
+            raise RuntimeError("measurement epoch contains unrelated requests")
+        for request in point.requests:
+            self.scheduler.add_request(
+                self.request_factory(
+                    request.request_key, list(request.prompt_token_ids)
+                )
+            )
+
+    def update_after_execute(self, scheduler_output: Any, model_output: Any) -> None:
+        """Apply one completed worker step to Scheduler state."""
+        self.scheduler.update_from_output(scheduler_output, model_output)
 
     def _inspect_worker_groups(
         self,
@@ -870,6 +904,234 @@ def make_prefill_chunk_row(
         "runner_wall_time_ms": runner_wall_time_ms,
         "cuda_model_time_ms": cuda_model_time_ms,
         "runtime_mode": allocation["runtime_mode"],
+        "error": error,
+    }
+
+
+def _allocation_payload(
+    adapter: VllmSchedulerCacheAdapter,
+    scheduled: ScheduledChunk,
+    allocation: AllocationEvidence,
+    *,
+    cache_epoch: str,
+    runtime_mode: str,
+) -> dict[str, Any]:
+    page_bytes = adapter._kv_page_bytes()
+    if len(set(page_bytes)) != 1:
+        raise RuntimeError("raw chunk schema requires one uniform KV block size")
+    return {
+        "state": allocation.state,
+        "actual_scheduled_tokens_by_request": dict(scheduled.actual_tokens_by_request),
+        "preempted_request_ids": scheduled.preempted_request_ids,
+        "unrelated_request_ids": scheduled.unrelated_request_ids,
+        "cache_epoch": cache_epoch,
+        "cache_reset_completed": True,
+        "cache_reset_empty": True,
+        "allocator_pressure_proven": allocation.allocator_pressure_proven,
+        "clean_reset_proven": allocation.clean_reset_proven,
+        "requested_blocks": allocation.requested_blocks,
+        "allocatable_blocks": allocation.allocatable_blocks,
+        "allocated_blocks": allocation.allocated_blocks,
+        "kv_block_bytes": page_bytes[0],
+        "lookup_time_ms": allocation.lookup_time_ms,
+        "allocation_time_ms": allocation.allocation_time_ms,
+        "runtime_mode": runtime_mode,
+    }
+
+
+def _runtime_mode(model_output: Any) -> str:
+    stats = getattr(model_output, "cudagraph_stats", None)
+    mode = str(getattr(stats, "runtime_mode", ""))
+    if mode not in {"FULL", "PIECEWISE"}:
+        raise RuntimeError(f"measured execution used unexpected CUDA Graph mode {mode}")
+    return mode
+
+
+def run_point_repetition(
+    point: PPointPlan,
+    *,
+    phase: Literal["warmup", "steady"],
+    ordinal: int,
+    adapter: Any,
+    execute_timed: Callable[[Any], tuple[Any, float | None, float | None]],
+    run_id: str = "unit-run",
+) -> dict[str, Any]:
+    """Run one reset-isolated point repetition in fail-closed order."""
+    cache_epoch = f"{point.point_id}:{phase}:{ordinal}"
+    adapter.reset_epoch()
+    prime_evidence = adapter.prime(point, phase, ordinal)
+    adapter.add_measurement_requests(point)
+    rows = []
+    for chunk in point.chunks:
+        scheduled = adapter.schedule_chunk(point, chunk)
+        out_of_capacity = adapter.classify_out_of_capacity(point, chunk, scheduled)
+        if out_of_capacity is not None:
+            if chunk.chunk_index != 0 or rows:
+                raise RuntimeError("allocator pressure was discovered after GPU timing")
+            allocation = _allocation_payload(
+                adapter,
+                scheduled,
+                out_of_capacity,
+                cache_epoch=cache_epoch,
+                runtime_mode="not_run",
+            )
+            rows.append(
+                make_prefill_chunk_row(
+                    run_id=run_id,
+                    point=point,
+                    phase=phase,
+                    ordinal=ordinal,
+                    chunk=chunk,
+                    runner_wall_time_ms=None,
+                    cuda_model_time_ms=None,
+                    allocation=allocation,
+                    status="out_of_capacity",
+                    error=None,
+                )
+            )
+            return {
+                "status": "out_of_capacity",
+                "rows": rows,
+                "prefix_evidence": prime_evidence,
+            }
+        adapter.require_complete_chunk(scheduled)
+        if chunk.chunk_index == 0:
+            if point.cache_condition == "prefix_hit":
+                adapter.verify_hit(point, scheduled.scheduler_output)
+            else:
+                adapter.verify_recompute_miss(point, scheduled.scheduler_output)
+        model_output, wall_ms, cuda_ms = execute_timed(scheduled.scheduler_output)
+        if wall_ms is None or cuda_ms is None:
+            raise RuntimeError("timed worker execution omitted GPU timings")
+        mode = _runtime_mode(model_output)
+        adapter.update_after_execute(scheduled.scheduler_output, model_output)
+        allocation = _allocation_payload(
+            adapter,
+            scheduled,
+            scheduled.allocation,
+            cache_epoch=cache_epoch,
+            runtime_mode=mode,
+        )
+        rows.append(
+            make_prefill_chunk_row(
+                run_id=run_id,
+                point=point,
+                phase=phase,
+                ordinal=ordinal,
+                chunk=chunk,
+                runner_wall_time_ms=wall_ms,
+                cuda_model_time_ms=cuda_ms,
+                allocation=allocation,
+                status="passed",
+                error=None,
+            )
+        )
+    return {"status": "passed", "rows": rows, "prefix_evidence": prime_evidence}
+
+
+def run_prefill_matrix(
+    config: dict[str, Any], points: tuple[PPointPlan, ...]
+) -> dict[str, Any]:
+    """Run the selected P-side matrix through Scheduler and GPUWorker."""
+    from benchmarks.ds4_profile.gpu_profile import (
+        execute_worker_step,
+        initialize_gpu_runtime,
+    )
+
+    runtime = None
+    rows: list[dict[str, Any]] = []
+    prefix_evidence: list[dict[str, Any]] = []
+    status = "passed"
+    error = None
+    try:
+        from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+        from vllm.v1.structured_output import StructuredOutputManager
+
+        runtime = initialize_gpu_runtime(config)
+        scheduler_class = runtime.vllm_config.scheduler_config.get_scheduler_cls()
+        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+            runtime.kv_cache_config, runtime.vllm_config
+        )
+        scheduler = scheduler_class(
+            vllm_config=runtime.vllm_config,
+            kv_cache_config=runtime.kv_cache_config,
+            structured_output_manager=StructuredOutputManager(runtime.vllm_config),
+            include_finished_set=False,
+            log_stats=False,
+            block_size=scheduler_block_size,
+            hash_block_size=hash_block_size,
+        )
+        adapter = VllmSchedulerCacheAdapter.from_runtime(
+            scheduler, runtime.executor, runtime.worker
+        )
+
+        def execute_timed(output: Any) -> tuple[Any, float | None, float | None]:
+            return execute_worker_step(runtime, output, timed=True)
+
+        profile = config["profile"]
+        repetitions = tuple(
+            ("warmup", ordinal) for ordinal in range(profile["warmup_repetitions"])
+        )
+        steady = tuple(
+            ("steady", ordinal) for ordinal in range(profile["measured_repetitions"])
+        )
+        for point in points:
+            point_row_start = len(rows)
+            for phase, ordinal in (*repetitions, *steady):
+                result = run_point_repetition(
+                    point,
+                    phase=phase,
+                    ordinal=ordinal,
+                    adapter=adapter,
+                    execute_timed=execute_timed,
+                    run_id=config["run_id"],
+                )
+                rows.extend(result["rows"])
+                prefix_evidence.extend(
+                    {
+                        "point_id": point.point_id,
+                        "phase": phase,
+                        "ordinal": ordinal,
+                        **asdict(item),
+                    }
+                    for item in result["prefix_evidence"]
+                )
+                if result["status"] == "out_of_capacity":
+                    if len(rows) != point_row_start + 1:
+                        raise RuntimeError(
+                            "out-of-capacity point contains earlier timed rows"
+                        )
+                    status = "out_of_capacity"
+                    break
+    except Exception as caught:
+        status = "failed"
+        error = f"{type(caught).__name__}: {caught}"
+    finally:
+        if runtime is not None:
+            runtime.executor.shutdown()
+    hardware_validated = bool(prefix_evidence) and all(
+        item["hardware_validated"] for item in prefix_evidence
+    )
+    return {
+        "schema_version": V2_SCHEMA_VERSION,
+        "run_id": config.get("run_id"),
+        "role": "prefill",
+        "runner_boundary": "GPUWorker.execute_model",
+        "point_manifest": [point.canonical_payload for point in points],
+        "prefix_evidence": prefix_evidence,
+        "samples": rows,
+        "startup_ms": None if runtime is None else runtime.startup_ms,
+        "capture_ms": None if runtime is None else runtime.capture_ms,
+        "compile_enabled": bool(
+            runtime is not None
+            and runtime.vllm_config.compilation_config.mode.name == "VLLM_COMPILE"
+        ),
+        "cudagraph_enabled": bool(
+            runtime is not None
+            and runtime.vllm_config.compilation_config.cudagraph_mode.name != "NONE"
+        ),
+        "hardware_validated": hardware_validated,
+        "status": status,
         "error": error,
     }
 
