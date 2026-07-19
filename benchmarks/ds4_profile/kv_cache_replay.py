@@ -4,6 +4,7 @@
 import hashlib
 import json
 import os
+import tempfile
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -11,6 +12,7 @@ from pathlib import Path
 from time import perf_counter_ns
 from typing import Any, Literal
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 if os.environ.get("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES") != "0":
@@ -35,6 +37,73 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import Request
 
 SCHEMA_VERSION = "1.0.0"
+
+CACHE_EVENT_SCHEMA = pa.schema(
+    [
+        pa.field("schema_version", pa.string(), nullable=False),
+        pa.field("run_id", pa.string(), nullable=False),
+        pa.field("trajectory_id", pa.string(), nullable=False),
+        pa.field("turn_index", pa.int32(), nullable=False),
+        pa.field("event_id", pa.string(), nullable=False),
+        pa.field("event_source", pa.string(), nullable=False),
+        pa.field("operation", pa.string(), nullable=False),
+        pa.field("operation_ordinal", pa.int32(), nullable=False),
+        pa.field("status", pa.string(), nullable=False),
+        pa.field("cache_outcome", pa.string()),
+        pa.field("miss_class", pa.string()),
+        pa.field("duration_ns", pa.int64()),
+        pa.field("eviction_time_ns", pa.int64()),
+        pa.field("evicted", pa.bool_()),
+        pa.field("block_position", pa.int32()),
+        pa.field("block_id", pa.int64()),
+        pa.field("block_hash", pa.string()),
+        pa.field("prefix_source", pa.string()),
+        pa.field("token_count", pa.int32()),
+        pa.field("active_blocks_before", pa.int32(), nullable=False),
+        pa.field("active_blocks_after", pa.int32(), nullable=False),
+        pa.field("cached_blocks_before", pa.int32(), nullable=False),
+        pa.field("cached_blocks_after", pa.int32(), nullable=False),
+        pa.field("free_blocks_before", pa.int32(), nullable=False),
+        pa.field("free_blocks_after", pa.int32(), nullable=False),
+        pa.field("useful_later", pa.bool_()),
+        pa.field("never_reused", pa.bool_()),
+        pa.field("next_reuse_turn", pa.int32()),
+        pa.field("turns_until_reuse", pa.int32()),
+        pa.field("error", pa.string()),
+    ],
+    metadata={b"schema_version": SCHEMA_VERSION.encode()},
+)
+
+TURN_SUMMARY_SCHEMA = pa.schema(
+    [
+        pa.field("schema_version", pa.string(), nullable=False),
+        pa.field("run_id", pa.string(), nullable=False),
+        pa.field("trajectory_id", pa.string(), nullable=False),
+        pa.field("turn_index", pa.int32(), nullable=False),
+        pa.field("status", pa.string(), nullable=False),
+        pa.field("prompt_tokens", pa.int32(), nullable=False),
+        pa.field("full_blocks", pa.int32(), nullable=False),
+        pa.field("cached_tokens", pa.int32(), nullable=False),
+        pa.field("recomputed_tokens", pa.int32(), nullable=False),
+        pa.field("hit_blocks", pa.int32(), nullable=False),
+        pa.field("manager_forced_recompute_blocks", pa.int32(), nullable=False),
+        pa.field("compulsory_miss_blocks", pa.int32(), nullable=False),
+        pa.field("capacity_miss_blocks", pa.int32(), nullable=False),
+        pa.field("prefix_mismatch_blocks", pa.int32(), nullable=False),
+        pa.field("allocated_blocks", pa.int32(), nullable=False),
+        pa.field("evicted_blocks", pa.int32(), nullable=False),
+        pa.field("freed_blocks", pa.int32(), nullable=False),
+        pa.field("cached_resident_blocks_after_free", pa.int32(), nullable=False),
+        pa.field("hash_time_ns", pa.int64(), nullable=False),
+        pa.field("lookup_time_ns", pa.int64(), nullable=False),
+        pa.field("touch_time_ns", pa.int64(), nullable=False),
+        pa.field("allocation_time_ns", pa.int64(), nullable=False),
+        pa.field("eviction_time_ns", pa.int64(), nullable=False),
+        pa.field("free_time_ns", pa.int64(), nullable=False),
+        pa.field("error", pa.string()),
+    ],
+    metadata={b"schema_version": SCHEMA_VERSION.encode()},
+)
 
 ReasoningMode = Literal["no_think", "think_high"]
 PrefixSource = Literal["global", "task", "session"]
@@ -844,20 +913,23 @@ def replay_session(
             for call in pool_calls:
                 if call.operation == "free":
                     continue
-                event_rows.append(
-                    _event_row(
-                        run_id,
-                        turn,
-                        status=status,
-                        operation=call.operation,
-                        event_source="observer",
-                        occupancy_before=call.occupancy_before,
-                        occupancy_after=call.occupancy_after,
-                        duration_ns=call.duration_ns,
-                        observer_call_index=call.index,
-                        observer_evicted=call.evicted,
+                physical_ids = call.block_ids or (None,)
+                for occurrence, block_id in enumerate(physical_ids):
+                    event_rows.append(
+                        _event_row(
+                            run_id,
+                            turn,
+                            status=status,
+                            operation=call.operation,
+                            event_source="observer",
+                            occupancy_before=call.occupancy_before,
+                            occupancy_after=call.occupancy_after,
+                            block_id=block_id,
+                            duration_ns=(call.duration_ns if occurrence == 0 else 0),
+                            observer_call_index=call.index,
+                            observer_evicted=call.evicted,
+                        )
                     )
-                )
 
             for event in native_events:
                 if isinstance(event, BlockStored):
@@ -916,20 +988,22 @@ def replay_session(
             for call in pool_calls:
                 if call.operation != "free":
                     continue
-                event_rows.append(
-                    _event_row(
-                        run_id,
-                        turn,
-                        status=status,
-                        operation=call.operation,
-                        event_source="observer",
-                        occupancy_before=call.occupancy_before,
-                        occupancy_after=call.occupancy_after,
-                        duration_ns=call.duration_ns,
-                        observer_call_index=call.index,
-                        observer_evicted=call.evicted,
+                for occurrence, block_id in enumerate(call.block_ids or (None,)):
+                    event_rows.append(
+                        _event_row(
+                            run_id,
+                            turn,
+                            status=status,
+                            operation=call.operation,
+                            event_source="observer",
+                            occupancy_before=call.occupancy_before,
+                            occupancy_after=call.occupancy_after,
+                            block_id=block_id,
+                            duration_ns=(call.duration_ns if occurrence == 0 else 0),
+                            observer_call_index=call.index,
+                            observer_evicted=call.evicted,
+                        )
                     )
-                )
 
             if allocated is None and (
                 pool_calls
@@ -1094,10 +1168,22 @@ def build_selection_plan(
                 "reason": reason,
             }
         )
-    selected = {
-        **_select_candidate(candidates),
-        "input_set_sha256": input_set_sha256,
-    }
+    try:
+        selected = {
+            **_select_candidate(candidates),
+            "input_set_sha256": input_set_sha256,
+        }
+    except ValueError as error:
+        return _with_canonical_sha256(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "status": "no_selection",
+                "selected": None,
+                "candidates": candidates,
+                "inputs": input_rows,
+                "error": str(error),
+            }
+        )
     return _with_canonical_sha256(
         {
             "schema_version": SCHEMA_VERSION,
@@ -1151,3 +1237,625 @@ def verify_pinned_selection(config: dict[str, Any], plan: dict[str, Any]) -> Non
         or any(selection.get(field) != selected.get(field) for field in pinned_fields)
     ):
         raise ValueError("pinned selection does not match planning record")
+
+
+def _normalized_event_rows(
+    result: ReplayResult, *, capacity_blocks: int, block_size: int
+) -> list[dict[str, Any]]:
+    """Convert the raw manager trace into the chronological artifact ledger."""
+    normalized: list[dict[str, Any]] = []
+    grouped: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for row in result.event_rows:
+        grouped.setdefault((row["trajectory_id"], row["turn_index"]), []).append(row)
+    summaries = {
+        (row["trajectory_id"], row["turn_index"]): row for row in result.turn_rows
+    }
+    state = (0, 0)
+
+    def append(raw: dict[str, Any], *, transition: bool = False) -> None:
+        nonlocal state
+        before = state
+        after = before
+        if transition:
+            after = (
+                raw["active_blocks_after"],
+                raw["cached_resident_blocks_after"],
+            )
+        ordinal = len(
+            [
+                row
+                for row in normalized
+                if (row["trajectory_id"], row["turn_index"])
+                == (raw["trajectory_id"], raw["turn_index"])
+            ]
+        )
+        operation = raw["operation"]
+        normalized.append(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "run_id": raw["run_id"],
+                "trajectory_id": raw["trajectory_id"],
+                "turn_index": raw["turn_index"],
+                "event_id": (
+                    f"{raw['run_id']}:{raw['trajectory_id']}:"
+                    f"{raw['turn_index']}:{operation}:{ordinal}"
+                ),
+                "event_source": (
+                    "lookup" if operation == "lookup" else raw["event_source"]
+                ),
+                "operation": operation,
+                "operation_ordinal": ordinal,
+                "status": raw["status"],
+                "cache_outcome": raw.get("cache_outcome"),
+                "miss_class": raw.get("miss_class"),
+                "duration_ns": raw.get("duration_ns"),
+                "eviction_time_ns": (
+                    raw.get("duration_ns")
+                    if operation == "evict" and raw["event_source"] == "observer"
+                    else None
+                ),
+                "evicted": raw.get("observer_evicted"),
+                "block_position": raw.get("block_position"),
+                "block_id": raw.get("block_id"),
+                "block_hash": raw.get("block_hash"),
+                "prefix_source": raw.get("prefix_source"),
+                "token_count": block_size if operation == "lookup" else None,
+                "active_blocks_before": before[0],
+                "active_blocks_after": after[0],
+                "cached_blocks_before": before[1],
+                "cached_blocks_after": after[1],
+                "free_blocks_before": capacity_blocks - before[0],
+                "free_blocks_after": capacity_blocks - after[0],
+                "useful_later": raw.get("useful_later"),
+                "never_reused": raw.get("never_reused"),
+                "next_reuse_turn": raw.get("reuse_turn_index"),
+                "turns_until_reuse": raw.get("turns_until_reuse"),
+                "error": raw.get("error"),
+            }
+        )
+        state = after
+
+    for key in sorted(grouped):
+        rows = grouped[key]
+        summary = summaries[key]
+        seed = rows[0]
+        append(
+            seed
+            | {
+                "operation": "hash",
+                "event_source": "replay",
+                "duration_ns": summary.get("hash_time_ns", 0),
+                "block_position": None,
+                "block_id": None,
+                "block_hash": None,
+                "cache_outcome": None,
+                "miss_class": None,
+                "prefix_source": None,
+            }
+        )
+        for row in rows:
+            if row["operation"] == "lookup":
+                append(row)
+
+        observers = [row for row in rows if row["event_source"] == "observer"]
+        native_evictions = {
+            row["observer_call_index"]: row
+            for row in rows
+            if row["event_source"] == "native" and row["operation"] == "evict"
+        }
+        native_stores = [
+            row
+            for row in rows
+            if row["event_source"] == "native" and row["operation"] == "store"
+        ]
+        calls: dict[int, list[dict[str, Any]]] = {}
+        for row in observers:
+            calls.setdefault(row["observer_call_index"], []).append(row)
+        deferred_free: list[list[dict[str, Any]]] = []
+        for call_index in sorted(calls):
+            call_rows = calls[call_index]
+            operation = call_rows[0]["operation"]
+            if operation == "free":
+                deferred_free.append(call_rows)
+                continue
+            for occurrence, row in enumerate(call_rows):
+                append(row, transition=occurrence == 0)
+            if operation == "evict" and call_rows[0]["observer_evicted"]:
+                native = native_evictions[call_index]
+                append(native | {"block_id": call_rows[0]["block_id"]})
+            if operation == "allocate":
+                for native in native_stores:
+                    append(native)
+        for call_rows in deferred_free:
+            for occurrence, row in enumerate(call_rows):
+                append(row, transition=occurrence == 0)
+        for row in rows:
+            if row["operation"] == "admission_failure":
+                append(row, transition=True)
+    return normalized
+
+
+def _normalized_turn_rows(
+    result: ReplayResult, events: Sequence[dict[str, Any]], block_size: int
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for source in result.turn_rows:
+        turn_events = [
+            row
+            for row in events
+            if row["trajectory_id"] == source["trajectory_id"]
+            and row["turn_index"] == source["turn_index"]
+        ]
+        lookup = [row for row in turn_events if row["operation"] == "lookup"]
+        observer = [row for row in turn_events if row["event_source"] == "observer"]
+        misses = [row["miss_class"] for row in lookup if row["miss_class"]]
+        rows.append(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "run_id": source["run_id"],
+                "trajectory_id": source["trajectory_id"],
+                "turn_index": source["turn_index"],
+                "status": source["status"],
+                "prompt_tokens": source["prompt_tokens"],
+                "full_blocks": len(lookup),
+                "cached_tokens": source["cached_tokens"],
+                "recomputed_tokens": source["recomputed_tokens"],
+                "hit_blocks": sum(row["cache_outcome"] == "hit" for row in lookup),
+                "manager_forced_recompute_blocks": sum(
+                    row["cache_outcome"] == "manager_forced_recompute" for row in lookup
+                ),
+                "compulsory_miss_blocks": misses.count("compulsory"),
+                "capacity_miss_blocks": misses.count("capacity"),
+                "prefix_mismatch_blocks": misses.count("prefix_mismatch"),
+                "allocated_blocks": sum(
+                    row["operation"] == "allocate" for row in observer
+                ),
+                "evicted_blocks": sum(
+                    row["operation"] == "evict" and row["event_source"] == "native"
+                    for row in turn_events
+                ),
+                "freed_blocks": sum(row["operation"] == "free" for row in observer),
+                "cached_resident_blocks_after_free": source[
+                    "cached_resident_blocks_after_free"
+                ],
+                "hash_time_ns": sum(
+                    row["duration_ns"] or 0
+                    for row in turn_events
+                    if row["operation"] == "hash"
+                ),
+                "lookup_time_ns": sum(row["duration_ns"] or 0 for row in lookup),
+                "touch_time_ns": sum(
+                    row["duration_ns"] or 0
+                    for row in observer
+                    if row["operation"] == "touch"
+                ),
+                "allocation_time_ns": sum(
+                    row["duration_ns"] or 0
+                    for row in observer
+                    if row["operation"] == "allocate"
+                ),
+                "eviction_time_ns": sum(
+                    row["eviction_time_ns"] or 0 for row in observer
+                ),
+                "free_time_ns": sum(
+                    row["duration_ns"] or 0
+                    for row in observer
+                    if row["operation"] == "free"
+                ),
+                "error": source["error"],
+            }
+        )
+    return rows
+
+
+def _result_markdown(result: ReplayResult) -> str:
+    return (
+        "# DS4 Ticket 07 KV Cache Replay\n\n"
+        f"Status: {result.status}\n\n"
+        "Metadata only: yes\n\n"
+        "GPU/HBM validated: no\n"
+    )
+
+
+def _write_json(path: Path, value: Any) -> None:
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def write_result(
+    config: dict[str, Any], result: ReplayResult, output_dir: Path
+) -> None:
+    if output_dir.exists():
+        raise FileExistsError(f"result directory already exists: {output_dir}")
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(
+        tempfile.mkdtemp(prefix=f".{output_dir.name}.partial-", dir=output_dir.parent)
+    )
+    events = _normalized_event_rows(
+        result,
+        capacity_blocks=config["selection"]["capacity_blocks"],
+        block_size=config["replay"]["block_size"],
+    )
+    turns = _normalized_turn_rows(result, events, config["replay"]["block_size"])
+    provenance = {
+        "artifact_schema_version": SCHEMA_VERSION,
+        "hardware_validated": False,
+        "environment": config["environment"],
+        "inputs": config["inputs"],
+        "metadata_only_validated": result.status == "passed",
+        "planning_record": config["planning_record"],
+        "planning_sha256": config["selection"]["planning_sha256"],
+        "run_id": config["run_id"],
+        "selected_turns": config["selected_turns"],
+        "selection": config["selection"],
+        "source": config["source"],
+        "status": result.status,
+    }
+    pq.write_table(
+        pa.Table.from_pylist(events, schema=CACHE_EVENT_SCHEMA),
+        stage / "cache_events.parquet",
+    )
+    pq.write_table(
+        pa.Table.from_pylist(turns, schema=TURN_SUMMARY_SCHEMA),
+        stage / "turn_summaries.parquet",
+    )
+    _write_json(stage / "run-config.json", config)
+    _write_json(stage / "provenance.json", provenance)
+    (stage / "result.md").write_text(_result_markdown(result))
+    validate_result_dir(stage)
+    stage.rename(output_dir)
+
+
+def _require_exact_schema(table: pa.Table, expected: pa.Schema, name: str) -> None:
+    if table.schema != expected:
+        raise ValueError(f"{name} schema mismatch")
+
+
+def _validate_manifests(
+    config: dict[str, Any], provenance: dict[str, Any], turns: list[dict[str, Any]]
+) -> None:
+    plan = config.get("planning_record")
+    selected = config.get("selected_turns")
+    if not isinstance(plan, dict) or plan != provenance.get("planning_record"):
+        raise ValueError("selected turn manifest mismatch: planning record")
+    if plan.get("sha256") != _canonical_json_sha256(
+        {key: value for key, value in plan.items() if key != "sha256"}
+    ):
+        raise ValueError("planning SHA-256 mismatch")
+    plan_turns = plan.get("selected", {}).get("turns")
+    if selected != plan_turns or selected != provenance.get("selected_turns"):
+        raise ValueError("selected turn manifest mismatch")
+    if _canonical_json_sha256(selected) != config["selection"].get(
+        "turn_manifest_sha256"
+    ):
+        raise ValueError("selected turn manifest mismatch: digest")
+    artifact_manifest = [
+        {
+            "trajectory_id": row["trajectory_id"],
+            "turn_index": row["turn_index"],
+            "prompt_tokens": row["prompt_tokens"],
+        }
+        for row in turns
+    ]
+    selected_projection = [
+        {
+            "trajectory_id": row["trajectory_id"],
+            "turn_index": row["turn_index"],
+            "prompt_tokens": row["prompt_tokens"],
+        }
+        for row in selected
+    ]
+    if artifact_manifest != selected_projection:
+        raise ValueError("selected turn manifest mismatch: artifact turns")
+
+    records = [InputRecord(**row) for row in provenance.get("inputs", [])]
+    verify_input_records(records)
+    input_rows = [asdict(record) for record in records]
+    if _canonical_json_sha256(input_rows) != config["selection"].get(
+        "input_set_sha256"
+    ):
+        raise ValueError("input set SHA-256 mismatch")
+    if input_rows != config.get("inputs") or input_rows != plan.get("inputs"):
+        raise ValueError("input records mismatch")
+
+    if "artifacts" in config and "tokenizer" in config:
+        reconstructed = [
+            turn
+            for turn in load_full_turns(config)
+            if turn.trajectory_id == config["selection"]["trajectory_id"]
+        ]
+        expected = _selected_turn_manifest(
+            reconstructed, config["replay"]["block_size"]
+        )
+        if expected != selected:
+            raise ValueError("selected turn manifest mismatch: reconstructed inputs")
+
+
+def _validate_event_rows(
+    events: list[dict[str, Any]], turns: list[dict[str, Any]], capacity: int
+) -> None:
+    operations = {
+        "hash",
+        "lookup",
+        "touch",
+        "allocate",
+        "store",
+        "evict",
+        "free",
+        "admission_failure",
+    }
+    sources = {"lookup", "observer", "native", "replay"}
+    statuses = {"passed", "out_of_capacity", "invalid"}
+    outcomes = {None, "hit", "miss", "manager_forced_recompute"}
+    miss_classes = {None, "compulsory", "capacity", "prefix_mismatch"}
+    prefixes = {None, "global", "task", "session"}
+    seen_ids: set[str] = set()
+    prior_after: tuple[int, int, int] | None = None
+    for row in events:
+        if row["operation"] not in operations:
+            raise ValueError(f"unknown operation: {row['operation']}")
+        if row["event_source"] not in sources:
+            raise ValueError("unknown event source")
+        if row["status"] not in statuses:
+            raise ValueError("unknown status")
+        if row["cache_outcome"] not in outcomes:
+            raise ValueError("unknown cache outcome")
+        if row["miss_class"] not in miss_classes:
+            raise ValueError("unknown miss class")
+        if row["prefix_source"] not in prefixes:
+            raise ValueError("unknown prefix source")
+        expected_id = (
+            f"{row['run_id']}:{row['trajectory_id']}:{row['turn_index']}:"
+            f"{row['operation']}:{row['operation_ordinal']}"
+        )
+        if row["event_id"] != expected_id or expected_id in seen_ids:
+            raise ValueError("event ID mismatch or duplicate")
+        seen_ids.add(expected_id)
+        before = (
+            row["active_blocks_before"],
+            row["cached_blocks_before"],
+            row["free_blocks_before"],
+        )
+        after = (
+            row["active_blocks_after"],
+            row["cached_blocks_after"],
+            row["free_blocks_after"],
+        )
+        if prior_after is not None and before != prior_after:
+            raise ValueError("occupancy transition mismatch")
+        if (
+            min(*before, *after) < 0
+            or before[0] + before[2] != capacity
+            or after[0] + after[2] != capacity
+            or before[1] > capacity
+            or after[1] > capacity
+        ):
+            raise ValueError("occupancy transition mismatch")
+        prior_after = after
+        if (row["cache_outcome"] == "miss") != (row["miss_class"] is not None):
+            raise ValueError("miss attribution mismatch")
+        is_observer_evict = (
+            row["event_source"] == "observer" and row["operation"] == "evict"
+        )
+        if is_observer_evict:
+            if row["eviction_time_ns"] != row["duration_ns"]:
+                raise ValueError("eviction timing mismatch")
+        elif row["eviction_time_ns"] is not None:
+            raise ValueError("eviction timing mismatch")
+
+    summary_by_key = {(row["trajectory_id"], row["turn_index"]): row for row in turns}
+    resident: dict[int, str] = {}
+    ever_stored: set[str] = set()
+    max_seen_depth = 0
+    for key in sorted(summary_by_key):
+        rows = sorted(
+            (row for row in events if (row["trajectory_id"], row["turn_index"]) == key),
+            key=lambda row: row["operation_ordinal"],
+        )
+        if [row["operation_ordinal"] for row in rows] != list(range(len(rows))):
+            raise ValueError("operation ordering mismatch: ordinals")
+        operations_in_turn = [row["operation"] for row in rows]
+        if not operations_in_turn or operations_in_turn[0] != "hash":
+            raise ValueError("operation ordering mismatch: hash")
+        lookup_indices = [
+            i for i, row in enumerate(rows) if row["operation"] == "lookup"
+        ]
+        if lookup_indices and lookup_indices != list(range(1, 1 + len(lookup_indices))):
+            raise ValueError("operation ordering mismatch: lookup")
+        if any(
+            row["operation"] == "touch"
+            for row in rows[
+                next(
+                    (i for i, row in enumerate(rows) if row["operation"] == "allocate"),
+                    len(rows),
+                ) :
+            ]
+        ):
+            raise ValueError("operation ordering mismatch: touch")
+        free_at = [i for i, row in enumerate(rows) if row["operation"] == "free"]
+        if free_at and free_at != list(range(free_at[0], len(rows))):
+            raise ValueError("operation ordering mismatch: free")
+        for index, row in enumerate(rows):
+            if (
+                row["event_source"] == "observer"
+                and row["operation"] == "evict"
+                and row["evicted"] is True
+                and (
+                    index + 1 >= len(rows)
+                    or not (
+                        rows[index + 1]["event_source"] == "native"
+                        and rows[index + 1]["operation"] == "evict"
+                        and rows[index + 1]["block_id"] == row["block_id"]
+                    )
+                )
+            ):
+                raise ValueError("operation ordering mismatch: eviction adjacency")
+
+        lookups = [row for row in rows if row["operation"] == "lookup"]
+        hit_count = 0
+        for position, row in enumerate(lookups):
+            block_hash = row["block_hash"]
+            resident_hashes = set(resident.values())
+            expected_miss = None
+            if block_hash not in resident_hashes:
+                expected_miss = (
+                    "capacity"
+                    if block_hash in ever_stored
+                    else "prefix_mismatch"
+                    if position < max_seen_depth
+                    else "compulsory"
+                )
+            if row["cache_outcome"] == "hit":
+                if block_hash not in resident_hashes or position != hit_count:
+                    raise ValueError("miss attribution mismatch")
+                hit_count += 1
+            elif row["cache_outcome"] == "manager_forced_recompute":
+                summary = summary_by_key[key]
+                if not (
+                    block_hash in resident_hashes
+                    and position == len(lookups) - 1
+                    and summary["prompt_tokens"] % row["token_count"] == 0
+                    and position == hit_count
+                ):
+                    raise ValueError("miss attribution mismatch")
+            elif row["cache_outcome"] != "miss" or row["miss_class"] != expected_miss:
+                raise ValueError("miss attribution mismatch")
+
+        for row in rows:
+            if row["event_source"] == "native" and row["operation"] == "store":
+                if row["block_id"] is None or row["block_hash"] is None:
+                    raise ValueError("native store lacks physical identity")
+                resident[row["block_id"]] = row["block_hash"]
+                ever_stored.add(row["block_hash"])
+            elif row["event_source"] == "native" and row["operation"] == "evict":
+                if resident.get(row["block_id"]) != row["block_hash"]:
+                    raise ValueError("native eviction physical accounting mismatch")
+                del resident[row["block_id"]]
+        max_seen_depth = max(max_seen_depth, len(lookups))
+
+        summary = summary_by_key[key]
+        misses = [row["miss_class"] for row in lookups if row["miss_class"]]
+        expected_counts = {
+            "full_blocks": len(lookups),
+            "hit_blocks": sum(row["cache_outcome"] == "hit" for row in lookups),
+            "manager_forced_recompute_blocks": sum(
+                row["cache_outcome"] == "manager_forced_recompute" for row in lookups
+            ),
+            "compulsory_miss_blocks": misses.count("compulsory"),
+            "capacity_miss_blocks": misses.count("capacity"),
+            "prefix_mismatch_blocks": misses.count("prefix_mismatch"),
+            "allocated_blocks": sum(
+                row["event_source"] == "observer" and row["operation"] == "allocate"
+                for row in rows
+            ),
+            "evicted_blocks": sum(
+                row["event_source"] == "native" and row["operation"] == "evict"
+                for row in rows
+            ),
+            "freed_blocks": sum(
+                row["event_source"] == "observer" and row["operation"] == "free"
+                for row in rows
+            ),
+        }
+        if any(summary[field] != value for field, value in expected_counts.items()):
+            raise ValueError("turn summary count mismatch")
+        if (
+            summary["cached_tokens"] + summary["recomputed_tokens"]
+            != summary["prompt_tokens"]
+        ):
+            raise ValueError("turn token accounting mismatch")
+
+    for index, row in enumerate(events):
+        if row["event_source"] != "native" or row["operation"] != "evict":
+            if any(
+                row[field] is not None
+                for field in (
+                    "useful_later",
+                    "never_reused",
+                    "next_reuse_turn",
+                    "turns_until_reuse",
+                )
+            ):
+                raise ValueError("future reuse mismatch: nullability")
+            continue
+        future_turn = next(
+            (
+                candidate["turn_index"]
+                for candidate in events[index + 1 :]
+                if candidate["operation"] == "lookup"
+                and candidate["block_hash"] == row["block_hash"]
+                and candidate["turn_index"] > row["turn_index"]
+            ),
+            None,
+        )
+        expected = (
+            future_turn is not None,
+            future_turn is None,
+            future_turn,
+            None if future_turn is None else future_turn - row["turn_index"],
+        )
+        actual = tuple(
+            row[field]
+            for field in (
+                "useful_later",
+                "never_reused",
+                "next_reuse_turn",
+                "turns_until_reuse",
+            )
+        )
+        if actual != expected:
+            raise ValueError("future reuse mismatch")
+
+
+def validate_result_dir(result_dir: Path) -> None:
+    required = {
+        "cache_events.parquet",
+        "turn_summaries.parquet",
+        "run-config.json",
+        "provenance.json",
+        "result.md",
+    }
+    present = (
+        {path.name for path in result_dir.iterdir()} if result_dir.is_dir() else set()
+    )
+    if present != required:
+        raise ValueError("result file set mismatch")
+    event_table = pq.read_table(result_dir / "cache_events.parquet")
+    turn_table = pq.read_table(result_dir / "turn_summaries.parquet")
+    _require_exact_schema(event_table, CACHE_EVENT_SCHEMA, "cache event")
+    _require_exact_schema(turn_table, TURN_SUMMARY_SCHEMA, "turn summary")
+    events = event_table.to_pylist()
+    turns = turn_table.to_pylist()
+    config = json.loads((result_dir / "run-config.json").read_text())
+    provenance = json.loads((result_dir / "provenance.json").read_text())
+    if any(row["schema_version"] != SCHEMA_VERSION for row in events + turns):
+        raise ValueError("artifact row schema version mismatch")
+    run_ids = {row["run_id"] for row in events + turns}
+    run_ids.update((config.get("run_id"), provenance.get("run_id")))
+    if len(run_ids) != 1:
+        raise ValueError("run ID mismatch")
+    required_environment = {
+        "PYTHONHASHSEED": "0",
+        "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES": "0",
+    }
+    if (
+        config.get("environment") != required_environment
+        or provenance.get("environment") != required_environment
+        or any(
+            os.environ.get(key) != value for key, value in required_environment.items()
+        )
+    ):
+        raise ValueError("deterministic environment mismatch")
+    if config.get("replay", {}).get("kv_event_hash_format") != "bytes":
+        raise ValueError("KV event hash format mismatch")
+    if provenance.get("hardware_validated") is not False:
+        raise ValueError("hardware validation claim is forbidden")
+    status = provenance.get("status")
+    if provenance.get("metadata_only_validated") != (status == "passed"):
+        raise ValueError("metadata-only validation status mismatch")
+    _validate_manifests(config, provenance, turns)
+    _validate_event_rows(events, turns, config["selection"]["capacity_blocks"])
+    if status == "passed" and not any(
+        row["event_source"] == "native" and row["operation"] == "evict"
+        for row in events
+    ):
+        raise ValueError("passed replay has no native eviction")

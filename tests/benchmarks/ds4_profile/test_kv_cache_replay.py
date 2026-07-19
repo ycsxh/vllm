@@ -16,6 +16,104 @@ assert os.environ["VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES"] == "0"
 pytestmark = pytest.mark.skip_global_cleanup
 
 
+def _artifact_fixture(tmp_path: Path) -> tuple[dict, object, Path]:
+    from benchmarks.ds4_profile.kv_cache_replay import (
+        _canonical_json_sha256,
+        _selected_turn_manifest,
+        _with_canonical_sha256,
+        replay_session,
+    )
+
+    input_path = tmp_path / "manifest.json"
+    input_path.write_bytes(b"fixture-input")
+    inputs = [
+        {
+            "logical_name": "manifest",
+            "path": str(input_path),
+            "size_bytes": input_path.stat().st_size,
+            "sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
+        }
+    ]
+    turns = [
+        _replay_turn(0, [1, 1, 2, 2, 3]),
+        _replay_turn(1, [1, 1, 9, 9, 8, 8]),
+        _replay_turn(2, [1, 1, 2, 2, 7]),
+    ]
+    selected_turns = _selected_turn_manifest(turns, 2)
+    input_sha = _canonical_json_sha256(inputs)
+    turn_sha = _canonical_json_sha256(selected_turns)
+    plan = _with_canonical_sha256(
+        {
+            "schema_version": "1.0.0",
+            "status": "selected",
+            "inputs": inputs,
+            "candidates": [],
+            "selected": {
+                "trajectory_id": "task:no_think",
+                "reasoning_mode": "no_think",
+                "capacity_blocks": 3,
+                "input_set_sha256": input_sha,
+                "turns": selected_turns,
+                "turn_manifest_sha256": turn_sha,
+            },
+        }
+    )
+    config = {
+        "schema_version": "1.0.0",
+        "run_id": "fixture-run",
+        "environment": {
+            "PYTHONHASHSEED": "0",
+            "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES": "0",
+        },
+        "inputs": inputs,
+        "planning_record": plan,
+        "selected_turns": selected_turns,
+        "replay": {
+            "block_size": 2,
+            "kv_event_hash_format": "bytes",
+            "max_model_len": 32,
+        },
+        "selection": {
+            "status": "pinned",
+            "trajectory_id": "task:no_think",
+            "reasoning_mode": "no_think",
+            "capacity_blocks": 3,
+            "input_set_sha256": input_sha,
+            "planning_sha256": plan["sha256"],
+            "turn_manifest_sha256": turn_sha,
+        },
+        "source": {"commit": "abc123", "dirty": False},
+    }
+    return (
+        config,
+        replay_session(
+            run_id="fixture-run",
+            turns=turns,
+            capacity_blocks=3,
+            block_size=2,
+            max_model_len=32,
+        ),
+        tmp_path / "result",
+    )
+
+
+def _write_valid_result(tmp_path: Path) -> Path:
+    from benchmarks.ds4_profile.kv_cache_replay import write_result
+
+    config, result, output = _artifact_fixture(tmp_path)
+    write_result(config, result, output)
+    return output
+
+
+def _rewrite_event_rows(output: Path, mutate) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import CACHE_EVENT_SCHEMA
+
+    path = output / "cache_events.parquet"
+    rows = pq.read_table(path).to_pylist()
+    mutate(rows)
+    pq.write_table(pa.Table.from_pylist(rows, schema=CACHE_EVENT_SCHEMA), path)
+
+
 def _replay_turn(index: int, tokens: list[int], trajectory_id: str = "task:no_think"):
     from benchmarks.ds4_profile.kv_cache_replay import ReplayTurn
 
@@ -496,6 +594,46 @@ def test_selection_plan_uses_real_replay_and_is_deterministic(tmp_path: Path) ->
     )
 
 
+def test_selection_plan_preserves_no_candidate_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from benchmarks.ds4_profile import kv_cache_replay
+
+    tokenizer = tmp_path / "tokenizer"
+    tokenizer.mkdir()
+    (tokenizer / "tokenizer.json").write_text("tokenizer")
+    artifacts = {}
+    for name in (
+        "manifest",
+        "normalized_turns",
+        "normalized_provenance",
+        "rendered_turns",
+        "workload_provenance",
+    ):
+        path = tmp_path / name
+        path.write_text(name)
+        artifacts[name] = str(path)
+    config = {
+        "artifacts": artifacts,
+        "tokenizer": {"path": str(tokenizer)},
+        "replay": {"block_size": 2, "max_model_len": 32},
+    }
+    monkeypatch.setattr(
+        kv_cache_replay,
+        "replay_session",
+        lambda **_: kv_cache_replay.ReplayResult("passed", [], [], 0),
+    )
+
+    plan = kv_cache_replay.build_selection_plan(config, [_replay_turn(0, [1, 1, 2, 2])])
+
+    assert plan["status"] == "no_selection"
+    assert plan["selected"] is None
+    assert plan["error"] == (
+        "no full trajectory admits all turns with eviction pressure"
+    )
+    assert plan["candidates"][0]["status"] == "rejected"
+
+
 def test_verify_pinned_selection_rejects_drift() -> None:
     from benchmarks.ds4_profile.kv_cache_replay import (
         _canonical_json_sha256,
@@ -759,3 +897,135 @@ def test_load_full_turns_rejects_extra_ticket_02_rows(
 
     with pytest.raises(ValueError, match="Ticket 02 key set mismatch"):
         load_full_turns(config)
+
+
+def test_artifacts_are_versioned_metadata_only_and_cross_validated(
+    tmp_path: Path,
+) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import validate_result_dir
+
+    output = _write_valid_result(tmp_path)
+    validate_result_dir(output)
+
+    assert {path.name for path in output.iterdir()} == {
+        "cache_events.parquet",
+        "provenance.json",
+        "result.md",
+        "run-config.json",
+        "turn_summaries.parquet",
+    }
+    markdown = (output / "result.md").read_text()
+    assert "Metadata only: yes" in markdown
+    assert "GPU/HBM validated: no" in markdown
+
+
+def test_writer_refuses_to_overwrite_and_preserves_failed_artifacts(
+    tmp_path: Path,
+) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import write_result
+
+    config, result, output = _artifact_fixture(tmp_path)
+    write_result(config, result, output)
+    with pytest.raises(FileExistsError):
+        write_result(config, result, output)
+
+
+def test_validator_rejects_unknown_enum(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import validate_result_dir
+
+    output = _write_valid_result(tmp_path)
+    _rewrite_event_rows(output, lambda rows: rows[0].update(operation="unknown"))
+    with pytest.raises(ValueError, match="unknown operation"):
+        validate_result_dir(output)
+
+
+def test_validator_recomputes_miss_attribution(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import validate_result_dir
+
+    output = _write_valid_result(tmp_path)
+
+    def corrupt(rows) -> None:
+        row = next(item for item in rows if item["cache_outcome"] == "miss")
+        row["miss_class"] = (
+            "capacity" if row["miss_class"] != "capacity" else "compulsory"
+        )
+
+    _rewrite_event_rows(output, corrupt)
+    with pytest.raises(ValueError, match="miss attribution mismatch"):
+        validate_result_dir(output)
+
+
+def test_validator_recomputes_future_reuse(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import validate_result_dir
+
+    output = _write_valid_result(tmp_path)
+
+    def corrupt(rows) -> None:
+        row = next(
+            item
+            for item in rows
+            if item["event_source"] == "native" and item["operation"] == "evict"
+        )
+        row["useful_later"] = not row["useful_later"]
+
+    _rewrite_event_rows(output, corrupt)
+    with pytest.raises(ValueError, match="future reuse mismatch"):
+        validate_result_dir(output)
+
+
+def test_validator_reconstructs_call_order(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import validate_result_dir
+
+    output = _write_valid_result(tmp_path)
+
+    def corrupt(rows) -> None:
+        touch = next(item for item in rows if item["operation"] == "touch")
+        allocate = next(
+            item
+            for item in rows
+            if item["turn_index"] == touch["turn_index"]
+            and item["operation"] == "allocate"
+        )
+        touch["operation_ordinal"], allocate["operation_ordinal"] = (
+            allocate["operation_ordinal"],
+            touch["operation_ordinal"],
+        )
+        for row in (touch, allocate):
+            row["event_id"] = (
+                f"{row['run_id']}:{row['trajectory_id']}:{row['turn_index']}:"
+                f"{row['operation']}:{row['operation_ordinal']}"
+            )
+
+    _rewrite_event_rows(output, corrupt)
+    with pytest.raises(ValueError, match="operation ordering mismatch"):
+        validate_result_dir(output)
+
+
+def test_validator_replays_occupancy_transitions(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import validate_result_dir
+
+    output = _write_valid_result(tmp_path)
+    _rewrite_event_rows(output, lambda rows: rows[1].update(active_blocks_before=99))
+    with pytest.raises(ValueError, match="occupancy transition mismatch"):
+        validate_result_dir(output)
+
+
+@pytest.mark.parametrize("corruption", ["omit", "reorder", "tamper"])
+def test_validator_reconstructs_the_exact_ordered_selected_turns(
+    tmp_path: Path, corruption: str
+) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import validate_result_dir
+
+    output = _write_valid_result(tmp_path)
+    path = output / "run-config.json"
+    config = json.loads(path.read_text())
+    turns = config["selected_turns"]
+    if corruption == "omit":
+        config["selected_turns"] = turns[:-1]
+    elif corruption == "reorder":
+        config["selected_turns"] = list(reversed(turns))
+    else:
+        config["selected_turns"][0]["prompt_token_ids_sha256"] = "0" * 64
+    path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+    with pytest.raises(ValueError, match="selected turn manifest mismatch"):
+        validate_result_dir(output)
