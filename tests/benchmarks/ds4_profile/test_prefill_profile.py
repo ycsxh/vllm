@@ -372,7 +372,15 @@ def _prime_evidence(
         request_key="r0",
         intended_cached_tokens=16,
         actual_cached_tokens=16,
-        prime_scheduler_outputs=(),
+        prime_scheduler_outputs=(
+            prefill_profile.SchedulerBlockTableEvidence(
+                chunk_index=0,
+                request_key="r0",
+                block_ids_by_group=(block_ids,),
+                execution_completed=completed,
+                gpu_synchronized=synchronized,
+            ),
+        ),
         measured_block_ids_by_group=(block_ids,),
         worker_groups=(),
         prime_completed=completed,
@@ -678,11 +686,14 @@ class _OrchestrationAdapter:
         pass
 
     def schedule_chunk(self, point, chunk):
+        self.last_chunk_index = chunk.chunk_index
         expected = dict(chunk.scheduled_tokens_by_request)
         actual = dict(expected)
         preempted: tuple[str, ...] = ()
         unrelated: tuple[str, ...] = ()
-        if self.outcome in {"empty", "ooc"}:
+        if self.outcome in {"empty", "ooc"} or (
+            self.outcome == "late_ooc" and chunk.chunk_index == 1
+        ):
             actual = {}
         elif self.outcome == "partial_tokens":
             actual["r0"] -= 1
@@ -715,7 +726,9 @@ class _OrchestrationAdapter:
         )
 
     def classify_out_of_capacity(self, _point, _chunk, scheduled):
-        if self.outcome != "ooc":
+        if self.outcome not in {"ooc", "late_ooc"} or (
+            self.outcome == "late_ooc" and self.last_chunk_index != 1
+        ):
             return None
         self.events.append("clean_reset")
         return replace(
@@ -775,15 +788,16 @@ def test_hit_repetition_primes_and_verifies_before_any_timed_chunk() -> None:
 def test_incomplete_repetition_output_is_never_timed(outcome: str) -> None:
     events: list[str] = []
 
-    with pytest.raises(RuntimeError):
-        prefill_profile.run_point_repetition(
-            _adapter_point(),
-            phase="steady",
-            ordinal=0,
-            adapter=_OrchestrationAdapter(events, outcome),
-            execute_timed=_timed_executor(events),
-        )
+    result = prefill_profile.run_point_repetition(
+        _adapter_point(),
+        phase="steady",
+        ordinal=0,
+        adapter=_OrchestrationAdapter(events, outcome),
+        execute_timed=_timed_executor(events),
+    )
 
+    assert result["status"] == "failed"
+    assert result["rows"][0]["status"] == "failed"
     assert not any(event.startswith("timed:") for event in events)
 
 
@@ -801,7 +815,85 @@ def test_allocator_pressure_emits_one_untimed_terminal_row() -> None:
     assert len(result["rows"]) == 1
     assert result["rows"][0]["row_kind"] == "terminal"
     assert result["rows"][0]["runner_wall_time_ms"] is None
+    assert result["rows"][0]["runtime_mode"] is None
+    assert isinstance(result["rows"][0]["cache_epoch"], int)
     assert events == ["reset", "prime_gpu0", "clean_reset"]
+
+
+def test_later_allocator_pressure_preserves_only_completed_chunk_timing() -> None:
+    events: list[str] = []
+    result = prefill_profile.run_point_repetition(
+        _artifact_point("prefix_hit"),
+        phase="warmup",
+        ordinal=0,
+        adapter=_OrchestrationAdapter(events, "late_ooc"),
+        execute_timed=_timed_executor(events),
+    )
+
+    assert result["status"] == "out_of_capacity"
+    assert [row["status"] for row in result["rows"]] == [
+        "passed",
+        "out_of_capacity",
+    ]
+    assert result["rows"][0]["runner_wall_time_ms"] == 1.0
+    assert result["rows"][1]["runner_wall_time_ms"] is None
+    assert events.count("timed:0") == 1
+
+
+def test_reset_flushes_pending_finished_ids_without_live_requests() -> None:
+    adapter, executor = _adapter(_fake_output({}, active_ids=()))
+    adapter.scheduler.finished_req_ids = {"r0"}
+
+    adapter.reset_epoch()
+
+    assert executor.execute_calls == 1
+
+
+def test_prefix_evidence_is_flattened_to_the_v2_group_schema() -> None:
+    worker_group = prefill_profile.WorkerKvTensorGroupEvidence(
+        group_index=0,
+        tensor_names=("layer.0",),
+        tensor_devices=("cuda:0",),
+        tensor_shapes=((128, 2),),
+        block_axis=0,
+        block_dimension=128,
+        verified_block_ids=(10,),
+        live_cuda_tensor_proven=True,
+    )
+    evidence = replace(
+        _prime_evidence(),
+        worker_groups=(worker_group,),
+    )
+
+    rows = prefill_profile._flatten_prefix_evidence(
+        "run", "point", "steady", 0, evidence
+    )
+
+    assert rows == [
+        {
+            "schema_version": "2.0.0",
+            "run_id": "run",
+            "point_id": "point",
+            "phase": "steady",
+            "ordinal": 0,
+            "request_key": "r0",
+            "kv_cache_group": "group-0",
+            "prime_scheduler_block_ids": [10],
+            "measured_scheduler_block_ids": [10],
+            "live_kv_tensor_names": ["layer.0"],
+            "live_kv_tensor_devices": ["cuda:0"],
+            "live_kv_tensor_shapes": [[128, 2]],
+            "block_axis": 0,
+            "block_dimension": 128,
+            "verified_physical_block_ids": [10],
+            "intended_cached_tokens": 16,
+            "actual_cached_tokens": 16,
+            "prime_completed": True,
+            "prime_synchronized": True,
+            "live_cuda_tensor_proven": True,
+            "hardware_validated": True,
+        }
+    ]
 
 
 def test_execute_worker_step_times_only_execute_model(
@@ -866,6 +958,84 @@ def test_execute_worker_step_times_only_execute_model(
     ]
     assert wall_ms is not None
     assert cuda_ms == 0.5
+
+
+def test_run_prefill_matrix_uses_public_runtime_and_always_shuts_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from benchmarks.ds4_profile import gpu_profile
+    from vllm.v1 import structured_output
+    from vllm.v1.core import kv_cache_utils
+
+    events: list[str] = []
+
+    class Executor:
+        def shutdown(self) -> None:
+            events.append("shutdown")
+
+    scheduler_calls = []
+
+    def make_scheduler(**kwargs):
+        scheduler_calls.append(kwargs)
+        return SimpleNamespace()
+
+    scheduler_config = SimpleNamespace(get_scheduler_cls=lambda: make_scheduler)
+    compilation_config = SimpleNamespace(
+        mode=SimpleNamespace(name="VLLM_COMPILE"),
+        cudagraph_mode=SimpleNamespace(name="FULL_AND_PIECEWISE"),
+    )
+    runtime = gpu_profile.GpuRuntime(
+        Executor(),
+        SimpleNamespace(),
+        SimpleNamespace(
+            scheduler_config=scheduler_config,
+            compilation_config=compilation_config,
+        ),
+        SimpleNamespace(),
+        startup_ms=10.0,
+        capture_ms=20.0,
+    )
+    adapter = _OrchestrationAdapter(events)
+    monkeypatch.setattr(gpu_profile, "initialize_gpu_runtime", lambda _config: runtime)
+    monkeypatch.setattr(
+        gpu_profile,
+        "execute_worker_step",
+        lambda _runtime, _output, *, timed: _timed_executor(events)(_output),
+    )
+    monkeypatch.setattr(
+        kv_cache_utils, "resolve_kv_cache_block_sizes", lambda *_args: (16, 16)
+    )
+    monkeypatch.setattr(
+        structured_output, "StructuredOutputManager", lambda _config: object()
+    )
+    monkeypatch.setattr(
+        prefill_profile.VllmSchedulerCacheAdapter,
+        "from_runtime",
+        classmethod(lambda _cls, *_args, **_kwargs: adapter),
+    )
+    config = {
+        "run_id": "matrix-run",
+        "profile": {"warmup_repetitions": 0, "measured_repetitions": 1},
+    }
+
+    result = prefill_profile.run_prefill_matrix(
+        config, (_adapter_point("full_recompute"),)
+    )
+
+    assert result["status"] == "passed"
+    assert result["error"] is None
+    assert len(result["samples"]) == 1
+    assert result["startup_ms"] == 10.0
+    assert set(scheduler_calls[0]) == {
+        "vllm_config",
+        "kv_cache_config",
+        "structured_output_manager",
+        "include_finished_set",
+        "log_stats",
+        "block_size",
+        "hash_block_size",
+    }
+    assert events[-1] == "shutdown"
 
 
 def test_planner_expands_the_pinned_matrix_to_68_points() -> None:

@@ -5,7 +5,7 @@
 
 import hashlib
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from time import perf_counter
 from typing import Any, Literal
 
@@ -445,6 +445,7 @@ class VllmSchedulerCacheAdapter:
     def reset_epoch(self) -> None:
         """Abort and flush every request, then prove an empty cache epoch."""
         request_ids = self._scheduler_request_ids() | self._queue_request_ids()
+        finished_ids_pending = bool(getattr(self.scheduler, "finished_req_ids", set()))
         if request_ids:
             try:
                 from vllm.v1.request import RequestStatus
@@ -453,6 +454,7 @@ class VllmSchedulerCacheAdapter:
             except ImportError:
                 status = "finished_aborted"
             self.scheduler.finish_requests(sorted(request_ids), status)
+        if request_ids or finished_ids_pending:
             flush = self.scheduler.schedule()
             if getattr(flush, "total_num_scheduled_tokens", 0):
                 raise RuntimeError("reset flush scheduled model work")
@@ -913,8 +915,8 @@ def _allocation_payload(
     scheduled: ScheduledChunk,
     allocation: AllocationEvidence,
     *,
-    cache_epoch: str,
-    runtime_mode: str,
+    cache_epoch: int,
+    runtime_mode: str | None,
 ) -> dict[str, Any]:
     page_bytes = adapter._kv_page_bytes()
     if len(set(page_bytes)) != 1:
@@ -947,33 +949,36 @@ def _runtime_mode(model_output: Any) -> str:
     return mode
 
 
-def run_point_repetition(
+def _run_point_repetition_impl(
     point: PPointPlan,
     *,
     phase: Literal["warmup", "steady"],
     ordinal: int,
     adapter: Any,
     execute_timed: Callable[[Any], tuple[Any, float | None, float | None]],
+    failure_coordinate: list[PChunkPlan],
     run_id: str = "unit-run",
 ) -> dict[str, Any]:
     """Run one reset-isolated point repetition in fail-closed order."""
-    cache_epoch = f"{point.point_id}:{phase}:{ordinal}"
+    epoch_payload = f"{point.point_id}:{phase}:{ordinal}".encode()
+    cache_epoch = int.from_bytes(hashlib.sha256(epoch_payload).digest()[:8], "big") & (
+        (1 << 63) - 1
+    )
     adapter.reset_epoch()
     prime_evidence = adapter.prime(point, phase, ordinal)
     adapter.add_measurement_requests(point)
     rows = []
     for chunk in point.chunks:
+        failure_coordinate[0] = chunk
         scheduled = adapter.schedule_chunk(point, chunk)
         out_of_capacity = adapter.classify_out_of_capacity(point, chunk, scheduled)
         if out_of_capacity is not None:
-            if chunk.chunk_index != 0 or rows:
-                raise RuntimeError("allocator pressure was discovered after GPU timing")
             allocation = _allocation_payload(
                 adapter,
                 scheduled,
                 out_of_capacity,
                 cache_epoch=cache_epoch,
-                runtime_mode="not_run",
+                runtime_mode=None,
             )
             rows.append(
                 make_prefill_chunk_row(
@@ -1029,6 +1034,126 @@ def run_point_repetition(
     return {"status": "passed", "rows": rows, "prefix_evidence": prime_evidence}
 
 
+def run_point_repetition(
+    point: PPointPlan,
+    *,
+    phase: Literal["warmup", "steady"],
+    ordinal: int,
+    adapter: Any,
+    execute_timed: Callable[[Any], tuple[Any, float | None, float | None]],
+    run_id: str = "unit-run",
+) -> dict[str, Any]:
+    """Run one repetition and preserve a structured failure coordinate."""
+    failure_coordinate = [point.chunks[0]]
+    try:
+        return _run_point_repetition_impl(
+            point,
+            phase=phase,
+            ordinal=ordinal,
+            adapter=adapter,
+            execute_timed=execute_timed,
+            run_id=run_id,
+            failure_coordinate=failure_coordinate,
+        )
+    except Exception as error:
+        chunk = failure_coordinate[0]
+        epoch_payload = f"{point.point_id}:{phase}:{ordinal}".encode()
+        cache_epoch = int.from_bytes(
+            hashlib.sha256(epoch_payload).digest()[:8], "big"
+        ) & ((1 << 63) - 1)
+        page_bytes = adapter._kv_page_bytes()
+        block_bytes = page_bytes[0] if page_bytes else 0
+        allocation = {
+            "state": "failed",
+            "actual_scheduled_tokens_by_request": {},
+            "preempted_request_ids": (),
+            "unrelated_request_ids": (),
+            "cache_epoch": cache_epoch,
+            "cache_reset_completed": False,
+            "cache_reset_empty": False,
+            "allocator_pressure_proven": False,
+            "clean_reset_proven": False,
+            "requested_blocks": 0,
+            "allocatable_blocks": 0,
+            "allocated_blocks": 0,
+            "kv_block_bytes": block_bytes,
+            "lookup_time_ms": 0.0,
+            "allocation_time_ms": 0.0,
+            "runtime_mode": None,
+        }
+        error_text = f"{type(error).__name__}: {error}"
+        row = make_prefill_chunk_row(
+            run_id=run_id,
+            point=point,
+            phase=phase,
+            ordinal=ordinal,
+            chunk=chunk,
+            runner_wall_time_ms=None,
+            cuda_model_time_ms=None,
+            allocation=allocation,
+            status="failed",
+            error=error_text,
+        )
+        return {
+            "status": "failed",
+            "rows": [row],
+            "prefix_evidence": (),
+            "error": error_text,
+        }
+
+
+def _flatten_prefix_evidence(
+    run_id: str,
+    point_id: str,
+    phase: str,
+    ordinal: int,
+    evidence: PrefixPrimeEvidence,
+) -> list[dict[str, Any]]:
+    rows = []
+    for group_index, (block_ids, worker_group) in enumerate(
+        zip(evidence.measured_block_ids_by_group, evidence.worker_groups)
+    ):
+        prime_block_ids = tuple(
+            block_id
+            for output in evidence.prime_scheduler_outputs
+            for block_id in output.block_ids_by_group[group_index]
+        )
+        if prime_block_ids != block_ids:
+            raise RuntimeError(
+                "serialized prime block tables do not match measured IDs"
+            )
+        rows.append(
+            {
+                "schema_version": V2_SCHEMA_VERSION,
+                "run_id": run_id,
+                "point_id": point_id,
+                "phase": phase,
+                "ordinal": ordinal,
+                "request_key": evidence.request_key,
+                "kv_cache_group": f"group-{group_index}",
+                "prime_scheduler_block_ids": list(prime_block_ids),
+                "measured_scheduler_block_ids": list(block_ids),
+                "live_kv_tensor_names": list(worker_group.tensor_names),
+                "live_kv_tensor_devices": list(worker_group.tensor_devices),
+                "live_kv_tensor_shapes": [
+                    list(shape) for shape in worker_group.tensor_shapes
+                ],
+                "block_axis": worker_group.block_axis,
+                "block_dimension": worker_group.block_dimension,
+                "verified_physical_block_ids": list(worker_group.verified_block_ids),
+                "intended_cached_tokens": evidence.intended_cached_tokens,
+                "actual_cached_tokens": evidence.actual_cached_tokens,
+                "prime_completed": evidence.prime_completed,
+                "prime_synchronized": evidence.prime_synchronized,
+                "live_cuda_tensor_proven": (worker_group.live_cuda_tensor_proven),
+                "hardware_validated": evidence.hardware_validated,
+            }
+        )
+    if len(rows) != len(evidence.measured_block_ids_by_group):
+        raise RuntimeError("prefix evidence omitted a live KV cache group")
+    return rows
+
+
 def run_prefill_matrix(
     config: dict[str, Any], points: tuple[PPointPlan, ...]
 ) -> dict[str, Any]:
@@ -1043,6 +1168,9 @@ def run_prefill_matrix(
     prefix_evidence: list[dict[str, Any]] = []
     status = "passed"
     error = None
+    failure_point = points[0] if points else None
+    failure_phase: Literal["warmup", "steady"] = "warmup"
+    failure_ordinal = 0
     try:
         from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
         from vllm.v1.structured_output import StructuredOutputManager
@@ -1076,8 +1204,11 @@ def run_prefill_matrix(
             ("steady", ordinal) for ordinal in range(profile["measured_repetitions"])
         )
         for point in points:
-            point_row_start = len(rows)
+            point_evidence_start = len(prefix_evidence)
             for phase, ordinal in (*repetitions, *steady):
+                failure_point = point
+                failure_phase = phase
+                failure_ordinal = ordinal
                 result = run_point_repetition(
                     point,
                     phase=phase,
@@ -1087,30 +1218,69 @@ def run_prefill_matrix(
                     run_id=config["run_id"],
                 )
                 rows.extend(result["rows"])
-                prefix_evidence.extend(
-                    {
-                        "point_id": point.point_id,
-                        "phase": phase,
-                        "ordinal": ordinal,
-                        **asdict(item),
-                    }
-                    for item in result["prefix_evidence"]
-                )
+                if result["status"] == "failed":
+                    raise RuntimeError(result["error"])
                 if result["status"] == "out_of_capacity":
-                    if len(rows) != point_row_start + 1:
-                        raise RuntimeError(
-                            "out-of-capacity point contains earlier timed rows"
-                        )
+                    del prefix_evidence[point_evidence_start:]
                     status = "out_of_capacity"
                     break
+                for item in result["prefix_evidence"]:
+                    prefix_evidence.extend(
+                        _flatten_prefix_evidence(
+                            config["run_id"],
+                            point.point_id,
+                            phase,
+                            ordinal,
+                            item,
+                        )
+                    )
     except Exception as caught:
         status = "failed"
         error = f"{type(caught).__name__}: {caught}"
+        if failure_point is not None and not (rows and rows[-1]["status"] == "failed"):
+            chunk = failure_point.chunks[0]
+            epoch_payload = (
+                f"{failure_point.point_id}:{failure_phase}:{failure_ordinal}"
+            ).encode()
+            cache_epoch = int.from_bytes(
+                hashlib.sha256(epoch_payload).digest()[:8], "big"
+            ) & ((1 << 63) - 1)
+            rows.append(
+                make_prefill_chunk_row(
+                    run_id=config.get("run_id") or "unknown-run",
+                    point=failure_point,
+                    phase=failure_phase,
+                    ordinal=failure_ordinal,
+                    chunk=chunk,
+                    runner_wall_time_ms=None,
+                    cuda_model_time_ms=None,
+                    allocation={
+                        "state": "failed",
+                        "actual_scheduled_tokens_by_request": {},
+                        "preempted_request_ids": (),
+                        "unrelated_request_ids": (),
+                        "cache_epoch": cache_epoch,
+                        "cache_reset_completed": False,
+                        "cache_reset_empty": False,
+                        "requested_blocks": 0,
+                        "allocatable_blocks": 0,
+                        "allocated_blocks": 0,
+                        "kv_block_bytes": 0,
+                        "lookup_time_ms": 0.0,
+                        "allocation_time_ms": 0.0,
+                        "runtime_mode": None,
+                    },
+                    status="failed",
+                    error=error,
+                )
+            )
     finally:
         if runtime is not None:
             runtime.executor.shutdown()
-    hardware_validated = bool(prefix_evidence) and all(
-        item["hardware_validated"] for item in prefix_evidence
+    hardware_validated = (
+        status != "failed"
+        and bool(prefix_evidence)
+        and all(item["hardware_validated"] for item in prefix_evidence)
     )
     return {
         "schema_version": V2_SCHEMA_VERSION,

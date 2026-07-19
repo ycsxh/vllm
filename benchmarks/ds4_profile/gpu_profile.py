@@ -74,7 +74,11 @@ def _create_vllm_config(config: dict[str, Any]):
 
 def initialize_gpu_runtime(config: dict[str, Any]) -> GpuRuntime:
     """Initialize the low-level executor and its configured KV cache."""
-    from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
+    from vllm.v1.core.kv_cache_utils import (
+        generate_scheduler_kv_cache_config,
+        get_kv_cache_capacity,
+        get_kv_cache_configs,
+    )
     from vllm.v1.core.single_type_kv_cache_manager import (
         register_all_kvcache_specs,
     )
@@ -89,6 +93,19 @@ def initialize_gpu_runtime(config: dict[str, Any]) -> GpuRuntime:
     kv_cache_configs = get_kv_cache_configs(
         vllm_config, kv_cache_specs, available_memory
     )
+    scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+    vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
+    groups = scheduler_kv_cache_config.kv_cache_groups
+    if groups:
+        vllm_config.cache_config.block_size = min(
+            group.kv_cache_spec.block_size for group in groups
+        )
+        capacity, concurrency = get_kv_cache_capacity(
+            vllm_config, scheduler_kv_cache_config
+        )
+        vllm_config.cache_config.kv_cache_size_tokens = capacity
+        vllm_config.cache_config.kv_cache_max_concurrency = concurrency
+    vllm_config.validate_block_size()
     startup_ms = (time.perf_counter() - started) * 1000
 
     try:
@@ -103,7 +120,7 @@ def initialize_gpu_runtime(config: dict[str, Any]) -> GpuRuntime:
         executor=executor,
         worker=worker,
         vllm_config=vllm_config,
-        kv_cache_config=kv_cache_configs[0],
+        kv_cache_config=scheduler_kv_cache_config,
         startup_ms=startup_ms,
         capture_ms=capture_ms,
     )
