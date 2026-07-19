@@ -7,8 +7,9 @@ from collections import Counter
 import pytest
 
 import benchmarks.ds4_profile.prefill_profile as prefill_profile
+from benchmarks.ds4_profile import profile_spine
 from benchmarks.ds4_profile.prefill_profile import build_prefill_points
-from benchmarks.ds4_profile.profile_spine import make_point_id
+from benchmarks.ds4_profile.profile_spine import make_comparison_id, make_point_id
 
 HOMOGENEOUS_CASES = (
     (1, 128),
@@ -232,7 +233,7 @@ def test_full_recompute_chunks_context_and_removes_completed_requests() -> None:
         and point.cache_condition == "full_recompute"
     )
 
-    scheduled = Counter()
+    scheduled: Counter[str] = Counter()
     active_sizes = []
     for chunk in point.chunks:
         active_sizes.append(len(chunk.scheduled_tokens_by_request))
@@ -309,3 +310,129 @@ def test_point_id_covers_planned_chunks_and_planner_algorithms(
     changed_algorithms = _build_pinned_points()[0]
     assert changed_algorithms.planner_digest != changed_chunk_algorithm.planner_digest
     assert changed_algorithms.point_id != changed_chunk_algorithm.point_id
+
+
+def _artifact_point(cache_condition: str) -> prefill_profile.PPointPlan:
+    request = prefill_profile.PRequestPlan(
+        request_key="r0",
+        trajectory_id=None,
+        turn_index=None,
+        reasoning_mode=None,
+        prompt_token_ids=tuple(range(200)),
+        context_tokens=200,
+        cached_tokens=100,
+        new_tokens=100,
+        token_digest="a" * 64,
+    )
+    chunks = (
+        prefill_profile.PChunkPlan(0, {"r0": 40}),
+        prefill_profile.PChunkPlan(1, {"r0": 60}),
+    )
+    payload = {
+        "workload_family": "homogeneous",
+        "selector": "artifact-b1-t100",
+        "requests": [
+            {
+                "request_key": request.request_key,
+                "trajectory_id": None,
+                "turn_index": None,
+                "reasoning_mode": None,
+                "context_tokens": request.context_tokens,
+                "cached_tokens": request.cached_tokens,
+                "new_tokens": request.new_tokens,
+                "token_digest": request.token_digest,
+            }
+        ],
+        "composition": "none",
+        "seed": 20260715,
+        "batch_size": 1,
+        "chunk_budget": 4096,
+        "cache_condition": cache_condition,
+        "block_size": 16,
+        "homogeneous_prefix_tokens": 4096,
+        "capacity_target": "native",
+        "planner_digest": "b" * 64,
+        "planned_chunks": [
+            {
+                "chunk_index": chunk.chunk_index,
+                "scheduled_tokens_by_request": sorted(
+                    chunk.scheduled_tokens_by_request.items()
+                ),
+            }
+            for chunk in chunks
+        ],
+    }
+    return prefill_profile.PPointPlan(
+        point_id=make_point_id(payload),
+        comparison_id=make_comparison_id(payload),
+        workload_family="homogeneous",
+        selector=payload["selector"],
+        composition="none",
+        seed=payload["seed"],
+        batch_size=1,
+        cache_condition=cache_condition,
+        planner_digest=payload["planner_digest"],
+        requests=(request,),
+        chunks=chunks,
+        canonical_payload=payload,
+    )
+
+
+def _passed_chunk_row(
+    point: prefill_profile.PPointPlan,
+    ordinal: int,
+    chunk: prefill_profile.PChunkPlan,
+    wall_time_ms: float,
+) -> dict:
+    return prefill_profile.make_prefill_chunk_row(
+        run_id="run-task-3",
+        point=point,
+        phase="steady",
+        ordinal=ordinal,
+        chunk=chunk,
+        runner_wall_time_ms=wall_time_ms,
+        cuda_model_time_ms=wall_time_ms - 0.5,
+        allocation={
+            "state": "allocated",
+            "actual_scheduled_tokens_by_request": (chunk.scheduled_tokens_by_request),
+            "preempted_request_ids": (),
+            "unrelated_request_ids": (),
+            "cache_epoch": ordinal,
+            "cache_reset_completed": True,
+            "cache_reset_empty": True,
+            "requested_blocks": 8,
+            "allocatable_blocks": 128,
+            "allocated_blocks": 8,
+            "kv_block_bytes": 1024,
+            "lookup_time_ms": 0.2,
+            "allocation_time_ms": 0.3,
+            "runtime_mode": "FULL",
+        },
+        status="passed",
+        error=None,
+    )
+
+
+def test_turn_and_comparison_statistics_are_recomputed_from_chunks() -> None:
+    hit = _artifact_point("prefix_hit")
+    recompute = _artifact_point("full_recompute")
+    raw_rows: list[dict] = []
+    for ordinal in range(10):
+        raw_rows.extend(
+            _passed_chunk_row(hit, ordinal, chunk, wall_time)
+            for chunk, wall_time in zip(hit.chunks, (4.0, 6.0), strict=True)
+        )
+        raw_rows.extend(
+            _passed_chunk_row(recompute, ordinal, chunk, wall_time)
+            for chunk, wall_time in zip(recompute.chunks, (6.0, 10.0), strict=True)
+        )
+
+    turns = profile_spine.summarize_turn_samples(raw_rows, (hit, recompute))
+    aggregates = profile_spine.aggregate_turn_samples(turns, 0.05)
+    comparisons = profile_spine.compare_conditions(aggregates, (hit, recompute), [])
+
+    hit_turn = next(row for row in turns if row["cache_condition"] == "prefix_hit")
+    assert hit_turn["runner_wall_time_ms"] == 10.0
+    assert hit_turn["throughput_tokens_per_s"] == 10_000.0
+    assert {row["sample_count"] for row in aggregates} == {10}
+    assert comparisons[0]["recompute_penalty_ms"] == 6.0

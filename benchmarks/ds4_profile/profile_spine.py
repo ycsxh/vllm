@@ -10,6 +10,7 @@ import statistics
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pyarrow as pa
@@ -132,23 +133,27 @@ def canonical_v2_points() -> list[dict[str, Any]]:
     inputs = canonical_v2_planner_inputs()
     for selector in inputs["workload_selectors"]:
         for cache_condition in ("prefix_hit", "full_recompute"):
-            planned_chunks = [{
-                "chunk_index": 0,
-                "scheduled_tokens_by_request": [["r0", 512]],
-            }]
+            planned_chunks = [
+                {
+                    "chunk_index": 0,
+                    "scheduled_tokens_by_request": [["r0", 512]],
+                }
+            ]
             payload = {
                 "workload_family": "homogeneous",
                 "selector": selector,
-                "requests": [{
-                    "request_key": "r0",
-                    "trajectory_id": None,
-                    "turn_index": None,
-                    "reasoning_mode": None,
-                    "context_tokens": 4608,
-                    "cached_tokens": 4096,
-                    "new_tokens": 512,
-                    "token_digest": hashlib.sha256(selector.encode()).hexdigest(),
-                }],
+                "requests": [
+                    {
+                        "request_key": "r0",
+                        "trajectory_id": None,
+                        "turn_index": None,
+                        "reasoning_mode": None,
+                        "context_tokens": 4608,
+                        "cached_tokens": 4096,
+                        "new_tokens": 512,
+                        "token_digest": hashlib.sha256(selector.encode()).hexdigest(),
+                    }
+                ],
                 "composition": "none",
                 "seed": inputs["seed"],
                 "batch_size": 1,
@@ -162,11 +167,13 @@ def canonical_v2_points() -> list[dict[str, Any]]:
                 ).hexdigest(),
                 "planned_chunks": planned_chunks,
             }
-            points.append({
-                "point_id": make_point_id(payload),
-                "comparison_id": make_comparison_id(payload),
-                "canonical_payload": payload,
-            })
+            points.append(
+                {
+                    "point_id": make_point_id(payload),
+                    "comparison_id": make_comparison_id(payload),
+                    "canonical_payload": payload,
+                }
+            )
     return points
 
 
@@ -338,6 +345,260 @@ V2_PREFIX_EVIDENCE_SCHEMA = _v2_schema(
         pa.field("hardware_validated", pa.bool_(), nullable=False),
     ]
 )
+
+
+def summarize_turn_samples(
+    raw_rows: list[dict[str, Any]], points: tuple[Any, ...]
+) -> list[dict[str, Any]]:
+    """Derive complete turn samples from passed schema-v2 chunk rows."""
+    points_by_id = {point.point_id: point for point in points}
+    terminal_point_ids = {
+        row["point_id"] for row in raw_rows if row["row_kind"] == "terminal"
+    }
+    grouped: dict[tuple[str, str, str, int], list[dict[str, Any]]] = {}
+    for row in raw_rows:
+        if row["point_id"] in terminal_point_ids:
+            continue
+        if row["row_kind"] != "chunk" or row["status"] != "passed":
+            raise ValueError("turn samples require passed chunk rows")
+        key = (row["run_id"], row["point_id"], row["phase"], row["ordinal"])
+        grouped.setdefault(key, []).append(row)
+
+    turns = []
+    for (run_id, point_id, phase, ordinal), chunks in sorted(grouped.items()):
+        point = points_by_id.get(point_id)
+        if point is None:
+            raise ValueError("raw chunk references an unknown point")
+        chunks.sort(key=lambda row: row["chunk_index"])
+        if [row["chunk_index"] for row in chunks] != list(
+            range(len(point.chunks))
+        ) or any(row["chunk_count"] != len(point.chunks) for row in chunks):
+            raise ValueError("turn samples require every planned chunk")
+        first = chunks[0]
+        totals = {
+            field: sum(row[field] for row in chunks) for field in _TURN_TOTAL_FIELDS
+        }
+        wall_time = totals["runner_wall_time_ms"]
+        runtime_modes = {row["runtime_mode"] for row in chunks}
+        if not runtime_modes <= V2_ENUMS["runtime_mode"]:
+            raise ValueError("turn samples require CUDA Graph runtime evidence")
+        turns.append(
+            {
+                "schema_version": V2_SCHEMA_VERSION,
+                "run_id": run_id,
+                "point_id": point_id,
+                "comparison_id": point.comparison_id,
+                "sample_id": f"{run_id}:{point_id}:{phase}:{ordinal}",
+                "role": "prefill",
+                "workload_family": point.workload_family,
+                "selector": point.selector,
+                "composition": point.composition,
+                "cache_condition": point.cache_condition,
+                "planner_digest": point.planner_digest,
+                "phase": phase,
+                "ordinal": ordinal,
+                "status": "passed",
+                "allocation_state": "allocated",
+                "chunk_count": len(chunks),
+                **totals,
+                "throughput_tokens_per_s": (
+                    totals["new_tokens"] * 1000 / wall_time if wall_time else 0.0
+                ),
+                "runtime_mode": (
+                    "PIECEWISE" if "PIECEWISE" in runtime_modes else "FULL"
+                ),
+            }
+        )
+        if any(
+            row["comparison_id"] != first["comparison_id"]
+            or row["planner_digest"] != first["planner_digest"]
+            for row in chunks
+        ):
+            raise ValueError("turn chunks do not share point metadata")
+    return turns
+
+
+def _distribution(values: list[float], threshold: float) -> dict[str, Any]:
+    if len(values) < 2:
+        raise ValueError("distribution requires at least two samples")
+    mean = statistics.fmean(values)
+    cv = statistics.pstdev(values) / mean if mean else 0.0
+    return {
+        "median": statistics.median(values),
+        "p90": statistics.quantiles(values, n=10, method="inclusive")[8],
+        "mean": mean,
+        "cv": cv,
+        "noisy": cv > threshold,
+    }
+
+
+def aggregate_turn_samples(
+    turn_rows: list[dict[str, Any]], noisy_cv_threshold: float
+) -> list[dict[str, Any]]:
+    """Aggregate exactly the ten steady passed turns for each point."""
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in turn_rows:
+        if row["phase"] == "steady" and row["status"] == "passed":
+            grouped.setdefault((row["run_id"], row["point_id"]), []).append(row)
+    aggregates = []
+    for (run_id, point_id), rows in sorted(grouped.items()):
+        if len(rows) != 10 or {row["ordinal"] for row in rows} != set(range(10)):
+            raise ValueError("aggregate requires ten steady turn samples")
+        wall = _distribution(
+            [row["runner_wall_time_ms"] for row in rows], noisy_cv_threshold
+        )
+        throughput = _distribution(
+            [row["throughput_tokens_per_s"] for row in rows],
+            noisy_cv_threshold,
+        )
+        first = rows[0]
+        aggregates.append(
+            {
+                "schema_version": V2_SCHEMA_VERSION,
+                "run_id": run_id,
+                "point_id": point_id,
+                "comparison_id": first["comparison_id"],
+                "role": "prefill",
+                "sample_count": len(rows),
+                "runner_wall_time_median_ms": wall["median"],
+                "runner_wall_time_p90_ms": wall["p90"],
+                "runner_wall_time_mean_ms": wall["mean"],
+                "runner_wall_time_cv": wall["cv"],
+                "throughput_median_tokens_per_s": throughput["median"],
+                "throughput_p90_tokens_per_s": throughput["p90"],
+                "throughput_mean_tokens_per_s": throughput["mean"],
+                "throughput_cv": throughput["cv"],
+                "noisy": wall["noisy"] or throughput["noisy"],
+            }
+        )
+    return aggregates
+
+
+def compare_conditions(
+    aggregate_rows: list[dict[str, Any]],
+    points: tuple[Any, ...],
+    terminal_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Pair hit/recompute aggregates or require terminal OOC proof."""
+    aggregates = {row["point_id"]: row for row in aggregate_rows}
+    terminals = {
+        row["point_id"]
+        for row in terminal_rows
+        if row["status"] == "out_of_capacity"
+        and row["allocation_state"] == "out_of_capacity"
+    }
+    pairs: dict[str, dict[str, Any]] = {}
+    for point in points:
+        pair = pairs.setdefault(point.comparison_id, {})
+        if point.cache_condition in pair:
+            raise ValueError("comparison pair contains a duplicate condition")
+        pair[point.cache_condition] = point
+    comparisons = []
+    for comparison_id, pair in sorted(pairs.items()):
+        if set(pair) != {"prefix_hit", "full_recompute"}:
+            raise ValueError("comparison pair is incomplete")
+        hit = pair["prefix_hit"]
+        recompute = pair["full_recompute"]
+        hit_row = aggregates.get(hit.point_id)
+        recompute_row = aggregates.get(recompute.point_id)
+        if hit_row is None or recompute_row is None:
+            if hit.point_id in terminals or recompute.point_id in terminals:
+                continue
+            raise ValueError("comparison aggregate is missing without OOC proof")
+        if hit_row["run_id"] != recompute_row["run_id"]:
+            raise ValueError("comparison aggregates have different run IDs")
+        hit_median = hit_row["runner_wall_time_median_ms"]
+        recompute_median = recompute_row["runner_wall_time_median_ms"]
+        comparisons.append(
+            {
+                "schema_version": V2_SCHEMA_VERSION,
+                "run_id": hit_row["run_id"],
+                "comparison_id": comparison_id,
+                "prefix_hit_point_id": hit.point_id,
+                "full_recompute_point_id": recompute.point_id,
+                "prefix_hit_median_ms": hit_median,
+                "full_recompute_median_ms": recompute_median,
+                "recompute_penalty_ms": recompute_median - hit_median,
+                "recompute_penalty_ratio": recompute_median / hit_median,
+            }
+        )
+    return comparisons
+
+
+def _point_plans_from_config(config: dict[str, Any]) -> tuple[Any, ...]:
+    points = []
+    for record in config["points"]:
+        payload = record.get("canonical_payload", record.get("payload"))
+        if not isinstance(payload, dict):
+            raise ValueError("config point is missing its canonical payload")
+        chunks = tuple(
+            SimpleNamespace(
+                chunk_index=index,
+                scheduled_tokens_by_request={
+                    item["request_key"]: item["scheduled_tokens"] for item in vector
+                },
+            )
+            for index, vector in enumerate(_planned_chunks(payload))
+        )
+        points.append(
+            SimpleNamespace(
+                point_id=record["point_id"],
+                comparison_id=record["comparison_id"],
+                workload_family=payload["workload_family"],
+                selector=payload["selector"],
+                composition=payload["composition"],
+                cache_condition=payload["cache_condition"],
+                planner_digest=payload["planner_digest"],
+                chunks=chunks,
+            )
+        )
+    return tuple(points)
+
+
+def write_v2_result_artifacts(
+    config: dict[str, Any],
+    raw_rows: list[dict[str, Any]],
+    prefix_evidence_rows: list[dict[str, Any]],
+    provenance: dict[str, Any],
+    output_dir: Path,
+) -> None:
+    """Derive, validate, and atomically publish schema-v2 artifacts."""
+    if output_dir.exists():
+        raise FileExistsError(f"result directory already exists: {output_dir}")
+    points = _point_plans_from_config(config)
+    turn_rows = summarize_turn_samples(raw_rows, points)
+    aggregate_rows = aggregate_turn_samples(
+        turn_rows, config.get("profile", {}).get("noisy_cv_threshold", 0.05)
+    )
+    terminal_rows = [row for row in raw_rows if row["row_kind"] == "terminal"]
+    comparison_rows = compare_conditions(aggregate_rows, points, terminal_rows)
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        dir=output_dir.parent, prefix=f".{output_dir.name}.staging-"
+    ) as temporary:
+        staging = Path(temporary) / "result"
+        staging.mkdir()
+        _write_json(staging / "run-config.json", config)
+        _write_json(staging / "provenance.json", provenance)
+        for name, rows, schema in (
+            ("raw_samples.parquet", raw_rows, V2_RAW_SAMPLE_SCHEMA),
+            ("turn_samples.parquet", turn_rows, V2_TURN_SAMPLE_SCHEMA),
+            ("aggregates.parquet", aggregate_rows, V2_AGGREGATE_SCHEMA),
+            ("comparisons.parquet", comparison_rows, V2_COMPARISON_SCHEMA),
+            (
+                "prefix_evidence.parquet",
+                prefix_evidence_rows,
+                V2_PREFIX_EVIDENCE_SCHEMA,
+            ),
+        ):
+            pq.write_table(pa.Table.from_pylist(rows, schema=schema), staging / name)
+        (staging / "result.md").write_text(
+            "# DS4 P-side profile result\n\n"
+            f"Run: `{config['run_id']}`\n\n"
+            f"Points: {len(config['expected_manifest'])}\n"
+        )
+        _validate_result_dir(staging)
+        staging.replace(output_dir)
 
 
 def _load_replay(config: dict[str, Any]) -> dict[str, Any]:
@@ -782,9 +1043,8 @@ def _manifest_points(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
         comparison_id = point.get("comparison_id", payload.get("comparison_id"))
         if not isinstance(point_id, str) or point_id != make_point_id(payload):
             raise ValueError("manifest point_id does not match canonical payload")
-        if (
-            not isinstance(comparison_id, str)
-            or comparison_id != make_comparison_id(payload)
+        if not isinstance(comparison_id, str) or comparison_id != make_comparison_id(
+            payload
         ):
             raise ValueError("manifest comparison_id does not match canonical payload")
         if point_id in resolved:
@@ -1003,7 +1263,7 @@ def _validate_v2_turn_totals(
             ):
                 raise ValueError("turn sample does not match raw chunk totals")
         expected_throughput = (
-            turn["scheduled_tokens"] * 1000 / turn["runner_wall_time_ms"]
+            turn["new_tokens"] * 1000 / turn["runner_wall_time_ms"]
             if turn["runner_wall_time_ms"]
             else 0.0
         )
@@ -1012,8 +1272,10 @@ def _validate_v2_turn_totals(
 
 
 def _validate_v2_statistics(
-    turn_rows: list[dict[str, Any]], aggregate_rows: list[dict[str, Any]],
-    expected_points: dict[str, dict[str, Any]], config: dict[str, Any]
+    turn_rows: list[dict[str, Any]],
+    aggregate_rows: list[dict[str, Any]],
+    expected_points: dict[str, dict[str, Any]],
+    config: dict[str, Any],
 ) -> None:
     aggregate_by_point = {row["point_id"]: row for row in aggregate_rows}
     if len(aggregate_by_point) != len(aggregate_rows):
@@ -1021,7 +1283,8 @@ def _validate_v2_statistics(
     threshold = config.get("profile", {}).get("noisy_cv_threshold", 0.05)
     for point_id in expected_points:
         steady = [
-            row for row in turn_rows
+            row
+            for row in turn_rows
             if row["point_id"] == point_id and row["phase"] == "steady"
         ]
         aggregate = aggregate_by_point.get(point_id)
@@ -1054,19 +1317,29 @@ def _validate_v2_statistics(
                 else 0.0
             ),
         }
-        if aggregate["sample_count"] != expected["sample_count"] or any(
-            not _same_float(aggregate[field], value)
-            for field, value in expected.items()
-            if field != "sample_count"
-        ) or aggregate["noisy"] != (expected["runner_wall_time_cv"] > threshold):
+        expected_noisy = (
+            expected["runner_wall_time_cv"] > threshold
+            or expected["throughput_cv"] > threshold
+        )
+        if (
+            aggregate["sample_count"] != expected["sample_count"]
+            or any(
+                not _same_float(aggregate[field], value)
+                for field, value in expected.items()
+                if field != "sample_count"
+            )
+            or aggregate["noisy"] != expected_noisy
+        ):
             raise ValueError("aggregate statistics do not match turn samples")
     if set(aggregate_by_point) - set(expected_points):
         raise ValueError("aggregate references an unknown point")
 
 
 def _validate_v2_comparisons(
-    rows: list[dict[str, Any]], aggregate_rows: list[dict[str, Any]],
-    outcomes: dict[str, str], expected_points: dict[str, dict[str, Any]],
+    rows: list[dict[str, Any]],
+    aggregate_rows: list[dict[str, Any]],
+    outcomes: dict[str, str],
+    expected_points: dict[str, dict[str, Any]],
 ) -> None:
     aggregate_by_point = {row["point_id"]: row for row in aggregate_rows}
     pairs: dict[str, dict[str, str]] = {}
@@ -1289,11 +1562,43 @@ def _validate_v2_result_dir(result_dir: Path, config: dict[str, Any]) -> None:
             ):
                 raise ValueError("out-of-capacity prefix contains a non-passed chunk")
             if any(
-                row["planned_scheduled_tokens_by_request"]
-                != chunks[row["chunk_index"]]
+                row["planned_scheduled_tokens_by_request"] != chunks[row["chunk_index"]]
                 for row in raw
             ):
                 raise ValueError("raw chunk does not match the planned vector")
+            expected_vector = chunks[terminal["chunk_index"]]
+            if terminal[
+                "actual_scheduled_tokens_by_request"
+            ] != expected_vector or terminal["scheduled_tokens"] != sum(
+                item["scheduled_tokens"] for item in expected_vector
+            ):
+                raise ValueError("terminal row does not match the planned vector")
+            if (
+                terminal["requested_kv_blocks"] <= terminal["allocatable_kv_blocks"]
+                or terminal["allocated_kv_blocks"] > terminal["allocatable_kv_blocks"]
+            ):
+                raise ValueError("terminal row does not prove allocator pressure")
+            if not (
+                terminal["cache_reset_completed"] and terminal["cache_reset_empty"]
+            ):
+                raise ValueError("terminal row does not prove a clean reset")
+            if (
+                terminal["runner_wall_time_ms"] is not None
+                or terminal["cuda_model_time_ms"] is not None
+                or terminal["runtime_mode"] is not None
+            ):
+                raise ValueError("terminal row must not contain GPU timing")
+            if terminal["preempted_request_ids"] or terminal["unrelated_request_ids"]:
+                raise ValueError("terminal row is not an isolated planned batch")
+            block_bytes = terminal["kv_block_bytes"]
+            if (
+                block_bytes <= 0
+                or terminal["requested_kv_bytes"]
+                != terminal["requested_kv_blocks"] * block_bytes
+                or terminal["allocated_kv_bytes"]
+                != terminal["allocated_kv_blocks"] * block_bytes
+            ):
+                raise ValueError("terminal row has inconsistent KV byte accounting")
             if turn_by_point.get(point_id) or any(
                 row["point_id"] == point_id for row in aggregate_rows
             ):

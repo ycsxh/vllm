@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from benchmarks.ds4_profile.profile_spine import (
+    V2_SCHEMA_VERSION,
     canonical_payload_json,
     make_comparison_id,
     make_point_id,
@@ -55,6 +56,118 @@ class PPointPlan:
     requests: tuple[PRequestPlan, ...]
     chunks: tuple[PChunkPlan, ...]
     canonical_payload: dict[str, Any]
+
+
+def _request_chunk_accounting(
+    point: PPointPlan, chunk: PChunkPlan
+) -> tuple[int, int, int, int]:
+    context_tokens = 0
+    cached_tokens = 0
+    new_tokens = 0
+    recomputed_tokens = 0
+    requests = {request.request_key: request for request in point.requests}
+    for request_key, scheduled_tokens in chunk.scheduled_tokens_by_request.items():
+        request = requests[request_key]
+        prior_tokens = sum(
+            prior.scheduled_tokens_by_request.get(request_key, 0)
+            for prior in point.chunks[: chunk.chunk_index]
+        )
+        if point.cache_condition == "prefix_hit":
+            cached = request.cached_tokens if prior_tokens == 0 else 0
+            context_tokens += cached + scheduled_tokens
+            cached_tokens += cached
+            new_tokens += scheduled_tokens
+            continue
+        prefix_tokens = request.context_tokens - request.new_tokens
+        recomputed = max(
+            0,
+            min(prior_tokens + scheduled_tokens, prefix_tokens) - prior_tokens,
+        )
+        context_tokens += scheduled_tokens
+        recomputed_tokens += recomputed
+        new_tokens += scheduled_tokens - recomputed
+    return context_tokens, cached_tokens, new_tokens, recomputed_tokens
+
+
+def _request_token_vector(tokens_by_request: dict[str, int]) -> list[dict[str, Any]]:
+    return [
+        {"request_key": request_key, "scheduled_tokens": scheduled_tokens}
+        for request_key, scheduled_tokens in tokens_by_request.items()
+    ]
+
+
+def make_prefill_chunk_row(
+    *,
+    run_id: str,
+    point: PPointPlan,
+    phase: Literal["warmup", "steady"],
+    ordinal: int,
+    chunk: PChunkPlan,
+    runner_wall_time_ms: float | None,
+    cuda_model_time_ms: float | None,
+    allocation: dict[str, Any],
+    status: str,
+    error: str | None,
+) -> dict[str, Any]:
+    """Build one schema-v2 row from a planned Scheduler chunk."""
+    if (
+        chunk.chunk_index >= len(point.chunks)
+        or point.chunks[chunk.chunk_index] != chunk
+    ):
+        raise ValueError("chunk does not belong to the point plan")
+    actual_tokens = allocation["actual_scheduled_tokens_by_request"]
+    context, cached, new, recomputed = _request_chunk_accounting(point, chunk)
+    kv_block_bytes = allocation["kv_block_bytes"]
+    requested_blocks = allocation["requested_blocks"]
+    allocated_blocks = allocation["allocated_blocks"]
+    return {
+        "schema_version": V2_SCHEMA_VERSION,
+        "run_id": run_id,
+        "point_id": point.point_id,
+        "comparison_id": point.comparison_id,
+        "sample_id": (
+            f"{run_id}:{point.point_id}:{phase}:{ordinal}:{chunk.chunk_index}"
+        ),
+        "role": "prefill",
+        "workload_family": point.workload_family,
+        "selector": point.selector,
+        "composition": point.composition,
+        "cache_condition": point.cache_condition,
+        "planner_digest": point.planner_digest,
+        "phase": phase,
+        "ordinal": ordinal,
+        "chunk_index": chunk.chunk_index,
+        "chunk_count": len(point.chunks),
+        "row_kind": "chunk" if status == "passed" else "terminal",
+        "status": status,
+        "allocation_state": allocation["state"],
+        "planned_scheduled_tokens_by_request": _request_token_vector(
+            chunk.scheduled_tokens_by_request
+        ),
+        "actual_scheduled_tokens_by_request": _request_token_vector(actual_tokens),
+        "preempted_request_ids": list(allocation["preempted_request_ids"]),
+        "unrelated_request_ids": list(allocation["unrelated_request_ids"]),
+        "cache_epoch": allocation["cache_epoch"],
+        "cache_reset_completed": allocation["cache_reset_completed"],
+        "cache_reset_empty": allocation["cache_reset_empty"],
+        "requested_kv_blocks": requested_blocks,
+        "allocatable_kv_blocks": allocation["allocatable_blocks"],
+        "allocated_kv_blocks": allocated_blocks,
+        "kv_block_bytes": kv_block_bytes,
+        "requested_kv_bytes": requested_blocks * kv_block_bytes,
+        "allocated_kv_bytes": allocated_blocks * kv_block_bytes,
+        "scheduled_tokens": sum(actual_tokens.values()),
+        "context_tokens": context,
+        "cached_tokens": cached,
+        "new_tokens": new,
+        "recomputed_tokens": recomputed,
+        "lookup_time_ms": allocation["lookup_time_ms"],
+        "allocation_time_ms": allocation["allocation_time_ms"],
+        "runner_wall_time_ms": runner_wall_time_ms,
+        "cuda_model_time_ms": cuda_model_time_ms,
+        "runtime_mode": allocation["runtime_mode"],
+        "error": error,
+    }
 
 
 def make_planner_digest(
@@ -369,8 +482,7 @@ def _validate_inputs(
         raise ValueError("token_budget must be positive")
     if homogeneous_prefix_tokens != CANONICAL_HOMOGENEOUS_PREFIX_TOKENS:
         raise ValueError(
-            "homogeneous prefix must be "
-            f"{CANONICAL_HOMOGENEOUS_PREFIX_TOKENS} tokens"
+            f"homogeneous prefix must be {CANONICAL_HOMOGENEOUS_PREFIX_TOKENS} tokens"
         )
     if homogeneous_prefix_tokens % CANONICAL_BLOCK_SIZE:
         raise ValueError("homogeneous prefix must be divisible by 16")
@@ -388,9 +500,7 @@ def build_prefill_points(
     seed: int,
 ) -> tuple[PPointPlan, ...]:
     """Expand pinned workload artifacts into paired executable prefill points."""
-    _validate_inputs(
-        workload_plan, block_size, token_budget, homogeneous_prefix_tokens
-    )
+    _validate_inputs(workload_plan, block_size, token_budget, homogeneous_prefix_tokens)
     planner_digest = make_planner_digest(
         workload_plan,
         rendered_turns,

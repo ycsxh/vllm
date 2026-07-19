@@ -9,6 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -19,19 +20,21 @@ import torch
 def test_v2_point_id_covers_every_workload_dimension() -> None:
     from benchmarks.ds4_profile import profile_spine
 
-    payload = {
+    payload: dict[str, Any] = {
         "workload_family": "homogeneous",
         "selector": "b2-t512",
-        "requests": [{
-            "request_key": "r0",
-            "trajectory_id": None,
-            "turn_index": None,
-            "reasoning_mode": None,
-            "context_tokens": 4608,
-            "cached_tokens": 4096,
-            "new_tokens": 512,
-            "token_digest": "a" * 64,
-        }],
+        "requests": [
+            {
+                "request_key": "r0",
+                "trajectory_id": None,
+                "turn_index": None,
+                "reasoning_mode": None,
+                "context_tokens": 4608,
+                "cached_tokens": 4096,
+                "new_tokens": 512,
+                "token_digest": "a" * 64,
+            }
+        ],
         "composition": "none",
         "seed": 20260715,
         "batch_size": 1,
@@ -41,10 +44,12 @@ def test_v2_point_id_covers_every_workload_dimension() -> None:
         "homogeneous_prefix_tokens": 4096,
         "capacity_target": "native",
         "planner_digest": "b" * 64,
-        "planned_chunks": [{
-            "chunk_index": 0,
-            "scheduled_tokens_by_request": [["r0", 512]],
-        }],
+        "planned_chunks": [
+            {
+                "chunk_index": 0,
+                "scheduled_tokens_by_request": [["r0", 512]],
+            }
+        ],
     }
     original = profile_spine.make_point_id(payload)
     changed = copy.deepcopy(payload)
@@ -367,9 +372,7 @@ def test_v2_validator_reconciles_turn_samples_with_raw_chunks(tmp_path: Path) ->
     turns = pq.read_table(turn_path)
     turn_rows = turns.to_pylist()
     target = next(
-        row
-        for row in turn_rows
-        if row["phase"] == "steady" and row["ordinal"] == 0
+        row for row in turn_rows if row["phase"] == "steady" and row["ordinal"] == 0
     )
     target["runner_wall_time_ms"] = 10.25
     target["cuda_model_time_ms"] = 10.25
@@ -518,9 +521,7 @@ def _filter_v2_result_to_selectors(output_dir: Path, selectors: set[str]) -> Non
             pa.Table.from_pylist(rows, schema=table.schema), output_dir / name
         )
     table = pq.read_table(output_dir / "comparisons.parquet")
-    rows = [
-        row for row in table.to_pylist() if row["comparison_id"] in comparison_ids
-    ]
+    rows = [row for row in table.to_pylist() if row["comparison_id"] in comparison_ids]
     pq.write_table(
         pa.Table.from_pylist(rows, schema=table.schema),
         output_dir / "comparisons.parquet",
@@ -584,6 +585,15 @@ def _make_v2_point_terminal_ooc(output_dir: Path) -> str:
             row["row_kind"] = "terminal"
             row["status"] = "out_of_capacity"
             row["allocation_state"] = "out_of_capacity"
+            row["requested_kv_blocks"] = 2
+            row["allocatable_kv_blocks"] = 1
+            row["allocated_kv_blocks"] = 0
+            row["requested_kv_bytes"] = 2
+            row["allocated_kv_bytes"] = 0
+            row["runner_wall_time_ms"] = None
+            row["cuda_model_time_ms"] = None
+            row["runtime_mode"] = None
+            row["error"] = "insufficient KV blocks"
             rows.append(row)
     pq.write_table(pa.Table.from_pylist(rows, schema=raw.schema), raw_path)
     for name in (
@@ -597,9 +607,7 @@ def _make_v2_point_terminal_ooc(output_dir: Path) -> str:
             pa.Table.from_pylist(rows, schema=table.schema), output_dir / name
         )
     table = pq.read_table(output_dir / "comparisons.parquet")
-    rows = [
-        row for row in table.to_pylist() if row["comparison_id"] != comparison_id
-    ]
+    rows = [row for row in table.to_pylist() if row["comparison_id"] != comparison_id]
     pq.write_table(
         pa.Table.from_pylist(rows, schema=table.schema),
         output_dir / "comparisons.parquet",
@@ -648,9 +656,7 @@ def test_v2_validator_hardens_comparison_and_ooc_contracts(tmp_path: Path) -> No
     comparisons = pq.read_table(ooc_dir / "comparisons.parquet")
     config = json.loads((ooc_dir / "run-config.json").read_text())
     pair = [
-        point
-        for point in config["points"]
-        if point["comparison_id"] == comparison_id
+        point for point in config["points"] if point["comparison_id"] == comparison_id
     ]
     rows = comparisons.to_pylist()
     rows.append(
@@ -702,6 +708,71 @@ def test_v2_validator_rejects_ooc_coordinate_gaps_and_later_rows(
     pq.write_table(pa.Table.from_pylist(rows, schema=raw.schema), raw_path)
     with pytest.raises(ValueError, match="coordinate prefix"):
         profile_spine._validate_result_dir(later_dir)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ({"requested_kv_blocks": 1}, "allocator pressure"),
+        ({"cache_reset_empty": False}, "clean reset"),
+        ({"runner_wall_time_ms": 1.0}, "GPU timing"),
+        (
+            {
+                "actual_scheduled_tokens_by_request": [
+                    {"request_key": "r0", "scheduled_tokens": 511}
+                ]
+            },
+            "planned vector",
+        ),
+    ),
+)
+def test_v2_validator_requires_fail_closed_ooc_evidence(
+    tmp_path: Path, mutation: dict[str, object], message: str
+) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    output_dir = _write_v2_result(tmp_path)
+    _make_v2_point_terminal_ooc(output_dir)
+    raw_path = output_dir / "raw_samples.parquet"
+    table = pq.read_table(raw_path)
+    rows = table.to_pylist()
+    terminal = next(row for row in rows if row["row_kind"] == "terminal")
+    terminal.update(mutation)
+    pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), raw_path)
+
+    with pytest.raises(ValueError, match=message):
+        profile_spine._validate_result_dir(output_dir)
+
+
+def test_v2_writer_derives_and_atomically_validates_artifacts(
+    tmp_path: Path,
+) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    source = _write_v2_result(tmp_path / "source")
+    config = json.loads((source / "run-config.json").read_text())
+    raw_rows = pq.read_table(source / "raw_samples.parquet").to_pylist()
+    evidence_rows = pq.read_table(source / "prefix_evidence.parquet").to_pylist()
+    provenance = json.loads((source / "provenance.json").read_text())
+    output = tmp_path / "assembled"
+
+    profile_spine.write_v2_result_artifacts(
+        config, raw_rows, evidence_rows, provenance, output
+    )
+
+    profile_spine._validate_result_dir(output)
+    assert pq.read_table(output / "turn_samples.parquet").num_rows == 68 * 13
+    assert pq.read_table(output / "aggregates.parquet").num_rows == 68
+    assert pq.read_table(output / "comparisons.parquet").num_rows == 34
+
+    invalid = copy.deepcopy(raw_rows)
+    invalid.pop()
+    failed_output = tmp_path / "failed-assembly"
+    with pytest.raises(ValueError, match="ten steady"):
+        profile_spine.write_v2_result_artifacts(
+            config, invalid, evidence_rows, provenance, failed_output
+        )
+    assert not failed_output.exists()
 
 
 def _fake_gpu_worker(
