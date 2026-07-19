@@ -415,20 +415,22 @@ class VllmSchedulerCacheAdapter:
             prime_id = f"prime:{phase}:{ordinal}:{request.request_key}"
             prefix = list(request.prompt_token_ids[: request.cached_tokens])
             self.scheduler.add_request(self.request_factory(prime_id, prefix))
-            remaining = request.cached_tokens
+            primed_tokens = 0
             prime_outputs = []
             sent_table: tuple[tuple[int, ...], ...] = ()
             measured: tuple[tuple[int, ...], ...] = ()
             worker_groups: tuple[WorkerKvTensorGroupEvidence, ...] = ()
             synchronized = self.synchronize_gpu is not None
             chunk_index = 0
-            while remaining:
-                budget = min(4096, remaining)
+            while primed_tokens < request.cached_tokens:
+                budget = min(4096, request.cached_tokens - primed_tokens)
                 self.scheduler.max_num_scheduled_tokens = budget
                 self.scheduler.scheduler_config.long_prefill_token_threshold = budget
                 output = self.scheduler.schedule()
                 scheduled, request_data = self._scheduled_vectors(output)
-                if scheduled != {prime_id: budget}:
+                if set(scheduled) != {prime_id} or not (
+                    0 < scheduled[prime_id] <= budget
+                ):
                     raise RuntimeError("prefix prime SchedulerOutput was partial")
                 prime_data = request_data.get(prime_id)
                 if prime_data is None:
@@ -454,8 +456,13 @@ class VllmSchedulerCacheAdapter:
                         gpu_synchronized=synchronized,
                     )
                 )
+                completed_tokens = (
+                    self._computed_tokens(prime_data) + scheduled[prime_id]
+                )
+                if not primed_tokens < completed_tokens <= request.cached_tokens:
+                    raise RuntimeError("prefix prime made invalid token progress")
                 self.scheduler.update_from_output(output, model_output)
-                remaining -= budget
+                primed_tokens = completed_tokens
                 chunk_index += 1
             intended_blocks = request.cached_tokens // CANONICAL_BLOCK_SIZE
             measured = tuple(group[:intended_blocks] for group in measured)
