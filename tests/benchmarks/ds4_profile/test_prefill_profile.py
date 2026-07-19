@@ -687,6 +687,8 @@ class _OrchestrationAdapter:
 
     def schedule_chunk(self, point, chunk):
         self.last_chunk_index = chunk.chunk_index
+        if self.outcome == "late_schedule_error" and chunk.chunk_index == 1:
+            raise RuntimeError("second schedule failed")
         expected = dict(chunk.scheduled_tokens_by_request)
         actual = dict(expected)
         preempted: tuple[str, ...] = ()
@@ -857,6 +859,43 @@ def test_later_invalid_output_preserves_completed_and_failed_coordinates() -> No
     assert [row["chunk_index"] for row in result["rows"]] == [0, 1]
     assert len(result["prefix_evidence"]) == 1
     assert events.count("timed:0") == 1
+
+
+def test_prime_failure_preserves_earlier_completed_request_evidence() -> None:
+    events: list[str] = []
+    adapter: Any = _OrchestrationAdapter(events)
+    adapter.prime = lambda *_args: (_ for _ in ()).throw(
+        RuntimeError("second prime failed")
+    )
+    adapter.completed_prime_evidence = lambda: (_prime_evidence(),)
+
+    result = prefill_profile.run_point_repetition(
+        _adapter_point(),
+        phase="warmup",
+        ordinal=0,
+        adapter=adapter,
+        execute_timed=_timed_executor(events),
+    )
+
+    assert result["status"] == "failed"
+    assert len(result["prefix_evidence"]) == 1
+    assert not any(event.startswith("timed:") for event in events)
+
+
+def test_later_schedule_failure_does_not_reuse_prior_chunk_evidence() -> None:
+    events: list[str] = []
+    result = prefill_profile.run_point_repetition(
+        _artifact_point("prefix_hit"),
+        phase="steady",
+        ordinal=0,
+        adapter=_OrchestrationAdapter(events, "late_schedule_error"),
+        execute_timed=_timed_executor(events),
+    )
+
+    failed = result["rows"][-1]
+    assert failed["chunk_index"] == 1
+    assert failed["actual_scheduled_tokens_by_request"] == []
+    assert failed["requested_kv_blocks"] == 0
 
 
 def test_reset_flushes_pending_finished_ids_without_live_requests() -> None:

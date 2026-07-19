@@ -1337,7 +1337,6 @@ def _validate_v2_evidence(
                 raise ValueError("prefix evidence has an invalid physical block ID")
 
     expected: set[tuple[str, str, int, str, str]] = set()
-    allowed_ooc: set[tuple[str, str, int, str, str]] = set()
     terminal_repetition = {
         row["point_id"]: (row["phase"], row["ordinal"])
         for row in raw_rows
@@ -1371,8 +1370,8 @@ def _validate_v2_evidence(
                         terminal_ordinal,
                     )
                     if coordinate <= terminal_coordinate:
-                        allowed_ooc.update(keys)
-    if not expected <= observed or not observed <= expected | allowed_ooc:
+                        expected.update(keys)
+    if observed != expected:
         raise ValueError("prefix evidence does not match completed hit repetitions")
 
 

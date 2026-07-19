@@ -489,6 +489,10 @@ class VllmSchedulerCacheAdapter:
         """Apply one completed worker step to Scheduler state."""
         self.scheduler.update_from_output(scheduler_output, model_output)
 
+    def completed_prime_evidence(self) -> tuple[PrefixPrimeEvidence, ...]:
+        """Return every request prime completed in the current epoch."""
+        return tuple(self._prime_evidence.values())
+
     def _inspect_worker_groups(
         self,
         block_ids_by_group: tuple[tuple[int, ...], ...],
@@ -970,12 +974,19 @@ def _run_point_repetition_impl(
         (1 << 63) - 1
     )
     adapter.reset_epoch()
-    prime_evidence = adapter.prime(point, phase, ordinal)
-    completed_evidence.extend(prime_evidence)
+    prime_evidence = ()
+    try:
+        prime_evidence = adapter.prime(point, phase, ordinal)
+    finally:
+        snapshot = getattr(
+            adapter, "completed_prime_evidence", lambda: prime_evidence
+        )()
+        completed_evidence.extend(snapshot)
     adapter.add_measurement_requests(point)
     rows = completed_rows
     for chunk in point.chunks:
         failure_coordinate[0] = chunk
+        failure_scheduled[0] = None
         scheduled = adapter.schedule_chunk(point, chunk)
         failure_scheduled[0] = scheduled
         out_of_capacity = adapter.classify_out_of_capacity(point, chunk, scheduled)

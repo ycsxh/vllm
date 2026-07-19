@@ -598,7 +598,7 @@ def test_v2_validator_uses_frozen_manifest_for_full_and_smoke(tmp_path: Path) ->
 
 
 def _make_v2_point_terminal_ooc(
-    output_dir: Path, *, preserve_prefix_evidence: bool = False
+    output_dir: Path, *, preserve_prefix_evidence: bool = True
 ) -> str:
     config = json.loads((output_dir / "run-config.json").read_text())
     point = config["points"][0]
@@ -665,6 +665,11 @@ def test_v2_validator_preserves_completed_prefix_evidence_for_ooc(
     _make_v2_point_terminal_ooc(output_dir, preserve_prefix_evidence=True)
 
     profile_spine._validate_result_dir(output_dir)
+
+    missing_dir = _write_v2_result(tmp_path / "ooc-missing-prefix-evidence")
+    _make_v2_point_terminal_ooc(missing_dir, preserve_prefix_evidence=False)
+    with pytest.raises(ValueError, match="prefix evidence"):
+        profile_spine._validate_result_dir(missing_dir)
 
 
 def test_v2_validator_hardens_comparison_and_ooc_contracts(tmp_path: Path) -> None:
