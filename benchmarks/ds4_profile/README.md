@@ -168,3 +168,28 @@ Validate an existing result without loading a model:
 .venv/bin/python -m benchmarks.ds4_profile.profile_spine validate \
   --result-dir /path/to/profile-spine-result
 ```
+
+## Replay Ticket 07 KV cache metadata
+
+Ticket 07 replays one complete DS4 prompt sequence through the real CPU-side
+`KVCacheManager` metadata path. It hashes prompt token IDs only. It does not
+read decode tokens, allocate KV tensors, use a GPU, establish HBM residency,
+or measure Prefill/Decode latency. Local development runs focused CPU
+contracts; the full planner and container artifact acceptance run on the
+school server.
+
+The replay uses the real `Request` → `KVCacheManager.get_computed_blocks` →
+`allocate_slots` → `take_events` → `free` path. Native `BlockRemoved` events
+are the eviction authority; compulsory, capacity, prefix-mismatch, and
+manager-forced-recompute outcomes remain distinct. A successful run is only
+**metadata-only validated** and must say **GPU/HBM validated: no**.
+
+See the [Ticket 07 container runbook](container/README.md#ticket-07-cpu-metadata-replay)
+for the school-server commands and [the current handoff](TICKET_07_HANDOFF.md)
+for the exact accepted and outstanding evidence.
+
+The current full-data planner failed closed: all 20 complete trajectories were
+admitted at their minimum usable capacity, but none emitted a native
+`BlockRemoved` event. The selection therefore remains `unselected`; Ticket 07
+is not metadata-only validated and is not mergeable without an approved design
+revision. See the handoff for the retained planning record and checksums.

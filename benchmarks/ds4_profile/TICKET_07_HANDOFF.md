@@ -1,77 +1,146 @@
-# Ticket 07 WIP Handoff
+# Ticket 07 CPU Metadata Replay Handoff
 
 ## Status
 
-Ticket 07 is an incomplete work-in-progress for continuation on the school
-server. The branch is `codex/ticket-07-kv-cache-manager-replay`, based on the
-Ticket 04 merge `65de0de0ab4a5799284e97b823e673d5ac73ef05`.
+Ticket 07 is **blocked and incomplete** on branch
+`codex/ticket-07-kv-cache-manager-replay`. Keep personal-fork issue #4 open.
+Do not create a PR or merge this branch.
 
-The last implementation commit before this handoff is
-`a0dd30f493`. Use the final pushed branch head named by the external delivery
-handoff, because this document is committed after that implementation commit.
+The deterministic full-data planner failed closed because none of the 20
+complete pilot trajectories produces native eviction pressure at its minimum
+usable capacity. The checked-in selection remains `unselected`. Pinning a
+trajectory, increasing capacity, shortening a prompt, skipping a turn, or
+claiming replay acceptance would violate the approved design.
 
-This branch is `remote_pending`. It is not ready for a PR or merge.
+- Metadata-only validated: **no** — full replay acceptance was not reached.
+- GPU/HBM validated: **no**.
 
-## Completed Locally
+Ticket 07 read prompt metadata and prompt token IDs only. It did not read
+completion/decode token IDs, allocate KV tensors, load a model, execute
+Prefill or Decode, use a GPU, or establish HBM residency.
 
-- The approved design and eight-task implementation plan are committed under
-  `docs/superpowers/`.
-- Task 1 reconstructs complete prompt-only sessions and reconciles the exact
-  Ticket 02 scalar key set without reading completion/decode token columns.
-- Task 2 builds the real metadata-only `Request` and `KVCacheManager` seam,
-  deterministic hashes, null-block accounting, and scoped observation of the
-  real BlockPool touch/allocate/evict/free operations.
-- Task 3 implements serial replay, miss attribution, manager-forced recompute,
-  native `BlockRemoved` eviction evidence, occupancy, per-operation timing,
-  partial OOC evidence, and future-reuse labels.
-- Independent reviews passed for Tasks 1 and 2 and the final Task 3 fix slice.
+## Source state
 
-Observed local checks include Ruff, `py_compile`, AST/interface checks,
-`git diff --check`, and direct prompt/replay harnesses. The shared local
-`.venv` has no `torch`, so pytest failed during collection; real manager tests,
-container execution, and full replay remain unverified.
+The coherent implementation checkpoint is
+`06b0ebce3` (`[Benchmarks] Checkpoint DS4 replay artifacts`). The planning
+diagnostic ran from base commit `e3aa14e29` with the later checkpoint changes
+present as a dirty worktree; it is diagnostic failure evidence, not accepted
+clean-image evidence. The documentation commit after this handoff does not
+retroactively make that run clean.
 
-Commits used `--no-verify` only after pre-commit attempted to bootstrap
-actionlint through unavailable network access. Re-run repository hooks in the
-server environment before delivery.
+Completed checkpoint work includes:
 
-## Remaining Work
+- the real `Request` → `KVCacheManager.get_computed_blocks` →
+  `allocate_slots` → `take_events` → `free` seam;
+- native `BlockRemoved` eviction authority, separate compulsory/capacity/
+  prefix-mismatch/manager-forced-recompute outcomes, physical duplicate-hash
+  occupancy, and ordered observer/native eviction pairing;
+- deterministic candidate capacity and stable selection ordering;
+- hashes for the manifest, Ticket 01/02 data and provenance, and every regular
+  tokenizer file;
+- content-addressed ordered turn manifests and pinned-selection verification;
+  and
+- a partial Task 5 Parquet writer/validator checkpoint with focused tamper
+  tests.
 
-Continue from Task 4 in
-`docs/superpowers/plans/2026-07-19-ds4-ticket-07-kv-cache-manager-replay.md`:
+Task 5 is not complete: the public `plan`/`run`/`validate` CLI, real hash
+timing, complete physical occupancy reconstruction, and OOC/invalid partial
+summary proof remain outstanding. Task 6 container registration was not
+implemented. No Ticket 07 image was built, and no container replay or
+independent container validation was run.
 
-1. Implement the deterministic trajectory/capacity selection planner and pin
-   the selected values in configuration.
-2. Add versioned Parquet artifacts, the independent semantic validator, and
-   the `plan`, `run`, and `validate` CLI commands.
-3. Register the CPU-only container command without requesting GPUs.
-4. Complete focused tests, documentation, full server planning/replay,
-   independent validation, input/result hashes, and the final handoff.
+## Test evidence
 
-Every Python/vLLM process must set `PYTHONHASHSEED=0` and
-`VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` before vLLM import. Ticket 07 is
-metadata-only: it reads prompt data, allocates no KV tensors, and makes no HBM,
-Prefill, Decode, model, or GPU-residency claim.
-
-## First Server Commands
+Every Python/vLLM command used:
 
 ```bash
-git fetch origin codex/ticket-07-kv-cache-manager-replay
-git switch --detach origin/codex/ticket-07-kv-cache-manager-replay
-git rev-parse HEAD
-git status --short
 export PYTHONHASHSEED=0
 export VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0
 ```
 
-Confirm the exact SHA and a clean checkout, read the design and plan, inspect
-the diff from `65de0de0ab`, then resume Task 4. Use `uv` and
-`.venv/bin/python`; never use system Python or bare pip. Keep all GitHub state
-changes in `ycsxh/vllm` and leave upstream read-only.
+Focused checkpoint suite:
 
-## Suggested Skills
+```bash
+.venv/bin/python -m pytest \
+  tests/benchmarks/ds4_profile/test_kv_cache_replay.py -q
+```
 
-- `superpowers:subagent-driven-development` or the existing task-by-task plan
-- `code-review` after each completed task
-- `agent-team-workflow:team-review-cycle` before the final push
-- `agent-team-workflow:team-delivery` for exact-SHA evidence
+Result: **33 passed**.
+
+Real upstream manager regressions:
+
+```bash
+.venv/bin/python -m pytest \
+  --confcutdir=tests/v1/core \
+  tests/v1/core/test_prefix_caching.py::test_prefill \
+  tests/v1/core/test_single_type_kv_cache_manager.py::test_evictable_cached_blocks_not_double_allocated \
+  -v
+```
+
+Result: **3 passed, 14 warnings**. `--confcutdir` excludes the repository's
+GPU cleanup fixture, which calls `torch.accelerator.empty_cache()` on this
+CPU-only torch installation after otherwise passing tests.
+
+The two focused Ruff hooks passed for the Python checkpoint:
+
+```bash
+.venv/bin/pre-commit run ruff-check --files \
+  benchmarks/ds4_profile/kv_cache_replay.py \
+  tests/benchmarks/ds4_profile/test_kv_cache_replay.py
+.venv/bin/pre-commit run ruff-format --files \
+  benchmarks/ds4_profile/kv_cache_replay.py \
+  tests/benchmarks/ds4_profile/test_kv_cache_replay.py
+```
+
+The complete selected-file pre-commit gate and container tests were not run;
+do not report them as passing.
+
+## Fail-closed planning evidence
+
+The host-side CPU planning record is retained outside the repository at:
+
+```text
+/home/lyc/ds4-storage/results/ticket-07-selection-failed-e3aa14e29.json
+```
+
+Record facts:
+
+- schema version: `1.0.0`;
+- status: `no_selection`;
+- candidates: `20`;
+- eligible candidates: `0`;
+- every candidate replay status: `passed`;
+- every candidate native eviction count: `0`;
+- canonical planning digest:
+  `b14031a82a099ad48df187aa65bb7a0b3e2b112786ee94f75940fb66ae028431`;
+- file SHA-256:
+  `0380bbcbe9b87c103188618704990a19abc4415b395a1e0ce04fd4618215ce6a`;
+  and
+- input inventory: five manifest/Ticket 01/Ticket 02 data/provenance records
+  plus nine regular files below the pinned DS4 tokenizer directory.
+
+Each candidate capacity is exactly
+`max(ceil(prompt_tokens / 16))` for that complete trajectory. Capacities range
+from 730 to 3374 usable blocks. Every full session was admitted, but all
+native eviction counts were zero. This is consistent with the pilot prompts'
+prefix growth fitting within the largest prompt capacity. Lowering capacity
+would reject the largest prompt; increasing it cannot create eviction
+pressure.
+
+The planning record was produced by `load_full_turns` followed by
+`build_selection_plan` using the immutable school-server manifest, Ticket
+01/02 artifacts and provenance, and pinned DS4 tokenizer. Triton reported zero
+active drivers and disabled itself. No GPU execution occurred.
+
+## Required decision before resuming
+
+Do not resume Task 5–8 under the current approved selection rule. A human must
+approve a revised design that supplies an eligible workload without weakening
+admission or inventing eviction evidence. Examples of materially different
+scope include selecting a workload with non-monotonic exact-hash reuse or
+moving eviction-pressure exploration into Ticket 08. Any revision requires a
+new design/plan review before implementation, a new planning record, and new
+clean-image evidence.
+
+The personal fork is the only writable GitHub repository. Upstream remains
+read-only. No PR was created and issue #4 must remain open.

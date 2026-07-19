@@ -133,10 +133,12 @@ The module-level functions used across tasks have these exact signatures:
 ### Task 1: Full-Session Reconstruction and Input Contract
 
 **Files:**
+
 - Create: `benchmarks/ds4_profile/kv_cache_replay.py`
 - Test: `tests/benchmarks/ds4_profile/test_kv_cache_replay.py`
 
 **Interfaces:**
+
 - Consumes: `benchmarks.ds4_profile.workloads.render_turns(manifest_path, normalized_turns_path, tokenizer_path, block_size=16, include_token_ids=True) -> list[dict[str, Any]]` and Ticket 02 `rendered_turns.parquet`.
 - Produces: `ReplayTurn`, `load_full_turns(config) -> list[ReplayTurn]`, `_sha256(path: Path) -> str`, and `_canonical_hash(value: bytes | int) -> str`.
 
@@ -340,10 +342,12 @@ git commit -m "[Benchmarks] Add DS4 cache replay inputs" \
 ### Task 2: Real Manager Factory and Scoped BlockPool Observation
 
 **Files:**
+
 - Modify: `benchmarks/ds4_profile/kv_cache_replay.py`
 - Modify: `tests/benchmarks/ds4_profile/test_kv_cache_replay.py`
 
 **Interfaces:**
+
 - Consumes: `ReplayTurn` from Task 1; vLLM `Request`, `KVCacheManager`, `KVCacheConfig`, `KVCacheGroupSpec`, and `FullAttentionSpec`.
 - Produces: `PoolCall`, `_initialize_hashing`, `make_request`, `make_manager`,
   `observe_block_pool`, `_resident_hashes(manager) -> set[str]`, and
@@ -704,10 +708,12 @@ git commit -m "[Benchmarks] Add the real KV cache replay seam" \
 ### Task 3: Serial Replay, Miss Attribution, and Future Reuse
 
 **Files:**
+
 - Modify: `benchmarks/ds4_profile/kv_cache_replay.py`
 - Modify: `tests/benchmarks/ds4_profile/test_kv_cache_replay.py`
 
 **Interfaces:**
+
 - Consumes: Task 2 manager and observer functions; native `BlockStored` and `BlockRemoved` returned by `manager.take_events()`.
 - Produces: `ReplayResult`, `replay_session`, `_prefix_source(turn, block_position, block_size) -> PrefixSource`, `_future_accesses(turns, block_size) -> dict[str, tuple[int, ...]]`, `_lookup_outcome`, and `_classify_miss`.
 
@@ -988,11 +994,13 @@ git commit -m "[Benchmarks] Replay DS4 cache metadata" \
 ### Task 4: Deterministic Selection Planner and Frozen Config
 
 **Files:**
+
 - Modify: `benchmarks/ds4_profile/kv_cache_replay.py`
 - Create: `benchmarks/ds4_profile/config/kv-cache-replay.json`
 - Modify: `tests/benchmarks/ds4_profile/test_kv_cache_replay.py`
 
 **Interfaces:**
+
 - Consumes: `load_full_turns`, `replay_session`, and `ReplayResult`.
 - Produces: `collect_input_records`, `verify_input_records`,
   `build_selection_plan`, `verify_pinned_selection`,
@@ -1309,10 +1317,12 @@ git commit -m "[Benchmarks] Select the DS4 cache replay" \
 ### Task 5: Versioned Artifacts, Independent Validator, and CLI
 
 **Files:**
+
 - Modify: `benchmarks/ds4_profile/kv_cache_replay.py`
 - Modify: `tests/benchmarks/ds4_profile/test_kv_cache_replay.py`
 
 **Interfaces:**
+
 - Consumes: `ReplayResult`, frozen config, and selection plan.
 - Produces: `CACHE_EVENT_SCHEMA`, `TURN_SUMMARY_SCHEMA`, `write_result`, `validate_result_dir`, `_result_markdown`, and CLI commands `plan`, `run`, `validate`.
 
@@ -1743,11 +1753,13 @@ git commit -m "[Benchmarks] Persist DS4 cache replay events" \
 ### Task 6: CPU-Only Container Registration
 
 **Files:**
+
 - Modify: `benchmarks/ds4_profile/container/runtime.py`
 - Modify: `benchmarks/ds4_profile/container/run.sh`
 - Modify: `tests/benchmarks/ds4_profile/test_kv_cache_replay.py`
 
 **Interfaces:**
+
 - Consumes: Task 5 module CLI.
 - Produces: container runtime command `kv-cache-replay plan|run|validate`, `_effective_kv_cache_replay_config`, default paths under `/mnt/ds4/config` and `/mnt/ds4/results/ticket-07`, and print-plan output.
 
@@ -1945,12 +1957,14 @@ git commit -m "[Benchmarks] Run cache replay in the DS4 container" \
 ### Task 7: Local Quality Gate and Operator Documentation
 
 **Files:**
+
 - Modify: `benchmarks/ds4_profile/README.md`
 - Modify: `benchmarks/ds4_profile/container/README.md`
 - Modify: `benchmarks/ds4_profile/WORKFLOW.md`
 - Create: `benchmarks/ds4_profile/TICKET_07_HANDOFF.md`
 
 **Interfaces:**
+
 - Consumes: final local commands and artifact contract from Tasks 1-6.
 - Produces: one non-duplicated operator workflow and an explicit unaccepted local handoff ready for school-server continuation.
 
@@ -2040,10 +2054,12 @@ git commit -m "[Docs] Hand off the DS4 cache replay" \
 ### Task 8: School-Server Selection, Pinning, and Container Acceptance
 
 **Files:**
+
 - Modify: `benchmarks/ds4_profile/config/kv-cache-replay.json`
 - Modify: `benchmarks/ds4_profile/TICKET_07_HANDOFF.md`
 
 **Interfaces:**
+
 - Consumes: clean local implementation SHA, school-server Ticket 03 image workflow, mounted immutable inputs, and planner CLI.
 - Produces: pinned selection config, accepted exact SHA/image/result, independent validation, and final handoff evidence. This task still performs no GPU work.
 

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -547,7 +548,7 @@ def test_selection_plan_uses_real_replay_and_is_deterministic(tmp_path: Path) ->
     tokenizer = tmp_path / "tokenizer"
     tokenizer.mkdir()
     (tokenizer / "tokenizer.json").write_text("tokenizer")
-    artifacts = {}
+    artifacts: dict[str, str] = {}
     for name in (
         "manifest",
         "normalized_turns",
@@ -558,7 +559,7 @@ def test_selection_plan_uses_real_replay_and_is_deterministic(tmp_path: Path) ->
         path = tmp_path / name
         path.write_text(name)
         artifacts[name] = str(path)
-    config = {
+    config: dict[str, Any] = {
         "artifacts": artifacts,
         "tokenizer": {"path": str(tokenizer)},
         "replay": {"block_size": 2, "max_model_len": 32},
@@ -686,7 +687,7 @@ def test_verify_pinned_selection_rejects_config_input_path_drift(
     tokenizer = tmp_path / "tokenizer"
     tokenizer.mkdir()
     (tokenizer / "tokenizer.json").write_text("tokenizer")
-    artifacts = {}
+    artifacts: dict[str, str] = {}
     for name in (
         "manifest",
         "normalized_turns",
@@ -697,7 +698,7 @@ def test_verify_pinned_selection_rejects_config_input_path_drift(
         path = tmp_path / name
         path.write_text(name)
         artifacts[name] = str(path)
-    config = {
+    config: dict[str, Any] = {
         "artifacts": artifacts,
         "tokenizer": {"path": str(tokenizer)},
         "replay": {"block_size": 2, "max_model_len": 32},
