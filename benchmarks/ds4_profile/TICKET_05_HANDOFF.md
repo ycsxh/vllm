@@ -7,6 +7,8 @@
 - Upstream: read-only; no upstream interaction is authorized
 - Implementation base handoff: `a59db6380383e8efc6db7ee3d18784b59391c199`
 - Task 6 implementation commit: `f318f3405d99a363ced68dc40f71522308359287`
+- Candidate source commit: `7ed4b9a501dff9ddb47f2239db5389d2072830cc`
+- Candidate source dirty state: `false`
 - Hardware state: `remote_pending`
 - Merge state: not ready for personal-fork merge
 
@@ -15,9 +17,10 @@ environment exposes no CUDA device and has no `/mnt/ds4` Ticket 02 or results
 mount, so neither smoke nor the full matrix has run. Static, CPU, mock, skip,
 and schema checks are not hardware acceptance.
 
-The exact post-Task-7 candidate source SHA and clean state are recorded in the
-final docs-only evidence commit. Build and execute exactly that source SHA; an
-older hardware result does not validate a newer code commit.
+Build and execute exactly the candidate source commit above. The final
+docs-only evidence commit changes only this handoff and does not change runtime
+code, tests, or configuration. An older hardware result does not validate a
+newer code commit.
 
 ## Frozen contract
 
