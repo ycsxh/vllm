@@ -2,16 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
+import json
 from collections import Counter
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import torch
 
 import benchmarks.ds4_profile.prefill_profile as prefill_profile
 from benchmarks.ds4_profile import profile_spine
+from benchmarks.ds4_profile.container import runtime as container_runtime
 from benchmarks.ds4_profile.prefill_profile import build_prefill_points
 from benchmarks.ds4_profile.profile_spine import make_comparison_id, make_point_id
 
@@ -134,6 +139,430 @@ def _build_pinned_points():
         homogeneous_prefix_tokens=4096,
         seed=20260715,
     )
+
+
+def test_checked_in_p_profile_config_freezes_hardware_contract() -> None:
+    path = (
+        Path(__file__).parents[3]
+        / "benchmarks/ds4_profile/config/p-prefill-profile.json"
+    )
+    config = json.loads(path.read_text())
+
+    assert config["schema_version"] == "2.0.0"
+    assert config["profile"] == {
+        "block_size": 16,
+        "homogeneous_prefix_tokens": 4096,
+        "max_num_batched_tokens": 4096,
+        "max_num_seqs": 8,
+        "measured_repetitions": 10,
+        "noisy_cv_threshold": 0.05,
+        "seed": 20260715,
+        "warmup_repetitions": 3,
+    }
+    assert config["runtime"]["dtype"] == "half"
+    assert config["runtime"]["kv_cache_dtype"] == "auto"
+    assert config["runtime"]["tensor_parallel_size"] == 1
+    assert config["runtime"]["enable_prefix_caching"] is True
+    assert config["runtime"]["enable_chunked_prefill"] is True
+    assert config["runtime"]["enforce_eager"] is False
+    buckets = [128, 256, 512, 1024, 2048, 4096]
+    assert config["runtime"]["compilation"]["compile_sizes"] == buckets
+    assert config["runtime"]["compilation"]["capture_sizes"] == buckets
+
+
+def test_freeze_expected_manifest_keeps_all_pairs_and_smoke_ids() -> None:
+    points = _build_pinned_points()
+    base = {
+        "schema_version": "2.0.0",
+        "profile": {
+            "block_size": 16,
+            "homogeneous_prefix_tokens": 4096,
+            "max_num_batched_tokens": 4096,
+            "seed": 20260715,
+        },
+        "smoke_selectors": [
+            "b1-t128",
+            "similar-b2",
+            "no_think-q00",
+            "high_skew-b8",
+            "b8-t512",
+        ],
+    }
+
+    full = prefill_profile.freeze_expected_manifest(base, points, "full")
+    smoke = prefill_profile.freeze_expected_manifest(base, points, "smoke")
+
+    assert len(full["canonical_full_manifest"]) == 68
+    assert full["expected_manifest"] == full["canonical_full_manifest"]
+    assert smoke["canonical_full_manifest"] == full["canonical_full_manifest"]
+    assert len(smoke["expected_manifest"]) == 10
+    selected = [
+        point for point in points if point.point_id in smoke["expected_manifest"]
+    ]
+    assert Counter(point.selector for point in selected) == Counter(
+        {selector: 2 for selector in base["smoke_selectors"]}
+    )
+    assert {point.cache_condition for point in selected} == {
+        "prefix_hit",
+        "full_recompute",
+    }
+    assert any(len(point.chunks) > 1 for point in selected)
+    assert smoke["points"] == full["points"]
+
+
+def test_p_profile_container_plan_is_gpu0_numa0_only(tmp_path: Path) -> None:
+    command = container_runtime._p_profile_worker_command(Path("run.json"), tmp_path)
+
+    assert "--membind=0" in command
+    assert "CUDA_VISIBLE_DEVICES=0" in command
+    assert "--role" not in command
+    assert "decode" not in command
+
+
+def _write_p_profile_config(tmp_path: Path) -> Path:
+    workload_plan, turns = _pinned_inputs()
+    workload_path = tmp_path / "workload-plan.json"
+    turns_path = tmp_path / "rendered-turns.parquet"
+    workload_path.write_text(json.dumps(workload_plan))
+    pq.write_table(pa.Table.from_pylist(turns), turns_path)
+    checked_in = (
+        Path(__file__).parents[3]
+        / "benchmarks/ds4_profile/config/p-prefill-profile.json"
+    )
+    config = json.loads(checked_in.read_text())
+    config["artifacts"] = {
+        "workload_plan": str(workload_path),
+        "rendered_turns": str(turns_path),
+    }
+    path = tmp_path / "p-profile.json"
+    path.write_text(json.dumps(config))
+    return path
+
+
+def test_p_profile_print_plan_freezes_68_points_without_worker(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    profile_config = _write_p_profile_config(tmp_path)
+
+    result = container_runtime._p_profile(
+        tmp_path / "container.json",
+        profile_config,
+        tmp_path / "result",
+        False,
+        True,
+    )
+
+    assert result == 0
+    lines = capsys.readouterr().out.splitlines()
+    manifest = json.loads(lines[0])
+    assert len(manifest["canonical_full_manifest"]) == 68
+    assert manifest["expected_manifest"] == manifest["canonical_full_manifest"]
+    assert len(lines) == 5
+    assert sum("gpu-worker" in line for line in lines) == 1
+    assert "CUDA_VISIBLE_DEVICES=0" in lines[2]
+    assert " validate " in lines[4]
+    effective = container_runtime._effective_p_profile_config(profile_config, "full")
+    assert effective["runtime"]["effective_max_model_len"] >= 8192
+
+
+def test_p_profile_preflight_failure_never_launches_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile_config = _write_p_profile_config(tmp_path)
+    commands = []
+
+    def fail_preflight(_config: Path, output: Path) -> int:
+        container_runtime._write_json(output, {"status": "failed"})
+        return 2
+
+    def record(command: list[str], **_kwargs: Any) -> SimpleNamespace:
+        commands.append(command)
+        return SimpleNamespace(returncode=2)
+
+    monkeypatch.setattr(container_runtime, "_preflight", fail_preflight)
+    monkeypatch.setattr(container_runtime.subprocess, "run", record)
+
+    result = container_runtime._p_profile(
+        tmp_path / "container.json",
+        profile_config,
+        tmp_path / "result",
+        True,
+        False,
+    )
+
+    assert result == 2
+    assert len(commands) == 1
+    assert "assemble" in commands[0]
+    assert "gpu-worker" not in commands[0]
+
+
+def test_validator_accepts_real_frozen_planner_and_rejects_point_mutation(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_p_profile_config(tmp_path)
+    base = json.loads(config_path.read_text())
+    points = prefill_profile.load_prefill_points(base)
+    config = freeze_config = prefill_profile.freeze_expected_manifest(
+        base,
+        points,
+        "full",
+    )
+    assert len(profile_spine._canonical_manifest_points(config)) == 68
+
+    changed = copy.deepcopy(freeze_config)
+    changed["points"][0]["canonical_payload"]["seed"] += 1
+    with pytest.raises(ValueError, match="point_id"):
+        profile_spine._canonical_manifest_points(changed)
+
+    forged = copy.deepcopy(freeze_config)
+    old_ids = []
+    new_ids = []
+    for record in forged["points"][:2]:
+        old_ids.append(record["point_id"])
+        record["canonical_payload"]["selector"] = "forged-selector"
+        record["point_id"] = make_point_id(record["canonical_payload"])
+        record["comparison_id"] = make_comparison_id(record["canonical_payload"])
+        new_ids.append(record["point_id"])
+    forged["canonical_full_manifest"] = [
+        new_ids[old_ids.index(point_id)] if point_id in old_ids else point_id
+        for point_id in forged["canonical_full_manifest"]
+    ]
+    forged["expected_manifest"] = list(forged["canonical_full_manifest"])
+    forged["canonical_planner_inputs"]["workload_selectors"][0] = "forged-selector"
+    with pytest.raises(ValueError, match="pinned planner artifacts"):
+        profile_spine._canonical_manifest_points(forged)
+
+
+def test_assemble_preserves_worker_output_when_validation_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    point = _build_pinned_points()[0]
+    config = {
+        "run_id": "run",
+        "expected_manifest": [point.point_id],
+        "source": {},
+    }
+    worker = {
+        "status": "passed",
+        "returncode": 0,
+        "hardware_validated": True,
+        "point_manifest": [point.canonical_payload],
+        "samples": [{"partial": True}],
+        "prefix_evidence": [{"partial": True}],
+    }
+    config_path = tmp_path / "config.json"
+    preflight_path = tmp_path / "preflight.json"
+    worker_path = tmp_path / "worker.json"
+    config_path.write_text(json.dumps(config))
+    preflight_path.write_text(json.dumps({"status": "ready"}))
+    worker_path.write_text(json.dumps(worker))
+    provenances = []
+
+    def write_result(
+        _config: dict[str, Any],
+        _rows: list[dict[str, Any]],
+        _evidence: list[dict[str, Any]],
+        provenance: dict[str, Any],
+        _output: Path,
+    ) -> None:
+        provenances.append(copy.deepcopy(provenance))
+        if len(provenances) == 1:
+            raise ValueError("partial coordinate set")
+
+    monkeypatch.setattr(profile_spine, "write_v2_result_artifacts", write_result)
+
+    passed = prefill_profile._assemble_result(
+        config_path,
+        preflight_path,
+        worker_path,
+        tmp_path / "result",
+    )
+
+    assert passed is False
+    assert [item["validation_state"] for item in provenances] == [
+        "remote_pending",
+        "remote_failed",
+    ]
+    assert provenances[-1]["hardware_validated"] is False
+    assert provenances[-1]["validation_error"] == "partial coordinate set"
+
+
+def test_p_profile_preserves_malformed_worker_as_failed_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile_config = _write_p_profile_config(tmp_path)
+    assembled_worker = {}
+
+    def ready_preflight(_config: Path, output: Path) -> int:
+        container_runtime._write_json(output, {"status": "ready"})
+        return 0
+
+    def run(command: list[str], **_kwargs: Any) -> SimpleNamespace:
+        if "gpu-worker" in command:
+            output = Path(command[command.index("--output") + 1])
+            output.write_text("{")
+            return SimpleNamespace(returncode=2)
+        if "assemble" in command:
+            worker = Path(command[command.index("--worker-result") + 1])
+            assembled_worker.update(json.loads(worker.read_text()))
+        return SimpleNamespace(returncode=2)
+
+    monkeypatch.setattr(container_runtime, "_preflight", ready_preflight)
+    monkeypatch.setattr(container_runtime.subprocess, "run", run)
+
+    result = container_runtime._p_profile(
+        tmp_path / "container.json",
+        profile_config,
+        tmp_path / "result",
+        True,
+        False,
+    )
+
+    assert result == 2
+    assert assembled_worker["status"] == "failed"
+    assert assembled_worker["hardware_validated"] is False
+    assert assembled_worker["returncode"] == 2
+    assert "invalid worker result" in assembled_worker["error"]
+
+
+def test_p_profile_runs_validator_only_after_successful_assembly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile_config = _write_p_profile_config(tmp_path)
+    commands = []
+
+    def ready_preflight(_config: Path, output: Path) -> int:
+        container_runtime._write_json(output, {"status": "ready"})
+        return 0
+
+    def run(command: list[str], **_kwargs: Any) -> SimpleNamespace:
+        commands.append(command)
+        if "gpu-worker" in command:
+            output = Path(command[command.index("--output") + 1])
+            output.write_text(
+                json.dumps(
+                    {
+                        "status": "passed",
+                        "hardware_validated": True,
+                        "samples": [],
+                        "prefix_evidence": [],
+                        "point_manifest": [],
+                    }
+                )
+            )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(container_runtime, "_preflight", ready_preflight)
+    monkeypatch.setattr(container_runtime.subprocess, "run", run)
+
+    result = container_runtime._p_profile(
+        tmp_path / "container.json",
+        profile_config,
+        tmp_path / "result",
+        True,
+        False,
+    )
+
+    assert result == 0
+    assert [
+        next(name for name in ("gpu-worker", "assemble", "validate") if name in cmd)
+        for cmd in commands
+    ] == ["gpu-worker", "assemble", "validate"]
+
+
+def test_p_profile_preserves_bootstrap_failure_before_planner_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checked_in = (
+        Path(__file__).parents[3]
+        / "benchmarks/ds4_profile/config/p-prefill-profile.json"
+    )
+    config = json.loads(checked_in.read_text())
+    config["artifacts"] = {
+        "workload_plan": str(tmp_path / "missing-plan.json"),
+        "rendered_turns": str(tmp_path / "missing-turns.parquet"),
+    }
+    profile_config = tmp_path / "p-profile.json"
+    profile_config.write_text(json.dumps(config))
+    output_dir = tmp_path / "failed-result"
+
+    def failed_preflight(_config: Path, output: Path) -> int:
+        container_runtime._write_json(output, {"status": "invalid"})
+        return 2
+
+    monkeypatch.setattr(container_runtime, "_preflight", failed_preflight)
+    monkeypatch.setattr(
+        container_runtime.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("worker or assembly was launched"),
+    )
+
+    result = container_runtime._p_profile(
+        tmp_path / "container.json",
+        profile_config,
+        output_dir,
+        True,
+        False,
+    )
+
+    assert result == 2
+    provenance = json.loads((output_dir / "provenance.json").read_text())
+    assert provenance["validation_state"] == "remote_failed"
+    assert provenance["hardware_validated"] is False
+    assert "FileNotFoundError" in provenance["validation_error"]
+    assert (output_dir / "preflight.json").is_file()
+    assert {
+        "raw_samples.parquet",
+        "turn_samples.parquet",
+        "aggregates.parquet",
+        "comparisons.parquet",
+        "prefix_evidence.parquet",
+    }.issubset(path.name for path in output_dir.iterdir())
+    profile_spine._validate_result_dir(output_dir)
+
+
+def test_assemble_normalizes_object_with_null_worker_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.json"
+    preflight_path = tmp_path / "preflight.json"
+    worker_path = tmp_path / "worker.json"
+    config_path.write_text(json.dumps({"run_id": "run", "expected_manifest": []}))
+    preflight_path.write_text(json.dumps({"status": "ready"}))
+    worker_path.write_text(
+        json.dumps(
+            {
+                "status": "passed",
+                "returncode": 0,
+                "hardware_validated": True,
+                "point_manifest": None,
+                "samples": None,
+                "prefix_evidence": None,
+            }
+        )
+    )
+    captured: dict[str, Any] = {}
+
+    def write_result(
+        _config: dict[str, Any],
+        rows: list[dict[str, Any]],
+        evidence: list[dict[str, Any]],
+        provenance: dict[str, Any],
+        _output: Path,
+    ) -> None:
+        captured.update(rows=rows, evidence=evidence, provenance=provenance)
+
+    monkeypatch.setattr(profile_spine, "write_v2_result_artifacts", write_result)
+
+    passed = prefill_profile._assemble_result(
+        config_path, preflight_path, worker_path, tmp_path / "result"
+    )
+
+    assert passed is False
+    assert captured["rows"] == []
+    assert captured["evidence"] == []
+    assert captured["provenance"]["validation_state"] == "remote_failed"
+    assert "malformed worker fields" in captured["provenance"]["validation_error"]
 
 
 class _FakeBlockPool:

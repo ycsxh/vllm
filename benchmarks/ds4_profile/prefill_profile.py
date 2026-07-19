@@ -3,11 +3,20 @@
 
 """Deterministic P-side prefill workload planning."""
 
+import argparse
+import copy
 import hashlib
+import json
+import os
+import sys
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from time import perf_counter
 from typing import Any, Literal
+
+import pyarrow.parquet as pq
 
 from benchmarks.ds4_profile.profile_spine import (
     V2_SCHEMA_VERSION,
@@ -23,6 +32,71 @@ CHUNK_ALGORITHM = "equal-active-cap-v1"
 HOMOGENEOUS_TOKEN_ALGORITHM = "sha256-legal-pool-v1"
 CANONICAL_BLOCK_SIZE = 16
 CANONICAL_HOMOGENEOUS_PREFIX_TOKENS = 4096
+
+
+def _point_record(point: "PPointPlan") -> dict[str, Any]:
+    return {
+        "point_id": point.point_id,
+        "comparison_id": point.comparison_id,
+        "canonical_payload": point.canonical_payload,
+    }
+
+
+def freeze_expected_manifest(
+    config: dict[str, Any],
+    points: tuple["PPointPlan", ...],
+    run_kind: Literal["full", "smoke"],
+) -> dict[str, Any]:
+    """Freeze the planner-derived full manifest and selected execution set."""
+    if run_kind not in ("full", "smoke"):
+        raise ValueError(f"unsupported run kind: {run_kind}")
+    if len(points) != 68:
+        raise ValueError("P-side planner must produce exactly 68 points")
+    point_ids = [point.point_id for point in points]
+    if len(set(point_ids)) != 68:
+        raise ValueError("P-side planner produced duplicate point IDs")
+    selectors: dict[str, list[PPointPlan]] = {}
+    for point in points:
+        selectors.setdefault(point.selector, []).append(point)
+    if len(selectors) != 34 or any(
+        len(pair) != 2
+        or {point.cache_condition for point in pair} != {"prefix_hit", "full_recompute"}
+        or len({point.comparison_id for point in pair}) != 1
+        for pair in selectors.values()
+    ):
+        raise ValueError("P-side planner must produce 34 complete condition pairs")
+    planner_digests = {point.planner_digest for point in points}
+    if len(planner_digests) != 1:
+        raise ValueError("P-side points do not share one planner digest")
+
+    selected = point_ids
+    if run_kind == "smoke":
+        smoke = config.get("smoke_selectors")
+        if not isinstance(smoke, list) or len(smoke) != len(set(smoke)):
+            raise ValueError("smoke_selectors must be a unique selector list")
+        unknown = sorted(set(smoke) - set(selectors))
+        if unknown:
+            raise ValueError(f"unknown smoke selectors: {', '.join(unknown)}")
+        selected = [point.point_id for point in points if point.selector in smoke]
+        if len(selected) != 2 * len(smoke):
+            raise ValueError("smoke selection broke a condition pair")
+
+    frozen = copy.deepcopy(config)
+    profile = frozen["profile"]
+    frozen["run_kind"] = run_kind
+    frozen["canonical_planner_inputs"] = {
+        "schema_version": V2_SCHEMA_VERSION,
+        "workload_selectors": list(selectors),
+        "kv_cache_groups": ["0"],
+        "seed": profile["seed"],
+        "block_size": profile["block_size"],
+        "chunk_budget": profile["max_num_batched_tokens"],
+        "planner_digest": planner_digests.pop(),
+    }
+    frozen["points"] = [_point_record(point) for point in points]
+    frozen["canonical_full_manifest"] = point_ids
+    frozen["expected_manifest"] = selected
+    return frozen
 
 
 @dataclass(frozen=True)
@@ -1766,3 +1840,218 @@ def build_prefill_points(
         )
 
     return tuple(points)
+
+
+def load_prefill_points(config: dict[str, Any]) -> tuple[PPointPlan, ...]:
+    """Recompute the canonical P-side points from the pinned Ticket 02 inputs."""
+    workload_plan = json.loads(Path(config["artifacts"]["workload_plan"]).read_text())
+    rendered_turns = pq.read_table(config["artifacts"]["rendered_turns"]).to_pylist()
+    profile = config["profile"]
+    points = build_prefill_points(
+        workload_plan,
+        rendered_turns,
+        block_size=profile["block_size"],
+        token_budget=profile["max_num_batched_tokens"],
+        homogeneous_prefix_tokens=profile["homogeneous_prefix_tokens"],
+        seed=profile["seed"],
+    )
+    frozen_records = config.get("points")
+    if frozen_records is not None and frozen_records != [
+        _point_record(point) for point in points
+    ]:
+        raise ValueError("frozen P-side points differ from the pinned inputs")
+    return points
+
+
+def _write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def _replace_text(path: Path, value: str) -> None:
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, delete=False
+    ) as temporary:
+        temporary.write(value)
+        temporary_path = Path(temporary.name)
+    temporary_path.replace(path)
+
+
+def _assemble_result(
+    config_path: Path,
+    preflight_path: Path,
+    worker_path: Path,
+    output_dir: Path,
+) -> bool:
+    from benchmarks.ds4_profile.profile_spine import write_v2_result_artifacts
+
+    config = json.loads(config_path.read_text())
+    preflight = json.loads(preflight_path.read_text())
+    worker = json.loads(worker_path.read_text())
+    malformed_fields = [
+        name
+        for name in ("point_manifest", "samples", "prefix_evidence")
+        if not isinstance(worker.get(name), list)
+    ]
+    point_manifest = worker.get("point_manifest", [])
+    if malformed_fields or not all(
+        isinstance(payload, dict) for payload in point_manifest
+    ):
+        malformed_fields.append("point_manifest payload")
+        point_manifest = []
+    samples = worker.get("samples", []) if not malformed_fields else []
+    evidence = worker.get("prefix_evidence", []) if not malformed_fields else []
+    observed = {make_point_id(payload) for payload in point_manifest}
+    expected = set(config["expected_manifest"])
+    worker_passed = (
+        preflight.get("status") == "ready"
+        and worker.get("status") in {"passed", "out_of_capacity"}
+        and worker.get("returncode") == 0
+        and worker.get("hardware_validated") is True
+        and observed == expected
+        and len(point_manifest) == len(expected)
+        and not malformed_fields
+    )
+    provenance = {
+        "schema_version": V2_SCHEMA_VERSION,
+        "run_id": config["run_id"],
+        "validation_state": "remote_pending" if worker_passed else "remote_failed",
+        "hardware_validated": worker_passed,
+        "preflight": preflight,
+        "image": {"id": worker.get("image_id", "unknown")},
+        "source": config.get("source", {}),
+        "worker": {
+            "command": worker.get("command"),
+            "returncode": worker.get("returncode"),
+            "status": worker.get("status"),
+            "error": worker.get("error"),
+            "startup_ms": worker.get("startup_ms"),
+            "capture_ms": worker.get("capture_ms"),
+        },
+    }
+    if observed != expected:
+        provenance["validation_error"] = "worker manifest differs from frozen manifest"
+    if malformed_fields:
+        provenance["validation_error"] = "malformed worker fields: " + ", ".join(
+            malformed_fields
+        )
+    try:
+        write_v2_result_artifacts(
+            config,
+            samples,
+            evidence,
+            provenance,
+            output_dir,
+        )
+    except ValueError as error:
+        if not worker_passed:
+            raise
+        worker_passed = False
+        provenance["validation_state"] = "remote_failed"
+        provenance["hardware_validated"] = False
+        provenance["validation_error"] = str(error)
+        write_v2_result_artifacts(
+            config,
+            samples,
+            evidence,
+            provenance,
+            output_dir,
+        )
+    return worker_passed
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the DS4 P-side profile.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    for name in ("plan", "fixture"):
+        command = subparsers.add_parser(name)
+        command.add_argument("--config", type=Path, required=True)
+        command.add_argument("--run-kind", choices=("full", "smoke"), default="full")
+        command.add_argument("--output", type=Path)
+    worker = subparsers.add_parser("gpu-worker")
+    worker.add_argument("--config", type=Path, required=True)
+    worker.add_argument("--output", type=Path, required=True)
+    assemble = subparsers.add_parser("assemble")
+    assemble.add_argument("--config", type=Path, required=True)
+    assemble.add_argument("--preflight", type=Path, required=True)
+    assemble.add_argument("--worker-result", type=Path, required=True)
+    assemble.add_argument("--output-dir", type=Path, required=True)
+    validate = subparsers.add_parser("validate")
+    validate.add_argument("--result-dir", type=Path, required=True)
+    args = parser.parse_args()
+
+    try:
+        if args.command in {"plan", "fixture"}:
+            config = json.loads(args.config.read_text())
+            frozen = freeze_expected_manifest(
+                config, load_prefill_points(config), args.run_kind
+            )
+            if args.output is None:
+                print(json.dumps(frozen, sort_keys=True))
+            else:
+                _write_json(args.output, frozen)
+            return
+        if args.command == "gpu-worker":
+            config = json.loads(args.config.read_text())
+            points = load_prefill_points(config)
+            expected = set(config["expected_manifest"])
+            selected = tuple(point for point in points if point.point_id in expected)
+            if {point.point_id for point in selected} != expected:
+                raise ValueError("expected_manifest references an unknown point")
+            result = run_prefill_matrix(config, selected)
+            result["image_id"] = os.environ.get("DS4_IMAGE_ID", "unknown")
+            _write_json(args.output, result)
+            if result["status"] == "failed":
+                raise SystemExit(2)
+            return
+        if args.command == "assemble":
+            passed = _assemble_result(
+                args.config,
+                args.preflight,
+                args.worker_result,
+                args.output_dir,
+            )
+            if not passed:
+                raise SystemExit(2)
+            return
+        from benchmarks.ds4_profile.profile_spine import _validate_result_dir
+
+        _validate_result_dir(args.result_dir)
+        provenance_path = args.result_dir / "provenance.json"
+        provenance = json.loads(provenance_path.read_text())
+        if (
+            provenance.get("validation_state") == "remote_pending"
+            and provenance.get("hardware_validated") is True
+        ):
+            provenance["validation_state"] = "remote_verified"
+            _replace_text(
+                provenance_path,
+                json.dumps(provenance, indent=2, sort_keys=True) + "\n",
+            )
+        if provenance.get("validation_state") != "remote_verified":
+            raise ValueError("result is not hardware verified")
+        print(args.result_dir)
+    except (KeyError, OSError, RuntimeError, ValueError) as error:
+        if args.command == "gpu-worker":
+            config = json.loads(args.config.read_text())
+            _write_json(
+                args.output,
+                {
+                    "schema_version": V2_SCHEMA_VERSION,
+                    "run_id": config.get("run_id"),
+                    "role": "prefill",
+                    "runner_boundary": "GPUWorker.execute_model",
+                    "point_manifest": [],
+                    "prefix_evidence": [],
+                    "samples": [],
+                    "hardware_validated": False,
+                    "status": "failed",
+                    "error": f"{type(error).__name__}: {error}",
+                },
+            )
+        print(f"P-side profile failed: {error}", file=sys.stderr)
+        raise SystemExit(2) from error
+
+
+if __name__ == "__main__":
+    main()

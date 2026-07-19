@@ -708,11 +708,10 @@ def write_v2_result_artifacts(
             pq.write_table(pa.Table.from_pylist(rows, schema=schema), staging / name)
         noisy_points = [row["point_id"] for row in aggregate_rows if row["noisy"]]
         artifact_names = sorted(_v2_required_files() - {"result.md"})
-        validation_state = staged_provenance.get("validation_state", "remote_pending")
         result_lines = [
             "# DS4 P-side profile result",
             "",
-            f"- Status: `{validation_state}`",
+            "- Validation state: see `provenance.json`",
             f"- Run: `{config['run_id']}`",
             f"- Points: {len(config['expected_manifest'])}",
             f"- Capacity boundary: {len(terminal_rows)} out-of-capacity points",
@@ -1188,23 +1187,78 @@ def _manifest_points(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def _canonical_manifest_points(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Validate the frozen point records against immutable planner inputs."""
     planner_inputs = config.get("canonical_planner_inputs")
-    if not isinstance(planner_inputs, dict) or (
-        canonical_payload_json(planner_inputs)
-        != canonical_payload_json(canonical_v2_planner_inputs())
-    ):
+    if not isinstance(planner_inputs, dict):
         raise ValueError("v2 run-config has noncanonical planner inputs")
     points = _manifest_points(config)
-    canonical = canonical_v2_points()
-    canonical_by_id = {
-        point["point_id"]: {
-            "payload": point["canonical_payload"],
-            "comparison_id": point["comparison_id"],
+    if canonical_payload_json(planner_inputs) == canonical_payload_json(
+        canonical_v2_planner_inputs()
+    ):
+        canonical = canonical_v2_points()
+        canonical_by_id = {
+            point["point_id"]: {
+                "payload": point["canonical_payload"],
+                "comparison_id": point["comparison_id"],
+            }
+            for point in canonical
         }
-        for point in canonical
+        if points != canonical_by_id:
+            raise ValueError("v2 points do not match canonical planner inputs")
+        return canonical_by_id
+
+    from benchmarks.ds4_profile.prefill_profile import load_prefill_points
+
+    recomputed = load_prefill_points({**config, "points": None})
+    recomputed_by_id = {
+        point.point_id: {
+            "payload": point.canonical_payload,
+            "comparison_id": point.comparison_id,
+        }
+        for point in recomputed
     }
-    if points != canonical_by_id:
-        raise ValueError("v2 points do not match canonical planner inputs")
-    return canonical_by_id
+    if points != recomputed_by_id:
+        raise ValueError("v2 points do not match the pinned planner artifacts")
+
+    expected_inputs = {
+        "schema_version": V2_SCHEMA_VERSION,
+        "kv_cache_groups": ["0"],
+        "seed": 20260715,
+        "block_size": 16,
+        "chunk_budget": 4096,
+    }
+    if any(planner_inputs.get(key) != value for key, value in expected_inputs.items()):
+        raise ValueError("v2 run-config has noncanonical planner inputs")
+    selectors = planner_inputs.get("workload_selectors")
+    planner_digest = planner_inputs.get("planner_digest")
+    if (
+        not isinstance(selectors, list)
+        or len(selectors) != 34
+        or len(set(selectors)) != 34
+        or not isinstance(planner_digest, str)
+        or len(planner_digest) != 64
+    ):
+        raise ValueError("v2 run-config has noncanonical planner inputs")
+    by_selector: dict[str, list[dict[str, Any]]] = {}
+    for point in points.values():
+        payload = point["payload"]
+        if (
+            payload.get("planner_digest") != planner_digest
+            or payload.get("seed") != 20260715
+            or payload.get("block_size") != 16
+            or payload.get("chunk_budget") != 4096
+            or payload.get("homogeneous_prefix_tokens") != 4096
+            or not 1 <= payload.get("batch_size", 0) <= 8
+        ):
+            raise ValueError("v2 points do not match canonical planner inputs")
+        by_selector.setdefault(payload.get("selector"), []).append(point)
+    if set(by_selector) != set(selectors) or any(
+        len(pair) != 2
+        or {item["payload"].get("cache_condition") for item in pair}
+        != {"prefix_hit", "full_recompute"}
+        or len({item["comparison_id"] for item in pair}) != 1
+        for pair in by_selector.values()
+    ):
+        raise ValueError("v2 points do not form 34 canonical condition pairs")
+    return points
 
 
 def _manifest_id_set(value: Any, name: str) -> set[str]:
@@ -1570,6 +1624,22 @@ def _validate_v2_result_dir(result_dir: Path, config: dict[str, Any]) -> None:
         (evidence_rows, "prefix_evidence.parquet"),
     ):
         _require_v2_enums(rows, name)
+    if config.get("bootstrap_failure") is True:
+        provenance = json.loads((result_dir / "provenance.json").read_text())
+        if any((raw_rows, turn_rows, aggregate_rows, comparison_rows, evidence_rows)):
+            raise ValueError("bootstrap failure artifacts must have empty data tables")
+        if (
+            config.get("run_kind") not in V2_ENUMS["run_kind"]
+            or config.get("points") != []
+            or config.get("canonical_full_manifest") != []
+            or config.get("expected_manifest") != []
+            or provenance.get("run_id") != config.get("run_id")
+            or provenance.get("validation_state") != "remote_failed"
+            or provenance.get("hardware_validated") is not False
+            or not isinstance(provenance.get("validation_error"), str)
+        ):
+            raise ValueError("invalid bootstrap failure artifact state")
+        return
     expected_points = _canonical_manifest_points(config)
     expected_kv_cache_groups = frozenset(
         config["canonical_planner_inputs"]["kv_cache_groups"]

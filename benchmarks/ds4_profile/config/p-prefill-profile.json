@@ -1,0 +1,56 @@
+{
+  "artifacts": {
+    "rendered_turns": "/mnt/ds4/ticket-02/rendered_turns.parquet",
+    "workload_plan": "/mnt/ds4/ticket-02/workload_plan.json"
+  },
+  "model": {
+    "repo_id": "Qwen/Qwen2.5-Coder-7B-Instruct",
+    "revision": "c03e6d358207e414f1eca0bb1891e29f1db0e242",
+    "tokenizer": "/mnt/ds4/tokenizers/qwen2.5-coder-7b-instruct/c03e6d358207e414f1eca0bb1891e29f1db0e242"
+  },
+  "profile": {
+    "block_size": 16,
+    "homogeneous_prefix_tokens": 4096,
+    "max_num_batched_tokens": 4096,
+    "max_num_seqs": 8,
+    "measured_repetitions": 10,
+    "noisy_cv_threshold": 0.05,
+    "seed": 20260715,
+    "warmup_repetitions": 3
+  },
+  "runtime": {
+    "compilation": {
+      "capture_sizes": [128, 256, 512, 1024, 2048, 4096],
+      "compile_sizes": [128, 256, 512, 1024, 2048, 4096],
+      "cudagraph_mode": "FULL_AND_PIECEWISE",
+      "mode": "VLLM_COMPILE"
+    },
+    "dtype": "half",
+    "enable_chunked_prefill": true,
+    "enable_prefix_caching": true,
+    "enforce_eager": false,
+    "gpu_memory_utilization": 0.9,
+    "kv_cache_dtype": "auto",
+    "max_num_seqs": 8,
+    "sampling": {
+      "max_tokens": 1,
+      "temperature": 0.0
+    },
+    "seed": 20260715,
+    "skip_tokenizer_init": true,
+    "tensor_parallel_size": 1
+  },
+  "run_id": null,
+  "schema_version": "2.0.0",
+  "smoke_selectors": [
+    "b1-t128",
+    "similar-b2",
+    "no_think-q00",
+    "high_skew-b8",
+    "b8-t512"
+  ],
+  "source": {
+    "commit": "unknown",
+    "dirty": true
+  }
+}

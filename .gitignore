@@ -232,6 +232,7 @@ hip_compat.h
 
 # Benchmark dataset
 benchmarks/**/*.json
+!benchmarks/ds4_profile/config/p-prefill-profile.json
 
 # Linting
 actionlint

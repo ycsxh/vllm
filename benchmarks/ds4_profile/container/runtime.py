@@ -771,6 +771,26 @@ def _profile_spine_worker_commands(
     ]
 
 
+def _p_profile_worker_command(config_path: Path, work_dir: Path) -> list[str]:
+    """Return the single GPU0/NUMA0 Ticket 05 worker command."""
+    settings = _profile_role_settings()["prefill"]
+    return [
+        "numactl",
+        f"--physcpubind={settings['cpuset']}",
+        "--membind=0",
+        "env",
+        "CUDA_VISIBLE_DEVICES=0",
+        sys.executable,
+        "-m",
+        "benchmarks.ds4_profile.prefill_profile",
+        "gpu-worker",
+        "--config",
+        str(config_path),
+        "--output",
+        str(work_dir / "prefill.json"),
+    ]
+
+
 def _effective_profile_config(profile_config_path: Path) -> dict[str, Any]:
     config = json.loads(profile_config_path.read_text())
     if not config.get("run_id"):
@@ -899,6 +919,308 @@ def _profile_spine(
         return subprocess.run(actual_assemble_command, check=False).returncode
 
 
+def _effective_p_profile_config(
+    profile_config_path: Path, run_kind: str
+) -> dict[str, Any]:
+    return _freeze_p_profile_config(
+        _base_p_profile_config(profile_config_path), run_kind
+    )
+
+
+def _freeze_p_profile_config(
+    base_config: dict[str, Any], run_kind: str
+) -> dict[str, Any]:
+    from benchmarks.ds4_profile.prefill_profile import (
+        freeze_expected_manifest,
+        load_prefill_points,
+    )
+
+    config = json.loads(json.dumps(base_config))
+    points = load_prefill_points(config)
+    config["runtime"]["effective_max_model_len"] = max(
+        8192,
+        max(request.context_tokens for point in points for request in point.requests)
+        + 1,
+    )
+    return freeze_expected_manifest(config, points, run_kind)
+
+
+def _base_p_profile_config(profile_config_path: Path) -> dict[str, Any]:
+    config = json.loads(profile_config_path.read_text())
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    config["run_id"] = config.get("run_id") or (
+        f"ds4-p-prefill-{timestamp}-{uuid.uuid4().hex[:8]}"
+    )
+    dirty = os.environ.get(
+        "DS4_VLLM_DIRTY", str(config.get("source", {}).get("dirty", True))
+    ).lower()
+    config["source"] = {
+        "commit": os.environ.get(
+            "DS4_VLLM_COMMIT", config.get("source", {}).get("commit", "unknown")
+        ),
+        "dirty": dirty == "true" if dirty in {"true", "false"} else "unknown",
+    }
+    return config
+
+
+def _write_p_profile_bootstrap_failure(
+    output_dir: Path,
+    config: dict[str, Any],
+    preflight: dict[str, Any],
+    run_kind: str,
+    error: Exception,
+) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from benchmarks.ds4_profile.profile_spine import (
+        V2_AGGREGATE_SCHEMA,
+        V2_COMPARISON_SCHEMA,
+        V2_PREFIX_EVIDENCE_SCHEMA,
+        V2_RAW_SAMPLE_SCHEMA,
+        V2_TURN_SAMPLE_SCHEMA,
+    )
+
+    if output_dir.exists():
+        raise FileExistsError(f"result directory already exists: {output_dir}")
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        dir=output_dir.parent, prefix=f".{output_dir.name}.staging-"
+    ) as temporary:
+        staging = Path(temporary) / "result"
+        staging.mkdir()
+        failed_config = json.loads(json.dumps(config))
+        failed_config.update(
+            {
+                "bootstrap_failure": True,
+                "run_kind": run_kind,
+                "points": [],
+                "canonical_full_manifest": [],
+                "expected_manifest": [],
+            }
+        )
+        _write_json(staging / "run-config.json", failed_config)
+        _write_json(staging / "preflight.json", preflight)
+        _write_json(
+            staging / "provenance.json",
+            {
+                "schema_version": config.get("schema_version"),
+                "run_id": config.get("run_id"),
+                "validation_state": "remote_failed",
+                "hardware_validated": False,
+                "preflight": preflight,
+                "source": config.get("source", {}),
+                "validation_error": f"{type(error).__name__}: {error}",
+            },
+        )
+        (staging / "result.md").write_text(
+            "# DS4 P-side profile bootstrap failure\n\n"
+            "- Validation state: see `provenance.json`\n"
+            "- No GPU worker was launched.\n"
+        )
+        for name, schema in (
+            ("raw_samples.parquet", V2_RAW_SAMPLE_SCHEMA),
+            ("turn_samples.parquet", V2_TURN_SAMPLE_SCHEMA),
+            ("aggregates.parquet", V2_AGGREGATE_SCHEMA),
+            ("comparisons.parquet", V2_COMPARISON_SCHEMA),
+            ("prefix_evidence.parquet", V2_PREFIX_EVIDENCE_SCHEMA),
+        ):
+            pq.write_table(pa.Table.from_pylist([], schema=schema), staging / name)
+        staging.replace(output_dir)
+
+
+def _p_profile_assemble_command(
+    config_path: Path,
+    preflight_path: Path,
+    worker_path: Path,
+    output_dir: Path,
+) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "benchmarks.ds4_profile.prefill_profile",
+        "assemble",
+        "--config",
+        str(config_path),
+        "--preflight",
+        str(preflight_path),
+        "--worker-result",
+        str(worker_path),
+        "--output-dir",
+        str(output_dir),
+    ]
+
+
+def _p_profile_validate_command(output_dir: Path) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "benchmarks.ds4_profile.prefill_profile",
+        "validate",
+        "--result-dir",
+        str(output_dir),
+    ]
+
+
+def _p_profile(
+    container_config_path: Path,
+    profile_config_path: Path,
+    output_dir: Path | None,
+    smoke: bool,
+    print_plan: bool,
+) -> int:
+    run_kind = "smoke" if smoke else "full"
+    base_config = _base_p_profile_config(profile_config_path)
+    if output_dir is None:
+        output_dir = Path("/mnt/ds4/results/ticket-05") / base_config["run_id"]
+    work_dir = output_dir.parent / f".{output_dir.name}.workers"
+    config_path = work_dir / "run-config.json"
+    preflight_path = work_dir / "preflight.json"
+    worker_path = work_dir / "prefill.json"
+    worker_command = _p_profile_worker_command(config_path, work_dir)
+    assemble_command = _p_profile_assemble_command(
+        config_path, preflight_path, worker_path, output_dir
+    )
+    validate_command = _p_profile_validate_command(output_dir)
+    if print_plan:
+        config = _freeze_p_profile_config(base_config, run_kind)
+        print(
+            json.dumps(
+                {
+                    "run_kind": run_kind,
+                    "canonical_full_manifest": config["canonical_full_manifest"],
+                    "expected_manifest": config["expected_manifest"],
+                },
+                sort_keys=True,
+            )
+        )
+        print(
+            shlex.join(
+                [
+                    sys.executable,
+                    "-m",
+                    "benchmarks.ds4_profile.container.runtime",
+                    "preflight",
+                    "--config",
+                    str(container_config_path),
+                    "--output",
+                    str(preflight_path),
+                ]
+            )
+        )
+        print(shlex.join(worker_command))
+        print(shlex.join(assemble_command))
+        print(shlex.join(validate_command))
+        return 0
+
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        dir=output_dir.parent, prefix=f".{output_dir.name}.workers-"
+    ) as temporary:
+        actual_work_dir = Path(temporary)
+        actual_config = actual_work_dir / "run-config.json"
+        actual_preflight = actual_work_dir / "preflight.json"
+        actual_worker = actual_work_dir / "prefill.json"
+        try:
+            preflight_returncode = _preflight(container_config_path, actual_preflight)
+            preflight = json.loads(actual_preflight.read_text())
+        except (json.JSONDecodeError, OSError, ValueError) as error:
+            preflight_returncode = 2
+            preflight = {"status": "invalid", "error": str(error)}
+            _write_json(actual_preflight, preflight)
+        try:
+            config = _freeze_p_profile_config(base_config, run_kind)
+        except (KeyError, OSError, ValueError) as error:
+            _write_p_profile_bootstrap_failure(
+                output_dir, base_config, preflight, run_kind, error
+            )
+            return 2
+        _write_json(actual_config, config)
+        actual_command = _p_profile_worker_command(actual_config, actual_work_dir)
+        if preflight_returncode == 0:
+            try:
+                returncode = subprocess.run(actual_command, check=False).returncode
+            except OSError as error:
+                returncode = 2
+                _write_json(
+                    actual_worker,
+                    {
+                        "schema_version": config["schema_version"],
+                        "run_id": config["run_id"],
+                        "role": "prefill",
+                        "runner_boundary": "GPUWorker.execute_model",
+                        "point_manifest": [],
+                        "prefix_evidence": [],
+                        "samples": [],
+                        "hardware_validated": False,
+                        "status": "failed",
+                        "error": f"worker launch failed: {error}",
+                    },
+                )
+        else:
+            returncode = 2
+            _write_json(
+                actual_worker,
+                {
+                    "schema_version": config["schema_version"],
+                    "run_id": config["run_id"],
+                    "role": "prefill",
+                    "runner_boundary": "GPUWorker.execute_model",
+                    "point_manifest": [],
+                    "prefix_evidence": [],
+                    "samples": [],
+                    "hardware_validated": False,
+                    "status": "failed",
+                    "error": "hardware preflight failed",
+                },
+            )
+        if not actual_worker.is_file():
+            _write_json(
+                actual_worker,
+                {
+                    "schema_version": config["schema_version"],
+                    "run_id": config["run_id"],
+                    "role": "prefill",
+                    "runner_boundary": "GPUWorker.execute_model",
+                    "point_manifest": [],
+                    "prefix_evidence": [],
+                    "samples": [],
+                    "hardware_validated": False,
+                    "status": "failed",
+                    "error": "worker result is missing",
+                },
+            )
+            returncode = 2
+        try:
+            worker = json.loads(actual_worker.read_text())
+            if not isinstance(worker, dict):
+                raise ValueError("worker result must be a JSON object")
+        except (json.JSONDecodeError, OSError, ValueError) as error:
+            worker = {
+                "schema_version": config["schema_version"],
+                "run_id": config["run_id"],
+                "role": "prefill",
+                "runner_boundary": "GPUWorker.execute_model",
+                "point_manifest": [],
+                "prefix_evidence": [],
+                "samples": [],
+                "hardware_validated": False,
+                "status": "failed",
+                "error": f"invalid worker result: {error}",
+            }
+            returncode = 2
+        worker["command"] = actual_command
+        worker["returncode"] = returncode
+        _write_json(actual_worker, worker)
+        command = _p_profile_assemble_command(
+            actual_config, actual_preflight, actual_worker, output_dir
+        )
+        assemble_returncode = subprocess.run(command, check=False).returncode
+        if assemble_returncode != 0:
+            return assemble_returncode
+        return subprocess.run(validate_command, check=False).returncode
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="DS4 container runtime checks.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -944,6 +1266,18 @@ def main() -> None:
     )
     profile_spine.add_argument("--output-dir", type=Path)
     profile_spine.add_argument("--print-plan", action="store_true")
+    p_profile = subparsers.add_parser("p-profile")
+    p_profile.add_argument(
+        "--config", type=Path, default=Path("/mnt/ds4/config/container-contract.json")
+    )
+    p_profile.add_argument(
+        "--profile-config",
+        type=Path,
+        default=Path("/mnt/ds4/config/p-prefill-profile.json"),
+    )
+    p_profile.add_argument("--output-dir", type=Path)
+    p_profile.add_argument("--smoke", action="store_true")
+    p_profile.add_argument("--print-plan", action="store_true")
     cache_model = subparsers.add_parser("cache-model")
     cache_model.add_argument(
         "--config", type=Path, default=Path("/mnt/ds4/config/container-contract.json")
@@ -981,6 +1315,16 @@ def main() -> None:
                 args.config,
                 args.profile_config,
                 args.output_dir,
+                args.print_plan,
+            )
+        )
+    if args.command == "p-profile":
+        raise SystemExit(
+            _p_profile(
+                args.config,
+                args.profile_config,
+                args.output_dir,
+                args.smoke,
                 args.print_plan,
             )
         )
