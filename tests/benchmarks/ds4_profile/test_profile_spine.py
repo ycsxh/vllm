@@ -282,6 +282,20 @@ def test_v1_result_still_validates(tmp_path: Path) -> None:
     profile_spine._validate_result_dir(output_dir)
 
 
+def test_v1_ignores_v2_only_validation_state_metadata(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    config_path = _write_fixture_inputs(tmp_path)
+    output_dir = tmp_path / "v1-result"
+    profile_spine._write_fixture_result(config_path, output_dir)
+    provenance_path = output_dir / "provenance.json"
+    provenance = json.loads(provenance_path.read_text())
+    provenance["validation_state"] = "legacy-external-state"
+    provenance_path.write_text(json.dumps(provenance))
+
+    profile_spine._validate_result_dir(output_dir)
+
+
 def test_v2_validator_rejects_unknown_schema_version(tmp_path: Path) -> None:
     from benchmarks.ds4_profile import profile_spine
 
@@ -290,6 +304,19 @@ def test_v2_validator_rejects_unknown_schema_version(tmp_path: Path) -> None:
     config["schema_version"] = "3.0.0"
     (output_dir / "run-config.json").write_text(json.dumps(config))
     with pytest.raises(ValueError, match="unsupported schema_version"):
+        profile_spine._validate_result_dir(output_dir)
+
+
+def test_v2_validator_rejects_unknown_validation_state(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    output_dir = _write_v2_result(tmp_path)
+    provenance_path = output_dir / "provenance.json"
+    provenance = json.loads(provenance_path.read_text())
+    provenance["validation_state"] = "passed"
+    provenance_path.write_text(json.dumps(provenance))
+
+    with pytest.raises(ValueError, match="unknown validation_state"):
         profile_spine._validate_result_dir(output_dir)
 
 

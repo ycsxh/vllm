@@ -483,3 +483,42 @@ def test_comparison_rejects_unvalidated_terminal_ooc_claim() -> None:
             (hit, recompute),
             [terminal],
         )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        {"chunk_index": -1},
+        {"chunk_count": 1},
+        {"phase": "steady", "ordinal": 10},
+        {"sample_id": "wrong-coordinate"},
+    ),
+)
+def test_comparison_requires_canonical_terminal_coordinates(
+    mutation: dict[str, object],
+) -> None:
+    hit, recompute, raw_rows = _artifact_rows()
+    turns = profile_spine.summarize_turn_samples(raw_rows, (hit, recompute))
+    aggregates = profile_spine.aggregate_turn_samples(turns, 0.05)
+    terminal = _passed_chunk_row(hit, 0, hit.chunks[0], 4.0)
+    terminal.update(
+        row_kind="terminal",
+        status="out_of_capacity",
+        allocation_state="out_of_capacity",
+        requested_kv_blocks=129,
+        allocatable_kv_blocks=128,
+        requested_kv_bytes=129 * 1024,
+        allocator_pressure_proven=True,
+        clean_reset_proven=True,
+        runner_wall_time_ms=None,
+        cuda_model_time_ms=None,
+        runtime_mode=None,
+    )
+    terminal.update(mutation)
+
+    with pytest.raises(ValueError, match="unvalidated terminal OOC"):
+        profile_spine.compare_conditions(
+            [row for row in aggregates if row["point_id"] != hit.point_id],
+            (hit, recompute),
+            [terminal],
+        )

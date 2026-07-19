@@ -512,9 +512,21 @@ def aggregate_turn_samples(
 
 
 def _terminal_ooc_proven(row: dict[str, Any], point: PPointView) -> bool:
-    if row["chunk_index"] >= len(point.chunks):
+    chunk_index = row["chunk_index"]
+    phase = row["phase"]
+    ordinal_limit = 3 if phase == "warmup" else 10 if phase == "steady" else 0
+    if (
+        not isinstance(chunk_index, int)
+        or chunk_index < 0
+        or chunk_index >= len(point.chunks)
+        or row["chunk_count"] != len(point.chunks)
+        or ordinal_limit == 0
+        or row["ordinal"] < 0
+        or row["ordinal"] >= ordinal_limit
+        or row["sample_id"] != _raw_sample_id(row)
+    ):
         return False
-    planned = point.chunks[row["chunk_index"]].scheduled_tokens_by_request
+    planned = point.chunks[chunk_index].scheduled_tokens_by_request
     expected_vector = [
         {"request_key": key, "scheduled_tokens": tokens}
         for key, tokens in planned.items()
@@ -1074,9 +1086,6 @@ def _validate_v1_result_dir(result_dir: Path, config: dict[str, Any]) -> None:
     raw_rows = raw.to_pylist()
     aggregate_rows = aggregates.to_pylist()
     provenance = json.loads((result_dir / "provenance.json").read_text())
-    validation_state = provenance.get("validation_state")
-    if validation_state is not None and validation_state not in V2_VALIDATION_STATES:
-        raise ValueError("unknown validation_state")
     run_id = config["run_id"]
     observed_run_ids = {row["run_id"] for row in raw_rows + aggregate_rows} | {
         provenance.get("run_id")
@@ -1576,6 +1585,9 @@ def _validate_v2_result_dir(result_dir: Path, config: dict[str, Any]) -> None:
     }
     point_views = {point.point_id: point for point in _point_plans_from_config(config)}
     provenance = json.loads((result_dir / "provenance.json").read_text())
+    validation_state = provenance.get("validation_state")
+    if validation_state is not None and validation_state not in V2_VALIDATION_STATES:
+        raise ValueError("unknown validation_state")
     run_id = config.get("run_id")
     all_rows = raw_rows + turn_rows + aggregate_rows + comparison_rows + evidence_rows
     observed_run_ids = {row["run_id"] for row in all_rows} | {provenance.get("run_id")}
