@@ -3,8 +3,10 @@
 
 import copy
 from collections import Counter
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 import benchmarks.ds4_profile.prefill_profile as prefill_profile
 from benchmarks.ds4_profile import profile_spine
@@ -130,6 +132,313 @@ def _build_pinned_points():
         homogeneous_prefix_tokens=4096,
         seed=20260715,
     )
+
+
+class _FakeBlockPool:
+    num_gpu_blocks = 128
+
+    def __init__(self, free_blocks: int = 120) -> None:
+        self.free_blocks = free_blocks
+
+    def get_num_free_blocks(self) -> int:
+        return self.free_blocks
+
+
+class _FakeScheduler:
+    def __init__(self, output, *, free_blocks: int = 120) -> None:
+        self.output = output
+        self.requests = {request_id: object() for request_id in output.active_ids}
+        self.running = [SimpleNamespace(request_id=item) for item in output.active_ids]
+        self.waiting: list[SimpleNamespace] = []
+        self.scheduler_config = SimpleNamespace(long_prefill_token_threshold=0)
+        self.kv_cache_config = SimpleNamespace(
+            kv_cache_groups=(
+                SimpleNamespace(
+                    layer_names=("layer.0",),
+                    kv_cache_spec=SimpleNamespace(page_size_bytes=64),
+                ),
+            )
+        )
+        self.kv_cache_manager = SimpleNamespace(
+            block_size=16,
+            block_pool=_FakeBlockPool(free_blocks),
+            get_block_ids=lambda _request_id: ([10],),
+        )
+        self.reset_succeeds = True
+
+    def schedule(self):
+        return self.output
+
+    def add_request(self, request) -> None:
+        self.requests[request.request_id] = request
+        self.running = [request]
+        self.output = _fake_output(
+            {request.request_id: len(request.prompt_token_ids)}, block_ids=(10,)
+        )
+
+    def finish_requests(self, request_ids, _status) -> None:
+        for request_id in request_ids:
+            self.requests.pop(request_id, None)
+        self.running = []
+        self.waiting = []
+        self.output = _fake_output({}, active_ids=())
+
+    def update_from_output(self, _scheduler_output, _model_output) -> None:
+        pass
+
+    def reset_prefix_cache(self) -> bool:
+        if self.reset_succeeds:
+            self.kv_cache_manager.block_pool.free_blocks = 128
+        return self.reset_succeeds
+
+
+class _FakeExecutor:
+    def __init__(self) -> None:
+        self.execute_calls = 0
+        self.timed_execute_calls = 0
+
+    def execute_model(self, _scheduler_output):
+        self.execute_calls += 1
+        return SimpleNamespace()
+
+
+def _fake_output(
+    tokens: dict[str, int],
+    *,
+    active_ids: tuple[str, ...] | None = None,
+    computed_tokens: int = 0,
+    block_ids: tuple[int, ...] = (10,),
+    preempted: tuple[str, ...] = (),
+):
+    new_requests = [
+        SimpleNamespace(
+            req_id=request_id,
+            num_computed_tokens=computed_tokens,
+            block_ids=(list(block_ids),),
+        )
+        for request_id in tokens
+    ]
+    return SimpleNamespace(
+        num_scheduled_tokens=tokens,
+        total_num_scheduled_tokens=sum(tokens.values()),
+        scheduled_new_reqs=new_requests,
+        scheduled_cached_reqs=SimpleNamespace(req_ids=()),
+        preempted_req_ids=preempted,
+        active_ids=tuple(tokens) if active_ids is None else active_ids,
+    )
+
+
+def _adapter(output, *, tensor=None, free_blocks: int = 120, block_axes=(0,)):
+    scheduler = _FakeScheduler(output, free_blocks=free_blocks)
+    executor = _FakeExecutor()
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            kv_caches=[torch.empty((128, 2)) if tensor is None else tensor]
+        )
+    )
+    return (
+        prefill_profile.VllmSchedulerCacheAdapter(
+            scheduler,
+            executor,
+            worker,
+            block_axes=block_axes,
+        ),
+        executor,
+    )
+
+
+def _adapter_point(cache_condition: str = "prefix_hit"):
+    request = prefill_profile.PRequestPlan(
+        request_key="r0",
+        trajectory_id=None,
+        turn_index=None,
+        reasoning_mode=None,
+        prompt_token_ids=tuple(range(32)),
+        context_tokens=32,
+        cached_tokens=16,
+        new_tokens=16,
+        token_digest="d" * 64,
+    )
+    chunk = prefill_profile.PChunkPlan(
+        0, {"r0": 16 if cache_condition == "prefix_hit" else 32}
+    )
+    return prefill_profile.PPointPlan(
+        point_id="point",
+        comparison_id="comparison",
+        workload_family="homogeneous",
+        selector="adapter",
+        composition="none",
+        seed=1,
+        batch_size=1,
+        cache_condition=cache_condition,
+        planner_digest="e" * 64,
+        requests=(request,),
+        chunks=(chunk,),
+        canonical_payload={},
+    )
+
+
+def _prime_evidence(
+    *, completed=True, synchronized=True, hardware=True, block_ids=(10,)
+):
+    return prefill_profile.PrefixPrimeEvidence(
+        request_key="r0",
+        intended_cached_tokens=16,
+        actual_cached_tokens=16,
+        prime_scheduler_outputs=(),
+        measured_block_ids_by_group=(block_ids,),
+        worker_groups=(),
+        prime_completed=completed,
+        prime_synchronized=synchronized,
+        hardware_validated=hardware,
+        kv_bytes=64,
+    )
+
+
+def test_schedule_chunk_preserves_exact_planned_request_vector() -> None:
+    point = _adapter_point()
+    adapter, executor = _adapter(_fake_output({"r0": 16}))
+
+    scheduled = adapter.schedule_chunk(point, point.chunks[0])
+    adapter.require_complete_chunk(scheduled)
+
+    assert scheduled.actual_tokens_by_request == {"r0": 16}
+    assert executor.timed_execute_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("output", "message"),
+    [
+        (_fake_output({}, active_ids=("r0",)), "partial request set"),
+        (_fake_output({"r0": 8}), "partial token vector"),
+        (_fake_output({"r0": 16}, preempted=("r0",)), "preempted"),
+        (_fake_output({"r0": 16, "other": 1}), "unrelated"),
+    ],
+)
+def test_incomplete_scheduler_output_never_reaches_gpu_timing(output, message) -> None:
+    point = _adapter_point()
+    adapter, executor = _adapter(output)
+
+    scheduled = adapter.schedule_chunk(point, point.chunks[0])
+    with pytest.raises(RuntimeError, match=message):
+        adapter.require_complete_chunk(scheduled)
+
+    assert executor.timed_execute_calls == 0
+
+
+def test_hit_requires_an_executed_synchronized_prime() -> None:
+    point = _adapter_point()
+    output = _fake_output({"r0": 16}, computed_tokens=16)
+    adapter, executor = _adapter(output)
+
+    with pytest.raises(RuntimeError, match="prefix was not executed on GPU0"):
+        adapter.verify_hit(point, output)
+
+    assert executor.timed_execute_calls == 0
+
+
+def test_cpu_prime_executes_but_never_claims_hardware_validation() -> None:
+    point = _adapter_point()
+    adapter, executor = _adapter(_fake_output({}, active_ids=()))
+    adapter.request_factory = lambda request_id, tokens: SimpleNamespace(
+        request_id=request_id, prompt_token_ids=tokens
+    )
+
+    evidence = adapter.prime(point, "warmup", 0)
+
+    assert len(evidence) == 1
+    assert evidence[0].prime_completed
+    assert not evidence[0].prime_synchronized
+    assert not evidence[0].hardware_validated
+    assert not evidence[0].worker_groups[0].live_cuda_tensor_proven
+    assert executor.execute_calls == 2
+
+
+def test_hit_rejects_different_physical_block_ids_before_timing() -> None:
+    point = _adapter_point()
+    output = _fake_output({"r0": 16}, computed_tokens=16, block_ids=(11,))
+    adapter, executor = _adapter(output)
+    adapter._prime_evidence["r0"] = _prime_evidence()
+
+    with pytest.raises(RuntimeError, match="physical block IDs"):
+        adapter.verify_hit(point, output)
+
+    assert executor.timed_execute_calls == 0
+
+
+def test_cpu_tensor_cannot_validate_resident_gpu0_blocks() -> None:
+    point = _adapter_point()
+    output = _fake_output({"r0": 16}, computed_tokens=16)
+    adapter, executor = _adapter(output)
+    adapter._prime_evidence["r0"] = _prime_evidence()
+
+    with pytest.raises(RuntimeError, match="not on cuda:0"):
+        adapter.verify_hit(point, output)
+
+    assert executor.timed_execute_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("tensor", "block_axes", "block_ids", "message"),
+    [
+        (object(), (0,), (10,), "not a torch.Tensor"),
+        (torch.empty((4, 2)), (2,), (1,), "invalid.*block axis"),
+        (torch.empty((4, 2)), (0,), (4,), "outside the live tensor"),
+    ],
+)
+def test_live_tensor_inspection_fails_closed(
+    tensor, block_axes, block_ids, message
+) -> None:
+    adapter, _ = _adapter(
+        _fake_output({"r0": 16}), tensor=tensor, block_axes=block_axes
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        adapter._inspect_worker_groups((block_ids,), require_hardware=False)
+
+
+def test_full_recompute_requires_zero_cached_tokens() -> None:
+    point = _adapter_point("full_recompute")
+    output = _fake_output({"r0": 32}, computed_tokens=16)
+    adapter, executor = _adapter(output)
+
+    with pytest.raises(RuntimeError, match="unexpectedly reused"):
+        adapter.verify_recompute_miss(point, output)
+
+    assert executor.timed_execute_calls == 0
+
+
+def test_reset_epoch_rejects_failed_prefix_cache_reset() -> None:
+    adapter, _ = _adapter(_fake_output({"r0": 16}))
+    adapter.scheduler.reset_succeeds = False
+
+    with pytest.raises(RuntimeError, match="prefix cache reset failed"):
+        adapter.reset_epoch()
+
+
+def test_allocator_ooc_requires_pressure_and_clean_reset() -> None:
+    point = _adapter_point()
+    adapter, executor = _adapter(_fake_output({}, active_ids=("r0",)), free_blocks=0)
+    scheduled = adapter.schedule_chunk(point, point.chunks[0])
+
+    allocation = adapter.classify_out_of_capacity(point, point.chunks[0], scheduled)
+
+    assert allocation is not None
+    assert allocation.state == "out_of_capacity"
+    assert allocation.allocator_pressure_proven
+    assert allocation.clean_reset_proven
+    assert executor.timed_execute_calls == 0
+
+
+def test_partial_output_without_allocator_pressure_is_invalid() -> None:
+    point = _adapter_point()
+    adapter, executor = _adapter(_fake_output({}, active_ids=("r0",)), free_blocks=120)
+    scheduled = adapter.schedule_chunk(point, point.chunks[0])
+
+    with pytest.raises(RuntimeError, match="allocator-pressure proof"):
+        adapter.classify_out_of_capacity(point, point.chunks[0], scheduled)
+
+    assert executor.timed_execute_calls == 0
 
 
 def test_planner_expands_the_pinned_matrix_to_68_points() -> None:

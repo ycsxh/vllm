@@ -4,7 +4,9 @@
 """Deterministic P-side prefill workload planning."""
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any, Literal
 
 from benchmarks.ds4_profile.profile_spine import (
@@ -56,6 +58,511 @@ class PPointPlan:
     requests: tuple[PRequestPlan, ...]
     chunks: tuple[PChunkPlan, ...]
     canonical_payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class SchedulerBlockTableEvidence:
+    chunk_index: int
+    request_key: str
+    block_ids_by_group: tuple[tuple[int, ...], ...]
+    execution_completed: bool
+    gpu_synchronized: bool
+
+
+@dataclass(frozen=True)
+class WorkerKvTensorGroupEvidence:
+    group_index: int
+    tensor_names: tuple[str, ...]
+    tensor_devices: tuple[str, ...]
+    tensor_shapes: tuple[tuple[int, ...], ...]
+    block_axis: int
+    block_dimension: int
+    verified_block_ids: tuple[int, ...]
+    live_cuda_tensor_proven: bool
+
+
+@dataclass(frozen=True)
+class PrefixPrimeEvidence:
+    request_key: str
+    intended_cached_tokens: int
+    actual_cached_tokens: int
+    prime_scheduler_outputs: tuple[SchedulerBlockTableEvidence, ...]
+    measured_block_ids_by_group: tuple[tuple[int, ...], ...]
+    worker_groups: tuple[WorkerKvTensorGroupEvidence, ...]
+    prime_completed: bool
+    prime_synchronized: bool
+    hardware_validated: bool
+    kv_bytes: int
+
+
+@dataclass(frozen=True)
+class AllocationEvidence:
+    state: Literal["allocated", "out_of_capacity", "failed"]
+    requested_blocks: int
+    allocated_blocks: int
+    allocatable_blocks: int
+    requested_bytes: int
+    allocated_bytes: int
+    lookup_time_ms: float
+    allocation_time_ms: float
+    allocator_pressure_proven: bool
+    clean_reset_proven: bool
+
+
+@dataclass(frozen=True)
+class ScheduledChunk:
+    scheduler_output: Any
+    expected_request_ids: tuple[str, ...]
+    actual_request_ids: tuple[str, ...]
+    expected_tokens_by_request: dict[str, int]
+    actual_tokens_by_request: dict[str, int]
+    preempted_request_ids: tuple[str, ...]
+    unrelated_request_ids: tuple[str, ...]
+    allocation: AllocationEvidence
+
+
+class VllmSchedulerCacheAdapter:
+    """Version-specific boundary around Scheduler and live KV cache state."""
+
+    def __init__(
+        self,
+        scheduler: Any,
+        executor: Any,
+        worker: Any,
+        *,
+        request_factory: Callable[[str, list[int]], Any] | None = None,
+        synchronize_gpu: Callable[[], None] | None = None,
+        block_axes: tuple[int, ...] | None = None,
+    ) -> None:
+        self.scheduler = scheduler
+        self.executor = executor
+        self.worker = worker
+        self.request_factory = request_factory
+        self.synchronize_gpu = synchronize_gpu
+        self.block_axes = block_axes
+        self._prime_evidence: dict[str, PrefixPrimeEvidence] = {}
+
+    @classmethod
+    def from_runtime(
+        cls,
+        scheduler: Any,
+        executor: Any,
+        worker: Any,
+        *,
+        block_axes: tuple[int, ...],
+    ) -> "VllmSchedulerCacheAdapter":
+        """Create the real adapter while keeping vLLM imports lazy."""
+        import torch
+
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.request import Request
+
+        def make_request(request_id: str, tokens: list[int]) -> Any:
+            return Request(
+                request_id,
+                tokens,
+                SamplingParams(max_tokens=1, temperature=0.0),
+                None,
+            )
+
+        return cls(
+            scheduler,
+            executor,
+            worker,
+            request_factory=make_request,
+            synchronize_gpu=lambda: torch.accelerator.synchronize(
+                torch.device("cuda:0")
+            ),
+            block_axes=block_axes,
+        )
+
+    @staticmethod
+    def _request_id(request: Any) -> str:
+        return str(getattr(request, "request_id", getattr(request, "req_id", request)))
+
+    def _scheduler_request_ids(self) -> set[str]:
+        requests = getattr(self.scheduler, "requests", {})
+        return (
+            set(requests)
+            if isinstance(requests, dict)
+            else {self._request_id(request) for request in requests}
+        )
+
+    def _queue_request_ids(self) -> set[str]:
+        return {
+            self._request_id(request)
+            for name in ("running", "waiting")
+            for request in getattr(self.scheduler, name, ())
+        }
+
+    @staticmethod
+    def _scheduled_vectors(output: Any) -> tuple[dict[str, int], dict[str, Any]]:
+        tokens = {
+            str(request_id): int(count)
+            for request_id, count in getattr(output, "num_scheduled_tokens", {}).items()
+        }
+        request_data: dict[str, Any] = {}
+        for item in getattr(output, "scheduled_new_reqs", ()):
+            request_data[str(item.req_id)] = item
+        cached = getattr(output, "scheduled_cached_reqs", None)
+        if cached is not None:
+            for index, request_id in enumerate(getattr(cached, "req_ids", ())):
+                request_data[str(request_id)] = (cached, index)
+        return tokens, request_data
+
+    @staticmethod
+    def _block_ids(request_data: Any) -> tuple[tuple[int, ...], ...]:
+        if isinstance(request_data, tuple):
+            cached, index = request_data
+            return tuple(
+                tuple(int(block_id) for block_id in group[index])
+                for group in cached.new_block_ids
+            )
+        return tuple(
+            tuple(int(block_id) for block_id in group)
+            for group in request_data.block_ids
+        )
+
+    @staticmethod
+    def _computed_tokens(request_data: Any) -> int:
+        if isinstance(request_data, tuple):
+            cached, index = request_data
+            return int(cached.num_computed_tokens[index])
+        return int(request_data.num_computed_tokens)
+
+    def _kv_page_bytes(self) -> tuple[int, ...]:
+        config = getattr(self.scheduler, "kv_cache_config", None)
+        groups = getattr(config, "kv_cache_groups", ())
+        return tuple(int(group.kv_cache_spec.page_size_bytes) for group in groups)
+
+    def _allocation_snapshot(
+        self, expected_tokens: dict[str, int], elapsed_ms: float
+    ) -> AllocationEvidence:
+        manager = self.scheduler.kv_cache_manager
+        block_size = int(getattr(manager, "block_size", CANONICAL_BLOCK_SIZE))
+        requested = sum(
+            (tokens + block_size - 1) // block_size
+            for tokens in expected_tokens.values()
+        )
+        pool = manager.block_pool
+        free = int(pool.get_num_free_blocks())
+        allocated = max(0, requested - free)
+        page_bytes = self._kv_page_bytes()
+        block_bytes = (
+            sum(page_bytes)
+            if page_bytes
+            else int(getattr(manager, "kv_block_bytes", 0))
+        )
+        return AllocationEvidence(
+            state="allocated",
+            requested_blocks=requested,
+            allocated_blocks=allocated,
+            allocatable_blocks=free,
+            requested_bytes=requested * block_bytes,
+            allocated_bytes=allocated * block_bytes,
+            lookup_time_ms=elapsed_ms,
+            allocation_time_ms=elapsed_ms,
+            allocator_pressure_proven=False,
+            clean_reset_proven=False,
+        )
+
+    def reset_epoch(self) -> None:
+        """Abort and flush every request, then prove an empty cache epoch."""
+        request_ids = self._scheduler_request_ids() | self._queue_request_ids()
+        if request_ids:
+            try:
+                from vllm.v1.request import RequestStatus
+
+                status = RequestStatus.FINISHED_ABORTED
+            except ImportError:
+                status = "finished_aborted"
+            self.scheduler.finish_requests(sorted(request_ids), status)
+            flush = self.scheduler.schedule()
+            if getattr(flush, "total_num_scheduled_tokens", 0):
+                raise RuntimeError("reset flush scheduled model work")
+            model_output = self.executor.execute_model(flush)
+            self.scheduler.update_from_output(flush, model_output)
+        if self._scheduler_request_ids() or self._queue_request_ids():
+            raise RuntimeError("reset left live Scheduler requests")
+        if not self.scheduler.reset_prefix_cache():
+            raise RuntimeError("prefix cache reset failed")
+        pool = self.scheduler.kv_cache_manager.block_pool
+        used = int(getattr(pool, "num_gpu_blocks", 0)) - int(pool.get_num_free_blocks())
+        if used > 1:
+            raise RuntimeError("prefix cache reset left live KV blocks")
+        self._prime_evidence.clear()
+
+    def _inspect_worker_groups(
+        self,
+        block_ids_by_group: tuple[tuple[int, ...], ...],
+        *,
+        require_hardware: bool,
+    ) -> tuple[WorkerKvTensorGroupEvidence, ...]:
+        import torch
+
+        config = getattr(self.scheduler, "kv_cache_config", None)
+        configured_groups = tuple(getattr(config, "kv_cache_groups", ()))
+        tensors = tuple(getattr(self.worker.model_runner, "kv_caches", ()))
+        axes = self.block_axes or tuple(0 for _ in configured_groups)
+        if len(block_ids_by_group) != len(configured_groups) or len(axes) != len(
+            configured_groups
+        ):
+            raise RuntimeError("KV cache group evidence is incomplete")
+        offset = 0
+        evidence = []
+        for group_index, (group, block_ids, block_axis) in enumerate(
+            zip(configured_groups, block_ids_by_group, axes)
+        ):
+            names = tuple(group.layer_names)
+            mapped = tensors[offset : offset + len(names)]
+            offset += len(names)
+            if len(mapped) != len(names):
+                raise RuntimeError("missing configured layer tensor")
+            if not mapped or any(
+                not isinstance(tensor, torch.Tensor) for tensor in mapped
+            ):
+                raise RuntimeError("live KV cache entry is not a torch.Tensor")
+            if any(block_axis < 0 or block_axis >= tensor.ndim for tensor in mapped):
+                raise RuntimeError("invalid KV cache physical block axis")
+            dimensions = {int(tensor.shape[block_axis]) for tensor in mapped}
+            if len(dimensions) != 1:
+                raise RuntimeError("KV cache tensors disagree on block dimension")
+            dimension = dimensions.pop()
+            if any(block_id < 0 or block_id >= dimension for block_id in block_ids):
+                raise RuntimeError("physical block ID is outside the live tensor")
+            cuda0 = all(
+                tensor.is_cuda and tensor.device == torch.device("cuda:0")
+                for tensor in mapped
+            )
+            if require_hardware and not cuda0:
+                raise RuntimeError("live KV cache tensor is not on cuda:0")
+            evidence.append(
+                WorkerKvTensorGroupEvidence(
+                    group_index=group_index,
+                    tensor_names=names,
+                    tensor_devices=tuple(str(tensor.device) for tensor in mapped),
+                    tensor_shapes=tuple(tuple(tensor.shape) for tensor in mapped),
+                    block_axis=block_axis,
+                    block_dimension=dimension,
+                    verified_block_ids=block_ids,
+                    live_cuda_tensor_proven=cuda0,
+                )
+            )
+        if offset != len(tensors):
+            raise RuntimeError("live KV cache contains unmapped layer tensors")
+        return tuple(evidence)
+
+    def prime(
+        self, point: PPointPlan, phase: str, ordinal: int
+    ) -> tuple[PrefixPrimeEvidence, ...]:
+        """Execute and synchronize every reusable prefix outside GPU timing."""
+        if point.cache_condition != "prefix_hit":
+            return ()
+        if self.request_factory is None:
+            raise RuntimeError("prefix priming requires a real request factory")
+        evidence = []
+        for request in point.requests:
+            prime_id = f"prime:{phase}:{ordinal}:{request.request_key}"
+            prefix = list(request.prompt_token_ids[: request.cached_tokens])
+            self.scheduler.add_request(self.request_factory(prime_id, prefix))
+            self.scheduler.max_num_scheduled_tokens = request.cached_tokens
+            self.scheduler.scheduler_config.long_prefill_token_threshold = (
+                request.cached_tokens
+            )
+            output = self.scheduler.schedule()
+            scheduled, request_data = self._scheduled_vectors(output)
+            if scheduled != {prime_id: request.cached_tokens}:
+                raise RuntimeError("prefix prime SchedulerOutput was partial")
+            prime_data = request_data.get(prime_id)
+            if prime_data is None:
+                raise RuntimeError("prefix prime omitted its Scheduler block table")
+            sent_block_ids = self._block_ids(prime_data)
+            model_output = self.executor.execute_model(output)
+            self.scheduler.update_from_output(output, model_output)
+            synchronized = self.synchronize_gpu is not None
+            if self.synchronize_gpu is not None:
+                self.synchronize_gpu()
+            measured = tuple(
+                tuple(int(block_id) for block_id in group)
+                for group in self.scheduler.kv_cache_manager.get_block_ids(prime_id)
+            )
+            intended_blocks = request.cached_tokens // CANONICAL_BLOCK_SIZE
+            measured = tuple(group[:intended_blocks] for group in measured)
+            if tuple(group[:intended_blocks] for group in sent_block_ids) != measured:
+                raise RuntimeError("prime block table changed after GPU execution")
+            worker_groups = self._inspect_worker_groups(
+                measured, require_hardware=synchronized
+            )
+            page_bytes = self._kv_page_bytes()
+            kv_bytes = sum(
+                len(group) * page_bytes[index] for index, group in enumerate(measured)
+            )
+            item = PrefixPrimeEvidence(
+                request_key=request.request_key,
+                intended_cached_tokens=request.cached_tokens,
+                actual_cached_tokens=request.cached_tokens,
+                prime_scheduler_outputs=(
+                    SchedulerBlockTableEvidence(
+                        chunk_index=0,
+                        request_key=request.request_key,
+                        block_ids_by_group=sent_block_ids,
+                        execution_completed=True,
+                        gpu_synchronized=synchronized,
+                    ),
+                ),
+                measured_block_ids_by_group=measured,
+                worker_groups=worker_groups,
+                prime_completed=True,
+                prime_synchronized=synchronized,
+                hardware_validated=synchronized
+                and all(group.live_cuda_tensor_proven for group in worker_groups),
+                kv_bytes=kv_bytes,
+            )
+            if synchronized and not item.hardware_validated:
+                raise RuntimeError("prefix prime did not establish GPU0 HBM evidence")
+            self._prime_evidence[request.request_key] = item
+            evidence.append(item)
+            try:
+                from vllm.v1.request import RequestStatus
+
+                status = RequestStatus.FINISHED_ABORTED
+            except ImportError:
+                status = "finished_aborted"
+            self.scheduler.finish_requests([prime_id], status)
+            flush = self.scheduler.schedule()
+            if getattr(flush, "total_num_scheduled_tokens", 0):
+                raise RuntimeError("prefix-prime cleanup scheduled model work")
+            flush_output = self.executor.execute_model(flush)
+            self.scheduler.update_from_output(flush, flush_output)
+        return tuple(evidence)
+
+    def schedule_chunk(self, point: PPointPlan, chunk: PChunkPlan) -> ScheduledChunk:
+        """Schedule exactly one planned chunk without executing it."""
+        expected = dict(chunk.scheduled_tokens_by_request)
+        expected_ids = tuple(expected)
+        state_ids = self._scheduler_request_ids() | self._queue_request_ids()
+        unrelated_state = tuple(sorted(state_ids - set(expected_ids)))
+        self.scheduler.max_num_scheduled_tokens = sum(expected.values())
+        self.scheduler.scheduler_config.long_prefill_token_threshold = max(
+            expected.values()
+        )
+        started = perf_counter()
+        output = self.scheduler.schedule()
+        elapsed_ms = (perf_counter() - started) * 1000
+        actual, _ = self._scheduled_vectors(output)
+        actual_ids = tuple(actual)
+        preempted = tuple(
+            str(item) for item in getattr(output, "preempted_req_ids", ())
+        )
+        unrelated = tuple(
+            sorted(set(actual_ids) - set(expected_ids) | set(unrelated_state))
+        )
+        allocation = self._allocation_snapshot(expected, elapsed_ms)
+        return ScheduledChunk(
+            scheduler_output=output,
+            expected_request_ids=expected_ids,
+            actual_request_ids=actual_ids,
+            expected_tokens_by_request=expected,
+            actual_tokens_by_request=actual,
+            preempted_request_ids=preempted,
+            unrelated_request_ids=unrelated,
+            allocation=allocation,
+        )
+
+    @staticmethod
+    def require_complete_chunk(scheduled: ScheduledChunk) -> None:
+        """Reject any SchedulerOutput that must not enter GPU timing."""
+        if scheduled.unrelated_request_ids:
+            raise RuntimeError(
+                "Scheduler state or output contains an unrelated request"
+            )
+        if scheduled.preempted_request_ids:
+            raise RuntimeError("Scheduler preempted an expected request")
+        if scheduled.actual_request_ids != scheduled.expected_request_ids:
+            raise RuntimeError("Scheduler returned a partial request set")
+        if scheduled.actual_tokens_by_request != scheduled.expected_tokens_by_request:
+            raise RuntimeError("Scheduler returned a partial token vector")
+        if sum(scheduled.actual_tokens_by_request.values()) > 4096:
+            raise RuntimeError("Scheduler output exceeds 4096 scheduled tokens")
+
+    def verify_hit(self, point: PPointPlan, scheduler_output: Any) -> None:
+        """Prove that measured lookup reuses synchronized resident GPU0 blocks."""
+        _, request_data = self._scheduled_vectors(scheduler_output)
+        for request in point.requests:
+            prime = self._prime_evidence.get(request.request_key)
+            if (
+                prime is None
+                or not prime.prime_completed
+                or not prime.prime_synchronized
+            ):
+                raise RuntimeError("prefix was not executed on GPU0")
+            measured = request_data.get(request.request_key)
+            if (
+                measured is None
+                or self._computed_tokens(measured) != request.cached_tokens
+            ):
+                raise RuntimeError(
+                    "measured cached-token count does not match the prime"
+                )
+            block_ids = self._block_ids(measured)
+            prefix_blocks = request.cached_tokens // CANONICAL_BLOCK_SIZE
+            prefix_ids = tuple(group[:prefix_blocks] for group in block_ids)
+            if prefix_ids != prime.measured_block_ids_by_group:
+                raise RuntimeError("measured physical block IDs do not match the prime")
+            groups = self._inspect_worker_groups(prefix_ids, require_hardware=True)
+            if not prime.hardware_validated or not all(
+                group.live_cuda_tensor_proven for group in groups
+            ):
+                raise RuntimeError("prefix was not proven resident in GPU0 HBM")
+
+    def verify_recompute_miss(self, point: PPointPlan, scheduler_output: Any) -> None:
+        """Require a zero-hit lookup for every recompute request."""
+        _, request_data = self._scheduled_vectors(scheduler_output)
+        for request in point.requests:
+            measured = request_data.get(request.request_key)
+            if measured is None or self._computed_tokens(measured) != 0:
+                raise RuntimeError("full recompute unexpectedly reused cached tokens")
+
+    def classify_out_of_capacity(
+        self, point: PPointPlan, chunk: PChunkPlan, scheduled: ScheduledChunk
+    ) -> AllocationEvidence | None:
+        """Return proven terminal OOC evidence or reject an invalid partial output."""
+        complete = (
+            not scheduled.unrelated_request_ids
+            and not scheduled.preempted_request_ids
+            and scheduled.actual_request_ids == scheduled.expected_request_ids
+            and scheduled.actual_tokens_by_request
+            == scheduled.expected_tokens_by_request
+        )
+        if complete:
+            return None
+        expected = set(chunk.scheduled_tokens_by_request)
+        state = self._scheduler_request_ids() | self._queue_request_ids()
+        actual = set(scheduled.actual_request_ids)
+        if (
+            state != expected
+            or not actual <= expected
+            or scheduled.unrelated_request_ids
+        ):
+            raise RuntimeError(
+                "partial SchedulerOutput was not isolated to the expected batch"
+            )
+        allocation = scheduled.allocation
+        if allocation.requested_blocks <= allocation.allocatable_blocks:
+            raise RuntimeError("partial SchedulerOutput lacks allocator-pressure proof")
+        self.reset_epoch()
+        return AllocationEvidence(
+            state="out_of_capacity",
+            requested_blocks=allocation.requested_blocks,
+            allocated_blocks=allocation.allocated_blocks,
+            allocatable_blocks=allocation.allocatable_blocks,
+            requested_bytes=allocation.requested_bytes,
+            allocated_bytes=allocation.allocated_bytes,
+            lookup_time_ms=allocation.lookup_time_ms,
+            allocation_time_ms=allocation.allocation_time_ms,
+            allocator_pressure_proven=True,
+            clean_reset_proven=True,
+        )
 
 
 def _request_chunk_accounting(
