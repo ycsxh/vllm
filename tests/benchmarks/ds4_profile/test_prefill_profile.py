@@ -413,7 +413,11 @@ def _passed_chunk_row(
     )
 
 
-def test_turn_and_comparison_statistics_are_recomputed_from_chunks() -> None:
+def _artifact_rows() -> tuple[
+    prefill_profile.PPointPlan,
+    prefill_profile.PPointPlan,
+    list[dict],
+]:
     hit = _artifact_point("prefix_hit")
     recompute = _artifact_point("full_recompute")
     raw_rows: list[dict] = []
@@ -426,13 +430,56 @@ def test_turn_and_comparison_statistics_are_recomputed_from_chunks() -> None:
             _passed_chunk_row(recompute, ordinal, chunk, wall_time)
             for chunk, wall_time in zip(recompute.chunks, (6.0, 10.0), strict=True)
         )
+    return hit, recompute, raw_rows
+
+
+def test_turn_statistics_are_recomputed_from_chunks() -> None:
+    hit, recompute, raw_rows = _artifact_rows()
 
     turns = profile_spine.summarize_turn_samples(raw_rows, (hit, recompute))
-    aggregates = profile_spine.aggregate_turn_samples(turns, 0.05)
-    comparisons = profile_spine.compare_conditions(aggregates, (hit, recompute), [])
 
     hit_turn = next(row for row in turns if row["cache_condition"] == "prefix_hit")
     assert hit_turn["runner_wall_time_ms"] == 10.0
     assert hit_turn["throughput_tokens_per_s"] == 10_000.0
+
+
+def test_aggregates_use_exactly_ten_steady_turns() -> None:
+    hit, recompute, raw_rows = _artifact_rows()
+    turns = profile_spine.summarize_turn_samples(raw_rows, (hit, recompute))
+
+    aggregates = profile_spine.aggregate_turn_samples(turns, 0.05)
+
     assert {row["sample_count"] for row in aggregates} == {10}
+
+
+def test_comparison_statistics_are_recomputed_from_aggregates() -> None:
+    hit, recompute, raw_rows = _artifact_rows()
+    turns = profile_spine.summarize_turn_samples(raw_rows, (hit, recompute))
+    aggregates = profile_spine.aggregate_turn_samples(turns, 0.05)
+
+    comparisons = profile_spine.compare_conditions(aggregates, (hit, recompute), [])
+
     assert comparisons[0]["recompute_penalty_ms"] == 6.0
+
+
+def test_comparison_rejects_unvalidated_terminal_ooc_claim() -> None:
+    hit, recompute, raw_rows = _artifact_rows()
+    turns = profile_spine.summarize_turn_samples(raw_rows, (hit, recompute))
+    aggregates = profile_spine.aggregate_turn_samples(turns, 0.05)
+    terminal = _passed_chunk_row(hit, 0, hit.chunks[0], 4.0)
+    terminal.update(
+        row_kind="terminal",
+        status="out_of_capacity",
+        allocation_state="out_of_capacity",
+        requested_kv_blocks=129,
+        runner_wall_time_ms=None,
+        cuda_model_time_ms=None,
+        runtime_mode=None,
+    )
+
+    with pytest.raises(ValueError, match="unvalidated terminal OOC"):
+        profile_spine.compare_conditions(
+            [row for row in aggregates if row["point_id"] != hit.point_id],
+            (hit, recompute),
+            [terminal],
+        )

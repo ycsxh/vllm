@@ -116,7 +116,8 @@ def make_prefill_chunk_row(
     ):
         raise ValueError("chunk does not belong to the point plan")
     actual_tokens = allocation["actual_scheduled_tokens_by_request"]
-    context, cached, new, recomputed = _request_chunk_accounting(point, chunk)
+    actual_chunk = PChunkPlan(chunk.chunk_index, actual_tokens)
+    context, cached, new, recomputed = _request_chunk_accounting(point, actual_chunk)
     kv_block_bytes = allocation["kv_block_bytes"]
     requested_blocks = allocation["requested_blocks"]
     allocated_blocks = allocation["allocated_blocks"]
@@ -150,6 +151,8 @@ def make_prefill_chunk_row(
         "cache_epoch": allocation["cache_epoch"],
         "cache_reset_completed": allocation["cache_reset_completed"],
         "cache_reset_empty": allocation["cache_reset_empty"],
+        "allocator_pressure_proven": allocation.get("allocator_pressure_proven", False),
+        "clean_reset_proven": allocation.get("clean_reset_proven", False),
         "requested_kv_blocks": requested_blocks,
         "allocatable_kv_blocks": allocation["allocatable_blocks"],
         "allocated_kv_blocks": allocated_blocks,

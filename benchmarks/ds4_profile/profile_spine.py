@@ -9,9 +9,9 @@ import math
 import statistics
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
+from typing import Any, Protocol
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -31,6 +31,7 @@ V2_ENUMS = {
     "status": frozenset({"passed", "out_of_capacity", "failed"}),
     "allocation_state": frozenset({"allocated", "out_of_capacity", "failed"}),
 }
+V2_VALIDATION_STATES = frozenset({"remote_pending", "remote_failed", "remote_verified"})
 
 # Task 2 consumes this contract to generate the executable planner output.  Task
 # 1 deliberately keeps it small and data-only so validation can independently
@@ -230,6 +231,8 @@ V2_RAW_SAMPLE_SCHEMA = _v2_schema(
         pa.field("cache_epoch", pa.int64(), nullable=False),
         pa.field("cache_reset_completed", pa.bool_(), nullable=False),
         pa.field("cache_reset_empty", pa.bool_(), nullable=False),
+        pa.field("allocator_pressure_proven", pa.bool_(), nullable=False),
+        pa.field("clean_reset_proven", pa.bool_(), nullable=False),
         pa.field("requested_kv_blocks", pa.int32(), nullable=False),
         pa.field("allocatable_kv_blocks", pa.int32(), nullable=False),
         pa.field("allocated_kv_blocks", pa.int32(), nullable=False),
@@ -347,8 +350,42 @@ V2_PREFIX_EVIDENCE_SCHEMA = _v2_schema(
 )
 
 
+class PChunkView(Protocol):
+    chunk_index: int
+    scheduled_tokens_by_request: dict[str, int]
+
+
+class PPointView(Protocol):
+    point_id: str
+    comparison_id: str
+    workload_family: str
+    selector: str
+    composition: str
+    cache_condition: str
+    planner_digest: str
+    chunks: tuple[PChunkView, ...]
+
+
+@dataclass(frozen=True)
+class _ManifestChunk:
+    chunk_index: int
+    scheduled_tokens_by_request: dict[str, int]
+
+
+@dataclass(frozen=True)
+class _ManifestPoint:
+    point_id: str
+    comparison_id: str
+    workload_family: str
+    selector: str
+    composition: str
+    cache_condition: str
+    planner_digest: str
+    chunks: tuple[_ManifestChunk, ...]
+
+
 def summarize_turn_samples(
-    raw_rows: list[dict[str, Any]], points: tuple[Any, ...]
+    raw_rows: list[dict[str, Any]], points: tuple[PPointView, ...]
 ) -> list[dict[str, Any]]:
     """Derive complete turn samples from passed schema-v2 chunk rows."""
     points_by_id = {point.point_id: point for point in points}
@@ -474,20 +511,67 @@ def aggregate_turn_samples(
     return aggregates
 
 
+def _terminal_ooc_proven(row: dict[str, Any], point: PPointView) -> bool:
+    if row["chunk_index"] >= len(point.chunks):
+        return False
+    planned = point.chunks[row["chunk_index"]].scheduled_tokens_by_request
+    expected_vector = [
+        {"request_key": key, "scheduled_tokens": tokens}
+        for key, tokens in planned.items()
+    ]
+    if row["planned_scheduled_tokens_by_request"] != expected_vector:
+        return False
+    actual_items = row["actual_scheduled_tokens_by_request"]
+    actual = {item["request_key"]: item["scheduled_tokens"] for item in actual_items}
+    if len(actual) != len(actual_items) or any(
+        key not in planned or tokens <= 0 or tokens > planned[key]
+        for key, tokens in actual.items()
+    ):
+        return False
+    expected_request_ids = set(planned)
+    if (
+        not set(row["preempted_request_ids"]) <= expected_request_ids
+        or row["unrelated_request_ids"]
+    ):
+        return False
+    block_bytes = row["kv_block_bytes"]
+    return (
+        row["row_kind"] == "terminal"
+        and row["status"] == "out_of_capacity"
+        and row["allocation_state"] == "out_of_capacity"
+        and row["scheduled_tokens"] == sum(actual.values())
+        and row["requested_kv_blocks"] > row["allocatable_kv_blocks"]
+        and row["allocated_kv_blocks"] <= row["allocatable_kv_blocks"]
+        and block_bytes > 0
+        and row["requested_kv_bytes"] == row["requested_kv_blocks"] * block_bytes
+        and row["allocated_kv_bytes"] == row["allocated_kv_blocks"] * block_bytes
+        and row["allocator_pressure_proven"]
+        and row["clean_reset_proven"]
+        and row["cache_reset_completed"]
+        and row["cache_reset_empty"]
+        and row["runner_wall_time_ms"] is None
+        and row["cuda_model_time_ms"] is None
+        and row["runtime_mode"] is None
+    )
+
+
 def compare_conditions(
     aggregate_rows: list[dict[str, Any]],
-    points: tuple[Any, ...],
+    points: tuple[PPointView, ...],
     terminal_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Pair hit/recompute aggregates or require terminal OOC proof."""
     aggregates = {row["point_id"]: row for row in aggregate_rows}
-    terminals = {
-        row["point_id"]
-        for row in terminal_rows
-        if row["status"] == "out_of_capacity"
-        and row["allocation_state"] == "out_of_capacity"
-    }
     pairs: dict[str, dict[str, Any]] = {}
+    points_by_id = {point.point_id: point for point in points}
+    terminals = set()
+    for row in terminal_rows:
+        point = points_by_id.get(row["point_id"])
+        if point is None or not _terminal_ooc_proven(row, point):
+            raise ValueError("comparison received unvalidated terminal OOC evidence")
+        if row["point_id"] in terminals:
+            raise ValueError("comparison received duplicate terminal OOC evidence")
+        terminals.add(row["point_id"])
     for point in points:
         pair = pairs.setdefault(point.comparison_id, {})
         if point.cache_condition in pair:
@@ -525,14 +609,17 @@ def compare_conditions(
     return comparisons
 
 
-def _point_plans_from_config(config: dict[str, Any]) -> tuple[Any, ...]:
+def _point_plans_from_config(config: dict[str, Any]) -> tuple[_ManifestPoint, ...]:
+    expected_manifest = set(config["expected_manifest"])
     points = []
     for record in config["points"]:
+        if record["point_id"] not in expected_manifest:
+            continue
         payload = record.get("canonical_payload", record.get("payload"))
         if not isinstance(payload, dict):
             raise ValueError("config point is missing its canonical payload")
         chunks = tuple(
-            SimpleNamespace(
+            _ManifestChunk(
                 chunk_index=index,
                 scheduled_tokens_by_request={
                     item["request_key"]: item["scheduled_tokens"] for item in vector
@@ -541,7 +628,7 @@ def _point_plans_from_config(config: dict[str, Any]) -> tuple[Any, ...]:
             for index, vector in enumerate(_planned_chunks(payload))
         )
         points.append(
-            SimpleNamespace(
+            _ManifestPoint(
                 point_id=record["point_id"],
                 comparison_id=record["comparison_id"],
                 workload_family=payload["workload_family"],
@@ -552,6 +639,8 @@ def _point_plans_from_config(config: dict[str, Any]) -> tuple[Any, ...]:
                 chunks=chunks,
             )
         )
+    if {point.point_id for point in points} != expected_manifest:
+        raise ValueError("expected_manifest references an unknown config point")
     return tuple(points)
 
 
@@ -566,12 +655,21 @@ def write_v2_result_artifacts(
     if output_dir.exists():
         raise FileExistsError(f"result directory already exists: {output_dir}")
     points = _point_plans_from_config(config)
-    turn_rows = summarize_turn_samples(raw_rows, points)
-    aggregate_rows = aggregate_turn_samples(
-        turn_rows, config.get("profile", {}).get("noisy_cv_threshold", 0.05)
-    )
     terminal_rows = [row for row in raw_rows if row["row_kind"] == "terminal"]
-    comparison_rows = compare_conditions(aggregate_rows, points, terminal_rows)
+    derivation_error = None
+    try:
+        turn_rows = summarize_turn_samples(raw_rows, points)
+        aggregate_rows = aggregate_turn_samples(
+            turn_rows, config.get("profile", {}).get("noisy_cv_threshold", 0.05)
+        )
+        comparison_rows = compare_conditions(aggregate_rows, points, terminal_rows)
+    except ValueError as error:
+        if provenance.get("validation_state") != "remote_failed":
+            raise
+        derivation_error = str(error)
+        turn_rows = []
+        aggregate_rows = []
+        comparison_rows = []
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
         dir=output_dir.parent, prefix=f".{output_dir.name}.staging-"
@@ -579,7 +677,11 @@ def write_v2_result_artifacts(
         staging = Path(temporary) / "result"
         staging.mkdir()
         _write_json(staging / "run-config.json", config)
-        _write_json(staging / "provenance.json", provenance)
+        staged_provenance = copy.deepcopy(provenance)
+        staged_provenance.setdefault("validation_state", "remote_pending")
+        if derivation_error is not None:
+            staged_provenance["validation_error"] = derivation_error
+        _write_json(staging / "provenance.json", staged_provenance)
         for name, rows, schema in (
             ("raw_samples.parquet", raw_rows, V2_RAW_SAMPLE_SCHEMA),
             ("turn_samples.parquet", turn_rows, V2_TURN_SAMPLE_SCHEMA),
@@ -592,12 +694,27 @@ def write_v2_result_artifacts(
             ),
         ):
             pq.write_table(pa.Table.from_pylist(rows, schema=schema), staging / name)
-        (staging / "result.md").write_text(
-            "# DS4 P-side profile result\n\n"
-            f"Run: `{config['run_id']}`\n\n"
-            f"Points: {len(config['expected_manifest'])}\n"
-        )
-        _validate_result_dir(staging)
+        noisy_points = [row["point_id"] for row in aggregate_rows if row["noisy"]]
+        artifact_names = sorted(_v2_required_files() - {"result.md"})
+        validation_state = staged_provenance.get("validation_state", "remote_pending")
+        result_lines = [
+            "# DS4 P-side profile result",
+            "",
+            f"- Status: `{validation_state}`",
+            f"- Run: `{config['run_id']}`",
+            f"- Points: {len(config['expected_manifest'])}",
+            f"- Capacity boundary: {len(terminal_rows)} out-of-capacity points",
+            f"- Noisy points: {', '.join(noisy_points) if noisy_points else 'none'}",
+            f"- Artifacts: {', '.join(artifact_names)}",
+        ]
+        (staging / "result.md").write_text("\n".join(result_lines) + "\n")
+        try:
+            _validate_result_dir(staging)
+        except ValueError as error:
+            if staged_provenance.get("validation_state") != "remote_failed":
+                raise
+            staged_provenance["validation_error"] = str(error)
+            _write_json(staging / "provenance.json", staged_provenance)
         staging.replace(output_dir)
 
 
@@ -957,6 +1074,9 @@ def _validate_v1_result_dir(result_dir: Path, config: dict[str, Any]) -> None:
     raw_rows = raw.to_pylist()
     aggregate_rows = aggregates.to_pylist()
     provenance = json.loads((result_dir / "provenance.json").read_text())
+    validation_state = provenance.get("validation_state")
+    if validation_state is not None and validation_state not in V2_VALIDATION_STATES:
+        raise ValueError("unknown validation_state")
     run_id = config["run_id"]
     observed_run_ids = {row["run_id"] for row in raw_rows + aggregate_rows} | {
         provenance.get("run_id")
@@ -1454,6 +1574,7 @@ def _validate_v2_result_dir(result_dir: Path, config: dict[str, Any]) -> None:
     expected_points = {
         point_id: expected_points[point_id] for point_id in expected_manifest
     }
+    point_views = {point.point_id: point for point in _point_plans_from_config(config)}
     provenance = json.loads((result_dir / "provenance.json").read_text())
     run_id = config.get("run_id")
     all_rows = raw_rows + turn_rows + aggregate_rows + comparison_rows + evidence_rows
@@ -1566,20 +1687,36 @@ def _validate_v2_result_dir(result_dir: Path, config: dict[str, Any]) -> None:
                 for row in raw
             ):
                 raise ValueError("raw chunk does not match the planned vector")
-            expected_vector = chunks[terminal["chunk_index"]]
-            if terminal[
-                "actual_scheduled_tokens_by_request"
-            ] != expected_vector or terminal["scheduled_tokens"] != sum(
-                item["scheduled_tokens"] for item in expected_vector
-            ):
-                raise ValueError("terminal row does not match the planned vector")
-            if (
-                terminal["requested_kv_blocks"] <= terminal["allocatable_kv_blocks"]
-                or terminal["allocated_kv_blocks"] > terminal["allocatable_kv_blocks"]
+            if not _terminal_ooc_proven(terminal, point_views[point_id]):
+                expected_vector = chunks[terminal["chunk_index"]]
+                actual_items = terminal["actual_scheduled_tokens_by_request"]
+                actual = {
+                    item["request_key"]: item["scheduled_tokens"]
+                    for item in actual_items
+                }
+                planned = {
+                    item["request_key"]: item["scheduled_tokens"]
+                    for item in expected_vector
+                }
+                if (
+                    len(actual) != len(actual_items)
+                    or any(
+                        key not in planned or tokens <= 0 or tokens > planned[key]
+                        for key, tokens in actual.items()
+                    )
+                    or terminal["scheduled_tokens"] != sum(actual.values())
+                ):
+                    raise ValueError("terminal row does not match the planned vector")
+            if not (
+                terminal["allocator_pressure_proven"]
+                and terminal["requested_kv_blocks"] > terminal["allocatable_kv_blocks"]
+                and terminal["allocated_kv_blocks"] <= terminal["allocatable_kv_blocks"]
             ):
                 raise ValueError("terminal row does not prove allocator pressure")
             if not (
-                terminal["cache_reset_completed"] and terminal["cache_reset_empty"]
+                terminal["clean_reset_proven"]
+                and terminal["cache_reset_completed"]
+                and terminal["cache_reset_empty"]
             ):
                 raise ValueError("terminal row does not prove a clean reset")
             if (
@@ -1588,7 +1725,13 @@ def _validate_v2_result_dir(result_dir: Path, config: dict[str, Any]) -> None:
                 or terminal["runtime_mode"] is not None
             ):
                 raise ValueError("terminal row must not contain GPU timing")
-            if terminal["preempted_request_ids"] or terminal["unrelated_request_ids"]:
+            expected_request_ids = {
+                item["request_key"] for item in chunks[terminal["chunk_index"]]
+            }
+            if (
+                not set(terminal["preempted_request_ids"]) <= expected_request_ids
+                or terminal["unrelated_request_ids"]
+            ):
                 raise ValueError("terminal row is not an isolated planned batch")
             block_bytes = terminal["kv_block_bytes"]
             if (
@@ -1599,6 +1742,8 @@ def _validate_v2_result_dir(result_dir: Path, config: dict[str, Any]) -> None:
                 != terminal["allocated_kv_blocks"] * block_bytes
             ):
                 raise ValueError("terminal row has inconsistent KV byte accounting")
+            if not _terminal_ooc_proven(terminal, point_views[point_id]):
+                raise ValueError("terminal row does not match the planned vector")
             if turn_by_point.get(point_id) or any(
                 row["point_id"] == point_id for row in aggregate_rows
             ):

@@ -590,6 +590,8 @@ def _make_v2_point_terminal_ooc(output_dir: Path) -> str:
             row["allocated_kv_blocks"] = 0
             row["requested_kv_bytes"] = 2
             row["allocated_kv_bytes"] = 0
+            row["allocator_pressure_proven"] = True
+            row["clean_reset_proven"] = True
             row["runner_wall_time_ms"] = None
             row["cuda_model_time_ms"] = None
             row["runtime_mode"] = None
@@ -714,7 +716,9 @@ def test_v2_validator_rejects_ooc_coordinate_gaps_and_later_rows(
     ("mutation", "message"),
     (
         ({"requested_kv_blocks": 1}, "allocator pressure"),
+        ({"allocator_pressure_proven": False}, "allocator pressure"),
         ({"cache_reset_empty": False}, "clean reset"),
+        ({"clean_reset_proven": False}, "clean reset"),
         ({"runner_wall_time_ms": 1.0}, "GPU timing"),
         (
             {
@@ -744,6 +748,31 @@ def test_v2_validator_requires_fail_closed_ooc_evidence(
         profile_spine._validate_result_dir(output_dir)
 
 
+@pytest.mark.parametrize(
+    ("actual", "preempted"),
+    (([], []), ([{"request_key": "r0", "scheduled_tokens": 128}], ["r0"])),
+)
+def test_v2_validator_accepts_isolated_partial_ooc_evidence(
+    tmp_path: Path,
+    actual: list[dict[str, Any]],
+    preempted: list[str],
+) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    output_dir = _write_v2_result(tmp_path)
+    _make_v2_point_terminal_ooc(output_dir)
+    raw_path = output_dir / "raw_samples.parquet"
+    table = pq.read_table(raw_path)
+    rows = table.to_pylist()
+    terminal = next(row for row in rows if row["row_kind"] == "terminal")
+    terminal["actual_scheduled_tokens_by_request"] = actual
+    terminal["scheduled_tokens"] = sum(item["scheduled_tokens"] for item in actual)
+    terminal["preempted_request_ids"] = preempted
+    pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), raw_path)
+
+    profile_spine._validate_result_dir(output_dir)
+
+
 def test_v2_writer_derives_and_atomically_validates_artifacts(
     tmp_path: Path,
 ) -> None:
@@ -765,6 +794,18 @@ def test_v2_writer_derives_and_atomically_validates_artifacts(
     assert pq.read_table(output / "aggregates.parquet").num_rows == 68
     assert pq.read_table(output / "comparisons.parquet").num_rows == 34
 
+
+def test_v2_writer_does_not_publish_an_invalid_staging_directory(
+    tmp_path: Path,
+) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    source = _write_v2_result(tmp_path / "source")
+    config = json.loads((source / "run-config.json").read_text())
+    raw_rows = pq.read_table(source / "raw_samples.parquet").to_pylist()
+    evidence_rows = pq.read_table(source / "prefix_evidence.parquet").to_pylist()
+    provenance = json.loads((source / "provenance.json").read_text())
+
     invalid = copy.deepcopy(raw_rows)
     invalid.pop()
     failed_output = tmp_path / "failed-assembly"
@@ -773,6 +814,51 @@ def test_v2_writer_derives_and_atomically_validates_artifacts(
             config, invalid, evidence_rows, provenance, failed_output
         )
     assert not failed_output.exists()
+
+
+def test_v2_writer_preserves_explicit_remote_failed_diagnostics(
+    tmp_path: Path,
+) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    source = _write_v2_result(tmp_path / "source")
+    config = json.loads((source / "run-config.json").read_text())
+    raw_rows = pq.read_table(source / "raw_samples.parquet").to_pylist()
+    raw_rows.pop()
+    evidence_rows = pq.read_table(source / "prefix_evidence.parquet").to_pylist()
+    provenance = json.loads((source / "provenance.json").read_text())
+    provenance["validation_state"] = "remote_failed"
+    output = tmp_path / "failed-result"
+
+    profile_spine.write_v2_result_artifacts(
+        config, raw_rows, evidence_rows, provenance, output
+    )
+
+    persisted = json.loads((output / "provenance.json").read_text())
+    assert persisted["validation_state"] == "remote_failed"
+    assert "validation_error" in persisted
+    with pytest.raises(ValueError):
+        profile_spine._validate_result_dir(output)
+
+
+def test_v2_writer_derives_only_the_frozen_smoke_manifest(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    source = _write_v2_result(tmp_path / "source")
+    _filter_v2_result_to_selectors(source, {"canonical-00"})
+    config = json.loads((source / "run-config.json").read_text())
+    raw_rows = pq.read_table(source / "raw_samples.parquet").to_pylist()
+    evidence_rows = pq.read_table(source / "prefix_evidence.parquet").to_pylist()
+    provenance = json.loads((source / "provenance.json").read_text())
+    output = tmp_path / "smoke-assembled"
+
+    profile_spine.write_v2_result_artifacts(
+        config, raw_rows, evidence_rows, provenance, output
+    )
+
+    profile_spine._validate_result_dir(output)
+    assert pq.read_table(output / "aggregates.parquet").num_rows == 2
+    assert pq.read_table(output / "comparisons.parquet").num_rows == 1
 
 
 def _fake_gpu_worker(
