@@ -11,6 +11,8 @@ import pytest
 assert os.environ["PYTHONHASHSEED"] == "0"
 assert os.environ["VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES"] == "0"
 
+pytestmark = pytest.mark.skip_global_cleanup
+
 
 def _replay_turn(index: int, tokens: list[int], trajectory_id: str = "task:no_think"):
     from benchmarks.ds4_profile.kv_cache_replay import ReplayTurn
@@ -106,7 +108,6 @@ def test_observer_records_touch_before_allocate_and_reverse_free() -> None:
     first = make_request(_replay_turn(0, [1, 1, 2, 2, 3]), 2, "first")
     hit, hit_tokens, _ = manager.get_computed_blocks(first)
     assert manager.allocate_slots(first, first.num_tokens, hit_tokens, hit) is not None
-    first_ids = manager.get_block_ids("first")[0]
     manager.free(first)
     manager.take_events()
 
@@ -135,9 +136,9 @@ def test_observer_records_touch_before_allocate_and_reverse_free() -> None:
     assert sum(call.evicted is True for call in eviction_calls) == sum(
         len(event.block_hashes) for event in removed
     )
+    assert removed
     free = next(call for call in calls if call.operation == "free")
     assert free.block_ids == tuple(reversed(second_ids))
-    assert first_ids[-1] not in second_ids or len(set(first_ids)) < len(first_ids)
 
 
 def test_replay_classifies_misses_eviction_and_future_reuse() -> None:
@@ -160,8 +161,14 @@ def test_replay_classifies_misses_eviction_and_future_reuse() -> None:
     misses = {
         row["miss_class"] for row in result.event_rows if row["cache_outcome"] == "miss"
     }
-    evictions = [row for row in result.event_rows if row["operation"] == "evict"]
+    evictions = [
+        row
+        for row in result.event_rows
+        if row["operation"] == "evict" and row["event_source"] == "native"
+    ]
     assert result.status == "passed"
+    assert result.eviction_count == len(evictions)
+    assert result.eviction_count > 0
     assert misses == {"compulsory", "prefix_mismatch", "capacity"}
     assert any(
         row["useful_later"] is True
@@ -227,7 +234,7 @@ def test_replay_records_status_occupancy_and_lookup_timing() -> None:
     )
 
 
-def test_replay_flushes_observed_work_before_admission_failure(
+def test_replay_marks_non_atomic_admission_failure_invalid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from benchmarks.ds4_profile import kv_cache_replay
@@ -251,10 +258,9 @@ def test_replay_flushes_observed_work_before_admission_failure(
         max_model_len=32,
     )
 
-    assert result.status == "out_of_capacity"
-    assert result.event_rows[-1]["operation"] == "admission_failure"
-    assert result.event_rows[-1]["status"] == "out_of_capacity"
-    assert all(row["status"] == "out_of_capacity" for row in result.event_rows)
+    assert result.status == "invalid"
+    assert "non-atomic admission failure" in result.error
+    assert all(row["status"] == "invalid" for row in result.event_rows)
     assert any(
         row["event_source"] == "observer" and row["operation"] == "allocate"
         for row in result.event_rows
@@ -263,8 +269,7 @@ def test_replay_flushes_observed_work_before_admission_failure(
         row["event_source"] == "native" and row["operation"] == "store"
         for row in result.event_rows
     )
-    assert result.turn_rows[0]["active_blocks_after"] > 0
-    assert result.turn_rows[0]["cached_resident_blocks_after"] > 0
+    assert result.turn_rows[0]["status"] == "invalid"
 
 
 def test_replay_separates_manager_forced_recompute_from_capacity_miss() -> None:
@@ -291,6 +296,52 @@ def test_replay_separates_manager_forced_recompute_from_capacity_miss() -> None:
     assert forced[0]["miss_class"] is None
     assert result.turn_rows[1]["manager_forced_recompute_blocks"] == 1
     assert result.turn_rows[1]["capacity_miss_blocks"] == 0
+
+
+def test_replay_counts_duplicate_hashes_as_distinct_resident_blocks() -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import replay_session
+
+    result = replay_session(
+        run_id="fixture-run",
+        turns=[
+            _replay_turn(0, [1, 1, 2, 2]),
+            _replay_turn(1, [1, 1, 2, 2]),
+        ],
+        capacity_blocks=3,
+        block_size=2,
+        max_model_len=32,
+    )
+
+    assert result.status == "passed"
+    assert result.turn_rows[1]["manager_forced_recompute_blocks"] == 1
+    assert result.turn_rows[1]["cached_resident_blocks_after_free"] == 3
+
+
+def test_replay_pairs_duplicate_hash_evictions_by_occurrence() -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import replay_session
+
+    result = replay_session(
+        run_id="fixture-run",
+        turns=[
+            _replay_turn(0, [1, 1, 2, 2]),
+            _replay_turn(1, [1, 1, 2, 2]),
+            _replay_turn(2, [9, 9, 8, 8, 7, 7]),
+        ],
+        capacity_blocks=3,
+        block_size=2,
+        max_model_len=32,
+    )
+
+    evictions = [
+        row
+        for row in result.event_rows
+        if row["turn_index"] == 2
+        and row["operation"] == "evict"
+        and row["event_source"] == "native"
+    ]
+    assert result.status == "passed"
+    assert len(evictions) == 3
+    assert len({row["observer_call_index"] for row in evictions}) == 3
 
 
 def _turn_row(

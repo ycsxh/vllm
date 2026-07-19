@@ -92,6 +92,7 @@ class ReplayResult:
     status: ReplayStatus
     event_rows: list[dict[str, Any]]
     turn_rows: list[dict[str, Any]]
+    eviction_count: int
     error: str | None = None
 
 
@@ -175,7 +176,12 @@ def _pool_occupancy(manager: KVCacheManager) -> PoolOccupancy:
         active_blocks=sum(
             not block.is_null and block.ref_cnt > 0 for block in pool.blocks
         ),
-        cached_resident_blocks=len(pool.cached_block_hash_to_block),
+        cached_resident_blocks=sum(
+            block.block_hash is not None
+            or block.block_id in pool.cached_block_hashes_by_block
+            for block in pool.blocks
+            if not block.is_null
+        ),
     )
 
 
@@ -563,7 +569,13 @@ def _out_of_capacity_result(
             lookup_time_ns=lookup_time_ns,
         )
     )
-    return ReplayResult("out_of_capacity", event_rows, turn_rows, error)
+    return ReplayResult(
+        "out_of_capacity",
+        event_rows,
+        turn_rows,
+        _native_eviction_count(event_rows),
+        error,
+    )
 
 
 def _distributed_durations(total_duration_ns: int, count: int) -> tuple[int, ...]:
@@ -571,6 +583,13 @@ def _distributed_durations(total_duration_ns: int, count: int) -> tuple[int, ...
         return ()
     duration_ns, remainder = divmod(total_duration_ns, count)
     return tuple(duration_ns + (position < remainder) for position in range(count))
+
+
+def _native_eviction_count(event_rows: Sequence[dict[str, Any]]) -> int:
+    return sum(
+        row["operation"] == "evict" and row["event_source"] == "native"
+        for row in event_rows
+    )
 
 
 def _future_reuse(
@@ -718,10 +737,7 @@ def replay_session(
             ]
             if len(evict_calls) != len(removed_hashes):
                 raise RuntimeError("observer/native eviction count mismatch")
-            evict_call_by_hash = {
-                block_hash: call
-                for block_hash, call in zip(removed_hashes, evict_calls, strict=True)
-            }
+            evict_call_iter = iter(evict_calls)
 
             for call in pool_calls:
                 if call.operation == "free":
@@ -771,7 +787,7 @@ def replay_session(
                 elif isinstance(event, BlockRemoved):
                     for block_hash in event.block_hashes:
                         canonical_hash = _canonical_hash(block_hash)
-                        evict_call = evict_call_by_hash[canonical_hash]
+                        evict_call = next(evict_call_iter)
                         reuse_turn, reuse_distance, useful_later, never_reused = (
                             _future_reuse(
                                 canonical_hash, turn.turn_index, future_accesses
@@ -811,6 +827,21 @@ def replay_session(
                         observer_call_index=call.index,
                         observer_evicted=call.evicted,
                     )
+                )
+
+            if allocated is None and (
+                pool_calls
+                or native_events
+                or occupancy_after_allocation != allocation_before
+            ):
+                for row in event_rows:
+                    if (
+                        row["trajectory_id"] == turn.trajectory_id
+                        and row["turn_index"] == turn.turn_index
+                    ):
+                        row["status"] = "invalid"
+                raise RuntimeError(
+                    "KVCacheManager returned a non-atomic admission failure"
                 )
 
             if allocated is None:
@@ -862,6 +893,8 @@ def replay_session(
             completed_evictions = sum(
                 row["operation"] == "evict" and row["event_source"] == "native"
                 for row in event_rows
+                if row["trajectory_id"] == turn.trajectory_id
+                and row["turn_index"] == turn.turn_index
             )
             turn_rows.append(
                 _turn_row(
@@ -882,6 +915,14 @@ def replay_session(
                     occupancy_after=occupancy_after,
                 )
             )
-            return ReplayResult("invalid", event_rows, turn_rows, error_text)
+            return ReplayResult(
+                "invalid",
+                event_rows,
+                turn_rows,
+                _native_eviction_count(event_rows),
+                error_text,
+            )
 
-    return ReplayResult("passed", event_rows, turn_rows)
+    return ReplayResult(
+        "passed", event_rows, turn_rows, _native_eviction_count(event_rows)
+    )
