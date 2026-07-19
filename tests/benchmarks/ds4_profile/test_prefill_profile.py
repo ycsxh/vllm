@@ -3,6 +3,7 @@
 
 import copy
 from collections import Counter
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -162,25 +163,38 @@ class _FakeScheduler:
         self.kv_cache_manager = SimpleNamespace(
             block_size=16,
             block_pool=_FakeBlockPool(free_blocks),
-            get_block_ids=lambda _request_id: ([10],),
+            get_block_ids=self.get_block_ids,
         )
         self.reset_succeeds = True
+        self.prime_request = None
+        self.prime_progress = 0
 
     def schedule(self):
+        if self.prime_request is not None:
+            remaining = len(self.prime_request.prompt_token_ids) - self.prime_progress
+            if remaining:
+                scheduled = min(self.max_num_scheduled_tokens, remaining)
+                self.prime_progress += scheduled
+                blocks = tuple(range((self.prime_progress + 15) // 16))
+                return _fake_output(
+                    {self.prime_request.request_id: scheduled},
+                    computed_tokens=self.prime_progress - scheduled,
+                    block_ids=blocks,
+                )
         return self.output
 
     def add_request(self, request) -> None:
         self.requests[request.request_id] = request
         self.running = [request]
-        self.output = _fake_output(
-            {request.request_id: len(request.prompt_token_ids)}, block_ids=(10,)
-        )
+        self.prime_request = request
+        self.prime_progress = 0
 
     def finish_requests(self, request_ids, _status) -> None:
         for request_id in request_ids:
             self.requests.pop(request_id, None)
         self.running = []
         self.waiting = []
+        self.prime_request = None
         self.output = _fake_output({}, active_ids=())
 
     def update_from_output(self, _scheduler_output, _model_output) -> None:
@@ -188,18 +202,39 @@ class _FakeScheduler:
 
     def reset_prefix_cache(self) -> bool:
         if self.reset_succeeds:
-            self.kv_cache_manager.block_pool.free_blocks = 128
+            self.kv_cache_manager.block_pool.free_blocks = 127
         return self.reset_succeeds
+
+    def get_block_ids(self, _request_id):
+        return (list(range((self.prime_progress + 15) // 16)),)
 
 
 class _FakeExecutor:
-    def __init__(self) -> None:
+    def __init__(self, *, execute_returns_none: bool = False) -> None:
         self.execute_calls = 0
         self.timed_execute_calls = 0
+        self.execute_returns_none = execute_returns_none
+        self.sample_calls = 0
 
     def execute_model(self, _scheduler_output):
         self.execute_calls += 1
+        if self.execute_returns_none:
+            return None
         return SimpleNamespace()
+
+    def sample_tokens(self, _hidden_states):
+        self.sample_calls += 1
+        return SimpleNamespace()
+
+
+class _Cuda1Tensor(torch.Tensor):
+    @property
+    def is_cuda(self) -> bool:
+        return True
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device("cuda:1")
 
 
 def _fake_output(
@@ -354,6 +389,71 @@ def test_cpu_prime_executes_but_never_claims_hardware_validation() -> None:
     assert executor.execute_calls == 2
 
 
+def test_prime_chunks_a_prefix_larger_than_the_scheduler_budget() -> None:
+    point = _adapter_point()
+    request = replace(
+        point.requests[0],
+        prompt_token_ids=tuple(range(4128)),
+        context_tokens=4128,
+        cached_tokens=4112,
+    )
+    point = replace(point, requests=(request,))
+    adapter, _ = _adapter(_fake_output({}, active_ids=()), tensor=torch.empty((512, 2)))
+    adapter.request_factory = lambda request_id, tokens: SimpleNamespace(
+        request_id=request_id, prompt_token_ids=tokens
+    )
+
+    evidence = adapter.prime(point, "steady", 0)
+
+    assert [item.chunk_index for item in evidence[0].prime_scheduler_outputs] == [0, 1]
+    assert len(evidence[0].measured_block_ids_by_group[0]) == 257
+
+
+def test_prime_handles_executor_none_with_sampling_fallback() -> None:
+    point = _adapter_point()
+    adapter, _ = _adapter(_fake_output({}, active_ids=()))
+    executor = _FakeExecutor(execute_returns_none=True)
+    adapter.executor = executor
+    adapter.request_factory = lambda request_id, tokens: SimpleNamespace(
+        request_id=request_id, prompt_token_ids=tokens
+    )
+
+    evidence = adapter.prime(point, "warmup", 0)
+
+    assert evidence[0].prime_completed
+    assert executor.sample_calls == 2
+
+
+def test_cached_request_block_tables_use_request_major_api_shape() -> None:
+    cached = SimpleNamespace(
+        new_block_ids=[([1, 2], [3]), ([4], [5, 6])],
+        num_computed_tokens=[16, 32],
+    )
+
+    assert prefill_profile.VllmSchedulerCacheAdapter._block_ids((cached, 1)) == (
+        (4,),
+        (5, 6),
+    )
+
+
+def test_worker_tensors_follow_bind_kv_cache_layer_order() -> None:
+    adapter, _ = _adapter(_fake_output({"r0": 16}))
+    adapter.scheduler.kv_cache_config.kv_cache_groups = (
+        SimpleNamespace(layer_names=("layer.1",)),
+        SimpleNamespace(layer_names=("layer.0",)),
+    )
+    adapter.worker.model_runner.kv_caches = [
+        torch.empty((4, 2)),
+        torch.empty((8, 2)),
+    ]
+    adapter.block_axes = (0, 0)
+    adapter.layer_order = ("layer.0", "layer.1")
+
+    groups = adapter._inspect_worker_groups(((7,), (3,)), require_hardware=False)
+
+    assert [group.block_dimension for group in groups] == [8, 4]
+
+
 def test_hit_rejects_different_physical_block_ids_before_timing() -> None:
     point = _adapter_point()
     output = _fake_output({"r0": 16}, computed_tokens=16, block_ids=(11,))
@@ -397,6 +497,16 @@ def test_live_tensor_inspection_fails_closed(
         adapter._inspect_worker_groups((block_ids,), require_hardware=False)
 
 
+def test_live_tensor_inspection_rejects_cuda1() -> None:
+    tensor = torch.Tensor._make_subclass(
+        _Cuda1Tensor, torch.empty((128, 2)), require_grad=False
+    )
+    adapter, _ = _adapter(_fake_output({"r0": 16}), tensor=tensor)
+
+    with pytest.raises(RuntimeError, match="not on cuda:0"):
+        adapter._inspect_worker_groups(((10,),), require_hardware=True)
+
+
 def test_full_recompute_requires_zero_cached_tokens() -> None:
     point = _adapter_point("full_recompute")
     output = _fake_output({"r0": 32}, computed_tokens=16)
@@ -414,6 +524,16 @@ def test_reset_epoch_rejects_failed_prefix_cache_reset() -> None:
 
     with pytest.raises(RuntimeError, match="prefix cache reset failed"):
         adapter.reset_epoch()
+
+
+def test_reset_epoch_synchronizes_the_gpu_flush() -> None:
+    adapter, _ = _adapter(_fake_output({"r0": 16}))
+    synchronizations = []
+    adapter.synchronize_gpu = lambda: synchronizations.append("sync")
+
+    adapter.reset_epoch()
+
+    assert synchronizations == ["sync"]
 
 
 def test_allocator_ooc_requires_pressure_and_clean_reset() -> None:

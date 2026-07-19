@@ -133,6 +133,7 @@ class VllmSchedulerCacheAdapter:
         request_factory: Callable[[str, list[int]], Any] | None = None,
         synchronize_gpu: Callable[[], None] | None = None,
         block_axes: tuple[int, ...] | None = None,
+        layer_order: tuple[str, ...] | None = None,
     ) -> None:
         self.scheduler = scheduler
         self.executor = executor
@@ -140,6 +141,7 @@ class VllmSchedulerCacheAdapter:
         self.request_factory = request_factory
         self.synchronize_gpu = synchronize_gpu
         self.block_axes = block_axes
+        self.layer_order = layer_order
         self._prime_evidence: dict[str, PrefixPrimeEvidence] = {}
 
     @classmethod
@@ -154,6 +156,7 @@ class VllmSchedulerCacheAdapter:
         """Create the real adapter while keeping vLLM imports lazy."""
         import torch
 
+        from vllm.model_executor.models.utils import extract_layer_index
         from vllm.sampling_params import SamplingParams
         from vllm.v1.request import Request
 
@@ -165,6 +168,12 @@ class VllmSchedulerCacheAdapter:
                 None,
             )
 
+        insertion_order = tuple(
+            layer_name
+            for tensor in scheduler.kv_cache_config.kv_cache_tensors
+            for layer_name in tensor.shared_by
+        )
+        layer_order = tuple(sorted(insertion_order, key=extract_layer_index))
         return cls(
             scheduler,
             executor,
@@ -174,6 +183,7 @@ class VllmSchedulerCacheAdapter:
                 torch.device("cuda:0")
             ),
             block_axes=block_axes,
+            layer_order=layer_order,
         )
 
     @staticmethod
@@ -214,10 +224,10 @@ class VllmSchedulerCacheAdapter:
     def _block_ids(request_data: Any) -> tuple[tuple[int, ...], ...]:
         if isinstance(request_data, tuple):
             cached, index = request_data
-            return tuple(
-                tuple(int(block_id) for block_id in group[index])
-                for group in cached.new_block_ids
-            )
+            entry = cached.new_block_ids[index]
+            if entry is None:
+                raise RuntimeError("cached request omitted its Scheduler block table")
+            return tuple(tuple(int(block_id) for block_id in group) for group in entry)
         return tuple(
             tuple(int(block_id) for block_id in group)
             for group in request_data.block_ids
@@ -230,23 +240,45 @@ class VllmSchedulerCacheAdapter:
             return int(cached.num_computed_tokens[index])
         return int(request_data.num_computed_tokens)
 
+    @classmethod
+    def _updated_block_table(
+        cls,
+        current: tuple[tuple[int, ...], ...],
+        request_id: str,
+        request_data: Any,
+    ) -> tuple[tuple[int, ...], ...]:
+        sent = cls._block_ids(request_data)
+        if not isinstance(request_data, tuple) or not current:
+            return sent
+        cached, _ = request_data
+        if request_id in cached.resumed_req_ids:
+            return sent
+        if len(current) != len(sent):
+            raise RuntimeError("prime Scheduler block-table groups changed")
+        return tuple(existing + new for existing, new in zip(current, sent))
+
     def _kv_page_bytes(self) -> tuple[int, ...]:
         config = getattr(self.scheduler, "kv_cache_config", None)
         groups = getattr(config, "kv_cache_groups", ())
         return tuple(int(group.kv_cache_spec.page_size_bytes) for group in groups)
 
     def _allocation_snapshot(
-        self, expected_tokens: dict[str, int], elapsed_ms: float
+        self,
+        expected_tokens: dict[str, int],
+        actual_tokens: dict[str, int],
+        free_before: int,
+        free_after: int,
+        elapsed_ms: float,
     ) -> AllocationEvidence:
         manager = self.scheduler.kv_cache_manager
         block_size = int(getattr(manager, "block_size", CANONICAL_BLOCK_SIZE))
-        requested = sum(
-            (tokens + block_size - 1) // block_size
-            for tokens in expected_tokens.values()
+        allocated = max(0, free_before - free_after)
+        unscheduled_lower_bound = sum(
+            (max(0, tokens - actual_tokens.get(request_id, 0)) + block_size - 1)
+            // block_size
+            for request_id, tokens in expected_tokens.items()
         )
-        pool = manager.block_pool
-        free = int(pool.get_num_free_blocks())
-        allocated = max(0, requested - free)
+        requested = allocated + unscheduled_lower_bound
         page_bytes = self._kv_page_bytes()
         block_bytes = (
             sum(page_bytes)
@@ -257,7 +289,7 @@ class VllmSchedulerCacheAdapter:
             state="allocated",
             requested_blocks=requested,
             allocated_blocks=allocated,
-            allocatable_blocks=free,
+            allocatable_blocks=free_before,
             requested_bytes=requested * block_bytes,
             allocated_bytes=allocated * block_bytes,
             lookup_time_ms=elapsed_ms,
@@ -280,15 +312,17 @@ class VllmSchedulerCacheAdapter:
             flush = self.scheduler.schedule()
             if getattr(flush, "total_num_scheduled_tokens", 0):
                 raise RuntimeError("reset flush scheduled model work")
-            model_output = self.executor.execute_model(flush)
+            model_output = self._execute_untimed(flush)
             self.scheduler.update_from_output(flush, model_output)
+            if self.synchronize_gpu is not None:
+                self.synchronize_gpu()
         if self._scheduler_request_ids() or self._queue_request_ids():
             raise RuntimeError("reset left live Scheduler requests")
         if not self.scheduler.reset_prefix_cache():
             raise RuntimeError("prefix cache reset failed")
         pool = self.scheduler.kv_cache_manager.block_pool
         used = int(getattr(pool, "num_gpu_blocks", 0)) - int(pool.get_num_free_blocks())
-        if used > 1:
+        if used != 1:
             raise RuntimeError("prefix cache reset left live KV blocks")
         self._prime_evidence.clear()
 
@@ -308,14 +342,24 @@ class VllmSchedulerCacheAdapter:
             configured_groups
         ):
             raise RuntimeError("KV cache group evidence is incomplete")
-        offset = 0
+        configured_names = tuple(
+            name for group in configured_groups for name in group.layer_names
+        )
+        layer_order = self.layer_order or configured_names
+        if len(layer_order) != len(tensors) or set(layer_order) != set(
+            configured_names
+        ):
+            raise RuntimeError("live KV cache layer ordering is incomplete")
+        tensor_by_name = dict(zip(layer_order, tensors))
         evidence = []
         for group_index, (group, block_ids, block_axis) in enumerate(
             zip(configured_groups, block_ids_by_group, axes)
         ):
             names = tuple(group.layer_names)
-            mapped = tensors[offset : offset + len(names)]
-            offset += len(names)
+            try:
+                mapped = tuple(tensor_by_name[name] for name in names)
+            except KeyError as error:
+                raise RuntimeError("missing configured layer tensor") from error
             if len(mapped) != len(names):
                 raise RuntimeError("missing configured layer tensor")
             if not mapped or any(
@@ -348,9 +392,15 @@ class VllmSchedulerCacheAdapter:
                     live_cuda_tensor_proven=cuda0,
                 )
             )
-        if offset != len(tensors):
-            raise RuntimeError("live KV cache contains unmapped layer tensors")
         return tuple(evidence)
+
+    def _execute_untimed(self, scheduler_output: Any) -> Any:
+        output = self.executor.execute_model(scheduler_output)
+        if output is None:
+            output = self.executor.sample_tokens(None)
+        if output is None:
+            raise RuntimeError("executor returned no Scheduler update output")
+        return output
 
     def prime(
         self, point: PPointPlan, phase: str, ordinal: int
@@ -365,34 +415,52 @@ class VllmSchedulerCacheAdapter:
             prime_id = f"prime:{phase}:{ordinal}:{request.request_key}"
             prefix = list(request.prompt_token_ids[: request.cached_tokens])
             self.scheduler.add_request(self.request_factory(prime_id, prefix))
-            self.scheduler.max_num_scheduled_tokens = request.cached_tokens
-            self.scheduler.scheduler_config.long_prefill_token_threshold = (
-                request.cached_tokens
-            )
-            output = self.scheduler.schedule()
-            scheduled, request_data = self._scheduled_vectors(output)
-            if scheduled != {prime_id: request.cached_tokens}:
-                raise RuntimeError("prefix prime SchedulerOutput was partial")
-            prime_data = request_data.get(prime_id)
-            if prime_data is None:
-                raise RuntimeError("prefix prime omitted its Scheduler block table")
-            sent_block_ids = self._block_ids(prime_data)
-            model_output = self.executor.execute_model(output)
-            self.scheduler.update_from_output(output, model_output)
+            remaining = request.cached_tokens
+            prime_outputs = []
+            sent_table: tuple[tuple[int, ...], ...] = ()
+            measured: tuple[tuple[int, ...], ...] = ()
+            worker_groups: tuple[WorkerKvTensorGroupEvidence, ...] = ()
             synchronized = self.synchronize_gpu is not None
-            if self.synchronize_gpu is not None:
-                self.synchronize_gpu()
-            measured = tuple(
-                tuple(int(block_id) for block_id in group)
-                for group in self.scheduler.kv_cache_manager.get_block_ids(prime_id)
-            )
+            chunk_index = 0
+            while remaining:
+                budget = min(4096, remaining)
+                self.scheduler.max_num_scheduled_tokens = budget
+                self.scheduler.scheduler_config.long_prefill_token_threshold = budget
+                output = self.scheduler.schedule()
+                scheduled, request_data = self._scheduled_vectors(output)
+                if scheduled != {prime_id: budget}:
+                    raise RuntimeError("prefix prime SchedulerOutput was partial")
+                prime_data = request_data.get(prime_id)
+                if prime_data is None:
+                    raise RuntimeError("prefix prime omitted its Scheduler block table")
+                sent_block_ids = self._block_ids(prime_data)
+                sent_table = self._updated_block_table(sent_table, prime_id, prime_data)
+                model_output = self._execute_untimed(output)
+                if self.synchronize_gpu is not None:
+                    self.synchronize_gpu()
+                measured = tuple(
+                    tuple(int(block_id) for block_id in group)
+                    for group in self.scheduler.kv_cache_manager.get_block_ids(prime_id)
+                )
+                worker_groups = self._inspect_worker_groups(
+                    measured, require_hardware=synchronized
+                )
+                prime_outputs.append(
+                    SchedulerBlockTableEvidence(
+                        chunk_index=chunk_index,
+                        request_key=request.request_key,
+                        block_ids_by_group=sent_block_ids,
+                        execution_completed=True,
+                        gpu_synchronized=synchronized,
+                    )
+                )
+                self.scheduler.update_from_output(output, model_output)
+                remaining -= budget
+                chunk_index += 1
             intended_blocks = request.cached_tokens // CANONICAL_BLOCK_SIZE
             measured = tuple(group[:intended_blocks] for group in measured)
-            if tuple(group[:intended_blocks] for group in sent_block_ids) != measured:
+            if tuple(group[:intended_blocks] for group in sent_table) != measured:
                 raise RuntimeError("prime block table changed after GPU execution")
-            worker_groups = self._inspect_worker_groups(
-                measured, require_hardware=synchronized
-            )
             page_bytes = self._kv_page_bytes()
             kv_bytes = sum(
                 len(group) * page_bytes[index] for index, group in enumerate(measured)
@@ -401,15 +469,7 @@ class VllmSchedulerCacheAdapter:
                 request_key=request.request_key,
                 intended_cached_tokens=request.cached_tokens,
                 actual_cached_tokens=request.cached_tokens,
-                prime_scheduler_outputs=(
-                    SchedulerBlockTableEvidence(
-                        chunk_index=0,
-                        request_key=request.request_key,
-                        block_ids_by_group=sent_block_ids,
-                        execution_completed=True,
-                        gpu_synchronized=synchronized,
-                    ),
-                ),
+                prime_scheduler_outputs=tuple(prime_outputs),
                 measured_block_ids_by_group=measured,
                 worker_groups=worker_groups,
                 prime_completed=True,
@@ -432,7 +492,7 @@ class VllmSchedulerCacheAdapter:
             flush = self.scheduler.schedule()
             if getattr(flush, "total_num_scheduled_tokens", 0):
                 raise RuntimeError("prefix-prime cleanup scheduled model work")
-            flush_output = self.executor.execute_model(flush)
+            flush_output = self._execute_untimed(flush)
             self.scheduler.update_from_output(flush, flush_output)
         return tuple(evidence)
 
@@ -446,9 +506,12 @@ class VllmSchedulerCacheAdapter:
         self.scheduler.scheduler_config.long_prefill_token_threshold = max(
             expected.values()
         )
+        pool = self.scheduler.kv_cache_manager.block_pool
+        free_before = int(pool.get_num_free_blocks())
         started = perf_counter()
         output = self.scheduler.schedule()
         elapsed_ms = (perf_counter() - started) * 1000
+        free_after = int(pool.get_num_free_blocks())
         actual, _ = self._scheduled_vectors(output)
         actual_ids = tuple(actual)
         preempted = tuple(
@@ -457,7 +520,9 @@ class VllmSchedulerCacheAdapter:
         unrelated = tuple(
             sorted(set(actual_ids) - set(expected_ids) | set(unrelated_state))
         )
-        allocation = self._allocation_snapshot(expected, elapsed_ms)
+        allocation = self._allocation_snapshot(
+            expected, actual, free_before, free_after, elapsed_ms
+        )
         return ScheduledChunk(
             scheduler_output=output,
             expected_request_ids=expected_ids,
