@@ -68,9 +68,9 @@ read-only planning pass before implementation acceptance:
 3. Define a trajectory's minimum usable capacity as the maximum, over its
    turns, of `ceil(prompt_tokens / block_size)`. Usable capacity excludes the
    manager's reserved null block.
-4. Replay the trajectory at that capacity. A candidate is eligible only if
-   every turn is admitted and at least one native `BlockRemoved` event proves
-   eviction pressure.
+4. Replay the trajectory at that capacity. A candidate is eligible when every
+   turn is admitted. Record the native `BlockRemoved` count as an observed
+   workload property; zero evictions do not invalidate metadata replay.
 5. Choose the eligible candidate by the stable key
    `(capacity_blocks, reasoning_mode_rank, trajectory_id)`, with
    `no_think` before `think_high`. The planning result records every candidate,
@@ -79,11 +79,13 @@ read-only planning pass before implementation acceptance:
 
 The smallest capacity that can admit a trajectory's largest prompt is the only
 capacity tested for that candidate: increasing it cannot create additional
-pressure. If no trajectory is eligible, planning fails closed instead of
-weakening admission or inventing pressure. The selected values are then
-written explicitly into `config/kv-cache-replay.json`; normal replay refuses
-derived or automatic capacity changes. School-server acceptance reruns the
-planner and verifies that its selection exactly matches the pinned config.
+pressure. If no trajectory admits every turn, planning fails closed instead of
+weakening admission. Planning never lowers capacity, truncates prompts, skips
+turns, or invents eviction evidence to manufacture pressure. The selected
+values are then written explicitly into `config/kv-cache-replay.json`; normal
+replay refuses derived or automatic capacity changes. School-server acceptance
+reruns the planner and verifies that its selection exactly matches the pinned
+config.
 
 The planning pass is read-only with respect to the snapshot, Ticket artifacts,
 tokenizers, repository, and remotes. It may write a planning record only to an
@@ -193,7 +195,9 @@ Future-use labeling is computed from the complete selected session before the
 replay. Each native eviction records `useful_later`, `never_reused`,
 `next_reuse_turn`, and `turns_until_reuse` for the exact chained hash. The two
 boolean labels are complements, and reuse distance is null only when the hash
-is never requested again.
+is never requested again. A run with no native evictions has no future-use
+labels to satisfy; validation instead requires an empty native-eviction set and
+zero eviction counts throughout the artifacts.
 
 ## Artifacts
 
@@ -204,9 +208,10 @@ Every finalized run directory contains:
 - `turn_summaries.parquet`: per-turn hits, misses, cached/recomputed tokens,
   allocations, evictions, frees, occupancy, timings, and admission status;
 - `provenance.json`: source revisions and hashes, selection-plan identity,
-  invocation, image, installed versions, source state, and validation status;
-  and
-- `result.md`: a concise table and explicit metadata-only validation wording.
+  invocation, image, installed versions, source state, validation status, and
+  boolean `pilot_eviction_pressure_observed`; and
+- `result.md`: a concise table with the native eviction count, explicit pilot
+  eviction-pressure status, and explicit metadata-only validation wording.
 
 Parquet schemas and enum values are versioned and independently validated.
 Stable IDs include the run, trajectory, turn, operation, and ordinal. Hashes
@@ -256,6 +261,15 @@ Request and manager construction follow the existing patterns in
 `tests/v1/core/test_prefix_caching.py`. Tests assert observable replay artifacts
 and operation order rather than private cache-map shapes.
 
+Acceptance separates workload replay from eviction conformance. Full pilot
+data proves deterministic admission, lookup, allocation, free, event,
+occupancy, manifest, and artifact behavior even when it produces no eviction.
+A tiny deterministic real-manager fixture separately must produce at least one
+native `BlockRemoved` and cover lazy LRU selection, capacity misses,
+future-reuse labels, and eviction occupancy transitions. Compulsory, capacity,
+and prefix-mismatch support is mandatory in focused contract tests; the pinned
+pilot run need not happen to contain every class.
+
 ## Container Integration and Acceptance
 
 The Ticket 03 image exposes `kv-cache-replay plan`, `run`, and `validate`
@@ -276,11 +290,20 @@ server. The accepted sequence is:
    invocation, planning record, and focused test result; and
 6. confirm the result says metadata-only validated and makes no GPU/HBM claim.
 
-Acceptance requires every selected turn to be admitted, at least one native
-eviction, valid event ordering, all three miss classes supported by the
-contract, correct future-use labels, schema-valid artifacts, and a clean
-independent validation. It does not require either RTX 3090, model weights,
-CUDA Graphs, or a latency threshold.
+Acceptance requires every selected turn to be admitted, valid event ordering,
+schema-valid artifacts, exact ordered-manifest and input-provenance matches,
+and a clean independent validation. Native eviction count is a zero-or-more
+workload observation. When native evictions occur, every removal must have
+correct event pairing, occupancy transitions, and future-use labels. When none
+occur, artifacts and validation must agree on zero without claiming that the
+pilot exercised eviction pressure.
+
+The separate focused conformance gate requires a deterministic real-manager
+fixture with at least one native eviction and coverage of all three miss
+classes. Passing both gates permits `metadata_only_validated: true`; reporting
+must set `pilot_eviction_pressure_observed` from the native eviction count and
+must state `GPU/HBM validated: no`. Acceptance does not require either RTX
+3090, model weights, CUDA Graphs, or a latency threshold.
 
 ## Files Owned
 
