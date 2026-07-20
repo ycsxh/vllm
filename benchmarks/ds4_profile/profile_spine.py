@@ -1210,7 +1210,7 @@ def _canonical_manifest_points(config: dict[str, Any]) -> dict[str, dict[str, An
     recomputed = load_prefill_points({**config, "points": None})
     recomputed_by_id = {
         point.point_id: {
-            "payload": point.canonical_payload,
+            "payload": json.loads(canonical_payload_json(point.canonical_payload)),
             "comparison_id": point.comparison_id,
         }
         for point in recomputed

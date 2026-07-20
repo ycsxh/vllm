@@ -336,6 +336,17 @@ def test_validator_accepts_real_frozen_planner_and_rejects_point_mutation(
         profile_spine._canonical_manifest_points(forged)
 
 
+def test_frozen_manifest_survives_json_round_trip(tmp_path: Path) -> None:
+    config_path = _write_p_profile_config(tmp_path)
+    base = json.loads(config_path.read_text())
+    points = prefill_profile.load_prefill_points(base)
+    frozen = prefill_profile.freeze_expected_manifest(base, points, "smoke")
+
+    serialized = json.loads(json.dumps(frozen))
+
+    assert prefill_profile.load_prefill_points(serialized) == points
+
+
 def test_assemble_preserves_worker_output_when_validation_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

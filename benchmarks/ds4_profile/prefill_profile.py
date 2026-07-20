@@ -35,11 +35,12 @@ CANONICAL_HOMOGENEOUS_PREFIX_TOKENS = 4096
 
 
 def _point_record(point: "PPointPlan") -> dict[str, Any]:
-    return {
+    record = {
         "point_id": point.point_id,
         "comparison_id": point.comparison_id,
         "canonical_payload": point.canonical_payload,
     }
+    return json.loads(canonical_payload_json(record))
 
 
 def freeze_expected_manifest(
