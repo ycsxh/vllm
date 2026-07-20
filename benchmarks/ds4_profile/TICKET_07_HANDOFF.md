@@ -172,11 +172,12 @@ export VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0
 - final-image pytest exec-record SHA-256:
   `5412c91324518280c1f6966a991994f9094092f8432778dc4ea3446cdd335002`.
 
-The final immutable image packages the focused Ticket 07 test file and pins
-`tblib==3.2.2`. The suite passed directly in that image without a mounted
-checkout or ephemeral dependency installation. The two warnings were an
-unregistered repository-only pytest mark and an unwritable pytest cache; no
-test was skipped.
+The final immutable image packages only the focused Ticket 07 test file. The
+suite passed directly in that image without a mounted checkout or ephemeral
+dependency installation. It needs no `tblib`; that dependency had only been
+pulled in by the root conftest during the superseded mounted-checkout attempt.
+The two warnings were an unregistered repository-only pytest mark and an
+unwritable pytest cache; no test was skipped.
 
 Selected-file pre-commit passed Ruff check/format, typos, Markdown lint, mypy
 3.10, SPDX, import/API/configuration checks, and all other applicable hooks.
