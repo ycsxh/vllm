@@ -19,6 +19,7 @@
     "warmup_repetitions": 3
   },
   "runtime": {
+    "allow_long_max_model_len": true,
     "compilation": {
       "capture_sizes": [128, 256, 512, 1024, 2048, 4096],
       "compile_sizes": [128, 256, 512, 1024, 2048, 4096],

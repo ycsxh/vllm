@@ -168,6 +168,7 @@ def test_checked_in_p_profile_config_freezes_hardware_contract() -> None:
     assert config["runtime"]["enable_prefix_caching"] is True
     assert config["runtime"]["enable_chunked_prefill"] is True
     assert config["runtime"]["enforce_eager"] is False
+    assert config["runtime"]["allow_long_max_model_len"] is True
     buckets = [128, 256, 512, 1024, 2048, 4096]
     assert config["runtime"]["compilation"]["compile_sizes"] == buckets
     assert config["runtime"]["compilation"]["capture_sizes"] == buckets
@@ -1489,6 +1490,23 @@ def test_initialize_gpu_runtime_shuts_down_on_kv_setup_failure(
         gpu_profile.initialize_gpu_runtime({})
 
     assert events == ["init", "shutdown"]
+
+
+def test_long_model_len_override_requires_explicit_runtime_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from benchmarks.ds4_profile import gpu_profile
+
+    monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+    gpu_profile._configure_long_model_len({})
+    assert "VLLM_ALLOW_LONG_MAX_MODEL_LEN" not in os.environ
+
+    gpu_profile._configure_long_model_len({"allow_long_max_model_len": True})
+    assert os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] == "1"
+
+    with pytest.raises(ValueError, match="allow_long_max_model_len"):
+        gpu_profile._configure_long_model_len({"allow_long_max_model_len": "yes"})
+    assert "VLLM_ALLOW_LONG_MAX_MODEL_LEN" not in os.environ
 
 
 def test_run_prefill_matrix_uses_public_runtime_and_always_shuts_down(

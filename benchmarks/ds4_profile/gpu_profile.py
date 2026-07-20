@@ -22,8 +22,18 @@ class GpuRuntime:
     capture_ms: float
 
 
+def _configure_long_model_len(runtime: dict[str, Any]) -> None:
+    allow = runtime.get("allow_long_max_model_len", False)
+    os.environ.pop("VLLM_ALLOW_LONG_MAX_MODEL_LEN", None)
+    if not isinstance(allow, bool):
+        raise ValueError("allow_long_max_model_len must be a boolean")
+    if allow:
+        os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+
+
 def _create_vllm_config(config: dict[str, Any]):
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+    _configure_long_model_len(config["runtime"])
 
     from vllm.config import CompilationConfig
     from vllm.config.compilation import CompilationMode, CUDAGraphMode
