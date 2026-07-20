@@ -58,6 +58,7 @@ Use paths owned by the experiment account. The examples below assume:
 │   └── uv/
 ├── config/
 │   ├── container-contract.json
+│   ├── kv-cache-replay.json
 │   └── profile-spine.json
 ├── results/
 ├── snapshot/4da61f3d06b48b6817a62b99e9c47035c8e59787/
@@ -66,7 +67,8 @@ Use paths owned by the experiment account. The examples below assume:
 └── tokenizers/
 ```
 
-Copy `benchmarks/ds4_profile/config/container-contract.json` and
+Copy `benchmarks/ds4_profile/config/container-contract.json`,
+`benchmarks/ds4_profile/config/kv-cache-replay.json`, and
 `benchmarks/ds4_profile/config/profile-spine.json` into `config/`. Keep the
 immutable raw snapshot and Ticket 01/02 directories read-only. The wrapper
 mounts them as:
@@ -222,6 +224,73 @@ Validate a completed directory through the same image:
 Set `DS4_PROFILE_SPINE_GPU_SMOKE=1` only on the documented dual-3090 host when
 running the hardware-gated pytest. The test asserts execution and artifact
 invariants, not latency thresholds.
+
+## Ticket 07 CPU metadata replay
+
+Ticket 07 is a CPU-only replay of prompt metadata through the real vLLM cache
+manager. It does not load a model, request a GPU, allocate KV tensors, or
+establish GPU/HBM residency. Use the separate
+`local/vllm-ds4-profile:ticket-07-plan` image for planning and
+`local/vllm-ds4-profile:ticket-07` for the pinned run; do not reuse a Ticket 03,
+04, or 05 result directory or image tag. In the common `DS4_RUN` array above,
+set `--image` to the image for the current phase.
+
+The deterministic planner selects every fully admitted candidate and records
+native eviction pressure independently. Zero pilot evictions are valid when
+all turns pass and the focused real-manager conformance fixture separately
+proves native eviction, LRU behavior, all three miss classes, and future reuse.
+Never lower capacity, shorten a prompt, or skip a turn to manufacture pressure.
+
+Build the clean planning image, retain its inspection metadata, and run the
+deterministic planner:
+
+```bash
+bash benchmarks/ds4_profile/container/build.sh \
+  --image local/vllm-ds4-profile:ticket-07-plan \
+  --metadata-out "$STORAGE/results/ticket-07-plan-image.json"
+
+"${DS4_RUN[@]}" kv-cache-replay plan \
+  --output /mnt/ds4/results/ticket-07-selection.json
+```
+
+Inspect the complete planning record before changing configuration. Pin
+exactly its trajectory ID, reasoning mode, usable capacity, input-set digest,
+turn-manifest digest, and planning digest in `kv-cache-replay.json`. The
+selection must then be committed, the checkout must be clean, and a new
+`local/vllm-ds4-profile:ticket-07` image must be built from that exact commit.
+The planning image cannot be accepted as the replay image.
+
+After changing the `DS4_RUN` image to the exact pinned image, run and validate:
+
+```bash
+"${DS4_RUN[@]}" kv-cache-replay run \
+  --planning-record /mnt/ds4/results/ticket-07-selection.json
+
+RESULT_DIR="$(find "$STORAGE/results/ticket-07" \
+  -mindepth 1 -maxdepth 1 -type d | sort | tail -1)"
+"${DS4_RUN[@]}" kv-cache-replay validate \
+  --result-dir "/mnt/ds4/results/ticket-07/$(basename "$RESULT_DIR")"
+```
+
+Do not enlarge capacity, truncate a prompt, or skip a turn after a failure.
+Retain partial and out-of-capacity result directories. A successful result has
+exactly these five artifacts:
+
+- `cache_events.parquet`
+- `turn_summaries.parquet`
+- `run-config.json`
+- `provenance.json`
+- `result.md`
+
+`result.md` must report `Metadata only: yes` and
+`GPU/HBM validated: no`; it must also report the pilot eviction count and
+pressure status. Provenance must record `metadata_only_validated: true`,
+`pilot_eviction_pressure_observed` from that count, and
+`hardware_validated: false`.
+Independently checksum all five files and retain the source SHA and dirty state,
+immutable image ID, verified input hashes, planning record, validator exit
+status, and result path in
+[`../TICKET_07_HANDOFF.md`](../TICKET_07_HANDOFF.md).
 
 ## Results and restart behavior
 

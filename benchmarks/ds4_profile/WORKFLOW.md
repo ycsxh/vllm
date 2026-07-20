@@ -83,6 +83,16 @@ The lightweight local environment may not contain torch. In that case the CPU
 contract suite remains valid with `--confcutdir`; GPU execution remains a
 school-server responsibility.
 
+Ticket 07 has a separate local/server gate. Locally, exercise the focused real
+`Request`/`KVCacheManager` CPU metadata contracts and the smallest relevant
+upstream KV cache regressions with both hash environment variables set before
+Python starts. Do not treat a fixture-only harness as real-manager evidence.
+The complete input planner, selection pin, replay, independent artifact
+validation, and checksum capture run on the school server. This remains a
+CPU-only metadata acceptance path and never constitutes GPU/HBM validation.
+The exact commands and result layout live only in the
+[Ticket 07 container runbook](container/README.md#ticket-07-cpu-metadata-replay).
+
 Before handoff, commit the implementation on the feature branch and push that
 branch to `origin`. Record:
 
@@ -171,3 +181,15 @@ server then returns to the merged personal-fork `main` for the next ticket.
 If hardware validation changes code, push the updated feature branch and rerun
 against its new exact commit. Evidence from an older commit does not validate a
 newer one.
+
+For Ticket 07, replace “hardware validation” in this integration gate with
+“metadata-only validation”: merge eligibility requires an accepted clean
+source SHA, immutable Ticket 07 image ID, pinned planning record, complete
+ordered replay, independent validator success, and five artifact checksums.
+The handoff must still state `GPU/HBM validated: no`.
+
+Ticket 07 uses split acceptance: the pilot gate requires complete deterministic
+metadata replay and permits zero native evictions, while a focused
+real-manager conformance gate must produce native eviction and cover all three
+miss classes. The accepted pilot observed zero eviction pressure; this is a
+workload result, not a manager failure or GPU/HBM evidence.

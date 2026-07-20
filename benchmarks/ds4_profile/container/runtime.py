@@ -899,6 +899,107 @@ def _profile_spine(
         return subprocess.run(actual_assemble_command, check=False).returncode
 
 
+def _kv_cache_replay_command(
+    replay_command: str,
+    config_path: Path,
+    output: Path | None,
+    planning_record: Path | None,
+    result_dir: Path | None,
+) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "benchmarks.ds4_profile.kv_cache_replay",
+        replay_command,
+    ]
+    if replay_command in {"plan", "run"}:
+        command.extend(["--config", str(config_path)])
+    if replay_command == "plan":
+        assert output is not None
+        command.extend(["--output", str(output)])
+    elif replay_command == "run":
+        assert planning_record is not None and result_dir is not None
+        command.extend(
+            [
+                "--planning-record",
+                str(planning_record),
+                "--output-dir",
+                str(result_dir),
+            ]
+        )
+    else:
+        assert result_dir is not None
+        command.extend(["--result-dir", str(result_dir)])
+    return command
+
+
+def _effective_kv_cache_replay_config(config_path: Path) -> dict[str, Any]:
+    config = json.loads(config_path.read_text())
+    if not config.get("run_id"):
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        config["run_id"] = f"ds4-kv-replay-{timestamp}-{uuid.uuid4().hex[:8]}"
+    dirty_value = os.environ.get(
+        "DS4_VLLM_DIRTY", str(config.get("source", {}).get("dirty", True))
+    ).lower()
+    config["source"] = {
+        "commit": os.environ.get(
+            "DS4_VLLM_COMMIT", config.get("source", {}).get("commit", "unknown")
+        ),
+        "dirty": (
+            dirty_value == "true" if dirty_value in {"true", "false"} else "unknown"
+        ),
+    }
+    expected_environment = config.get("environment", {})
+    actual_environment = {
+        "PYTHONHASHSEED": os.environ.get("PYTHONHASHSEED"),
+        "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES": os.environ.get(
+            "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES"
+        ),
+    }
+    if actual_environment != expected_environment:
+        raise ValueError("kv-cache-replay deterministic environment mismatch")
+    config["environment"] = actual_environment
+    config["host_invocation"] = os.environ.get("DS4_HOST_INVOCATION")
+    config["image"] = {"id": os.environ.get("DS4_IMAGE_ID", "unknown")}
+    config["installed_versions"] = _installed_versions()
+    return config
+
+
+def _kv_cache_replay(
+    replay_command: str,
+    config_path: Path,
+    output: Path,
+    planning_record: Path,
+    result_dir: Path | None,
+    print_plan: bool,
+) -> int:
+    command_config_path = config_path
+    work_dir: Path | None = None
+    if replay_command == "run":
+        config = _effective_kv_cache_replay_config(config_path)
+        if result_dir is None:
+            result_dir = Path("/mnt/ds4/results/ticket-07") / config["run_id"]
+        work_dir = result_dir.parent / f".{result_dir.name}.work"
+        command_config_path = work_dir / "run-config.json"
+    elif replay_command == "validate" and result_dir is None:
+        raise ValueError("kv-cache-replay validate requires --result-dir")
+    command = _kv_cache_replay_command(
+        replay_command,
+        command_config_path,
+        output,
+        planning_record,
+        result_dir,
+    )
+    if print_plan:
+        print(shlex.join(command))
+        return 0
+    if replay_command == "run":
+        assert work_dir is not None
+        config["invocation"] = command
+        _write_json(command_config_path, config)
+    return subprocess.run(command, check=False).returncode
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="DS4 container runtime checks.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -952,6 +1053,25 @@ def main() -> None:
         "--output", type=Path, default=Path("/mnt/ds4/results/cache-model.json")
     )
     cache_model.add_argument("--print-plan", action="store_true")
+    cache_replay = subparsers.add_parser("kv-cache-replay")
+    cache_replay.add_argument("replay_command", choices=("plan", "run", "validate"))
+    cache_replay.add_argument(
+        "--config",
+        type=Path,
+        default=Path("/mnt/ds4/config/kv-cache-replay.json"),
+    )
+    cache_replay.add_argument(
+        "--output",
+        type=Path,
+        default=Path("/mnt/ds4/results/ticket-07-selection.json"),
+    )
+    cache_replay.add_argument(
+        "--planning-record",
+        type=Path,
+        default=Path("/mnt/ds4/results/ticket-07-selection.json"),
+    )
+    cache_replay.add_argument("--result-dir", type=Path)
+    cache_replay.add_argument("--print-plan", action="store_true")
     profile_exec = subparsers.add_parser("exec")
     profile_exec.add_argument("--output", type=Path, required=True)
     profile_exec.add_argument("profile_command", nargs=argparse.REMAINDER)
@@ -986,6 +1106,17 @@ def main() -> None:
         )
     if args.command == "cache-model":
         raise SystemExit(_cache_model(args.config, args.output, args.print_plan))
+    if args.command == "kv-cache-replay":
+        raise SystemExit(
+            _kv_cache_replay(
+                args.replay_command,
+                args.config,
+                args.output,
+                args.planning_record,
+                args.result_dir,
+                args.print_plan,
+            )
+        )
     if args.command == "exec":
         raise SystemExit(_exec_profile(args.output, args.profile_command))
 
