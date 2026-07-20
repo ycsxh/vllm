@@ -39,6 +39,9 @@
 - Create `tests/benchmarks/ds4_profile/test_kv_cache_replay.py`: focused CPU contracts using tiny prompts and the real manager, plus CLI/container plan checks.
 - Modify `benchmarks/ds4_profile/container/runtime.py`: register CPU-only `kv-cache-replay plan|run|validate` commands and generate the effective run ID/source state.
 - Modify `benchmarks/ds4_profile/container/run.sh`: classify `kv-cache-replay` as CPU-only so Docker does not request GPUs or `SYS_NICE`.
+- Modify `benchmarks/ds4_profile/container/Dockerfile`: copy only the focused
+  Ticket 07 test module into the overlay so the exact-image conformance gate
+  runs without a mounted source checkout or test-only dependency install.
 - Modify `benchmarks/ds4_profile/README.md`: document metadata-only semantics and local validation.
 - Modify `benchmarks/ds4_profile/container/README.md`: document the school-server planning, pinning, run, validation, and evidence sequence.
 - Modify `benchmarks/ds4_profile/WORKFLOW.md`: add Ticket 07's local/server gate without copying the runbook.

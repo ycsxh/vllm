@@ -134,6 +134,15 @@ def _rewrite_event_rows(output: Path, mutate) -> None:
     pq.write_table(pa.Table.from_pylist(rows, schema=CACHE_EVENT_SCHEMA), path)
 
 
+def _rewrite_turn_rows(output: Path, mutate) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import TURN_SUMMARY_SCHEMA
+
+    path = output / "turn_summaries.parquet"
+    rows = pq.read_table(path).to_pylist()
+    mutate(rows)
+    pq.write_table(pa.Table.from_pylist(rows, schema=TURN_SUMMARY_SCHEMA), path)
+
+
 def _replay_turn(index: int, tokens: list[int], trajectory_id: str = "task:no_think"):
     from benchmarks.ds4_profile.kv_cache_replay import ReplayTurn
 
@@ -1237,6 +1246,59 @@ def test_validator_reconstructs_call_order(tmp_path: Path) -> None:
 
     _rewrite_event_rows(output, corrupt)
     with pytest.raises(ValueError, match="operation ordering mismatch"):
+        validate_result_dir(output)
+
+
+@pytest.mark.parametrize(
+    ("earlier_operation", "later_operation"),
+    [("allocate", "evict"), ("store", "allocate")],
+)
+def test_validator_reconstructs_eviction_allocation_store_order(
+    tmp_path: Path, earlier_operation: str, later_operation: str
+) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import validate_result_dir
+
+    output = _write_valid_result(tmp_path)
+
+    def corrupt(rows) -> None:
+        earlier = next(item for item in rows if item["operation"] == earlier_operation)
+        later = next(
+            item
+            for item in rows
+            if item["turn_index"] == earlier["turn_index"]
+            and item["operation"] == later_operation
+        )
+        earlier["operation_ordinal"], later["operation_ordinal"] = (
+            later["operation_ordinal"],
+            earlier["operation_ordinal"],
+        )
+        for row in (earlier, later):
+            row["event_id"] = (
+                f"{row['run_id']}:{row['trajectory_id']}:{row['turn_index']}:"
+                f"{row['operation']}:{row['operation_ordinal']}"
+            )
+
+    _rewrite_event_rows(output, corrupt)
+    with pytest.raises(ValueError, match="operation ordering mismatch"):
+        validate_result_dir(output)
+
+
+def test_validator_reconstructs_timing_summaries(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import validate_result_dir
+
+    output = _write_valid_result(tmp_path)
+    _rewrite_turn_rows(output, lambda rows: rows[0].update(allocation_time_ns=0))
+    with pytest.raises(ValueError, match="turn summary timing mismatch"):
+        validate_result_dir(output)
+
+
+def test_validator_rejects_result_claim_tampering(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import validate_result_dir
+
+    output = _write_valid_result(tmp_path)
+    path = output / "result.md"
+    path.write_text(path.read_text().replace("GPU/HBM validated: no", "yes"))
+    with pytest.raises(ValueError, match="result summary mismatch"):
         validate_result_dir(output)
 
 

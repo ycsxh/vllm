@@ -1463,15 +1463,15 @@ def _normalized_turn_rows(
     return rows
 
 
-def _result_markdown(result: ReplayResult) -> str:
-    pilot_eviction_pressure_observed = result.eviction_count > 0
+def _result_markdown(status: ReplayStatus, eviction_count: int) -> str:
+    pilot_eviction_pressure_observed = eviction_count > 0
     return (
         "# DS4 Ticket 07 KV Cache Replay\n\n"
-        f"Status: {result.status}\n\n"
+        f"Status: {status}\n\n"
         "Metadata only: yes\n\n"
         "Pilot eviction pressure observed: "
         f"{'yes' if pilot_eviction_pressure_observed else 'no'}\n\n"
-        f"Native eviction count: {result.eviction_count}\n\n"
+        f"Native eviction count: {eviction_count}\n\n"
         "GPU/HBM validated: no\n"
     )
 
@@ -1524,7 +1524,9 @@ def write_result(
     )
     _write_json(stage / "run-config.json", config)
     _write_json(stage / "provenance.json", provenance)
-    (stage / "result.md").write_text(_result_markdown(result))
+    (stage / "result.md").write_text(
+        _result_markdown(result.status, result.eviction_count)
+    )
     validate_result_dir(stage)
     stage.rename(output_dir)
 
@@ -1718,6 +1720,25 @@ def _validate_event_rows(
         free_at = [i for i, row in enumerate(rows) if row["operation"] == "free"]
         if free_at and free_at != list(range(free_at[0], len(rows))):
             raise ValueError("operation ordering mismatch: free")
+        eviction_checks = [
+            i
+            for i, row in enumerate(rows)
+            if row["event_source"] == "observer" and row["operation"] == "evict"
+        ]
+        allocations = [
+            i
+            for i, row in enumerate(rows)
+            if row["event_source"] == "observer" and row["operation"] == "allocate"
+        ]
+        stores = [
+            i
+            for i, row in enumerate(rows)
+            if row["event_source"] == "native" and row["operation"] == "store"
+        ]
+        if (
+            allocations and eviction_checks and max(eviction_checks) > min(allocations)
+        ) or (stores and (not allocations or min(stores) < max(allocations))):
+            raise ValueError("operation ordering mismatch: allocation")
         for index, row in enumerate(rows):
             if (
                 row["event_source"] == "observer"
@@ -1831,6 +1852,36 @@ def _validate_event_rows(
         }
         if any(summary[field] != value for field, value in expected_counts.items()):
             raise ValueError("turn summary count mismatch")
+        expected_timings = {
+            "hash_time_ns": sum(
+                row["duration_ns"] or 0 for row in rows if row["operation"] == "hash"
+            ),
+            "lookup_time_ns": sum(
+                row["duration_ns"] or 0 for row in rows if row["operation"] == "lookup"
+            ),
+            "touch_time_ns": sum(
+                row["duration_ns"] or 0
+                for row in rows
+                if row["event_source"] == "observer" and row["operation"] == "touch"
+            ),
+            "allocation_time_ns": sum(
+                row["duration_ns"] or 0
+                for row in rows
+                if row["event_source"] == "observer" and row["operation"] == "allocate"
+            ),
+            "eviction_time_ns": sum(
+                row["eviction_time_ns"] or 0
+                for row in rows
+                if row["event_source"] == "observer" and row["operation"] == "evict"
+            ),
+            "free_time_ns": sum(
+                row["duration_ns"] or 0
+                for row in rows
+                if row["event_source"] == "observer" and row["operation"] == "free"
+            ),
+        }
+        if any(summary[field] != value for field, value in expected_timings.items()):
+            raise ValueError("turn summary timing mismatch")
         if summary["cached_resident_blocks_after_free"] != len(resident):
             raise ValueError("occupancy transition mismatch")
         if (
@@ -1960,6 +2011,15 @@ def validate_result_dir(result_dir: Path) -> None:
         is not pilot_eviction_pressure_observed
     ):
         raise ValueError("pilot eviction pressure status mismatch")
+    expected_markdown = _result_markdown(
+        provenance["status"],
+        sum(
+            row["event_source"] == "native" and row["operation"] == "evict"
+            for row in events
+        ),
+    )
+    if (result_dir / "result.md").read_text() != expected_markdown:
+        raise ValueError("result summary mismatch")
 
 
 def _load_json_object(path: Path) -> dict[str, Any]:

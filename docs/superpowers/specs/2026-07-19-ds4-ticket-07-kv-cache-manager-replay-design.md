@@ -314,6 +314,8 @@ Ticket 07 may add or modify only its focused surface:
 - `tests/benchmarks/ds4_profile/test_kv_cache_replay.py`;
 - minimal command registration in `benchmarks/ds4_profile/container/runtime.py`
   and CPU classification in `container/run.sh`;
+- the DS4 overlay `container/Dockerfile`, limited to packaging the focused
+  Ticket 07 test module for the exact-image conformance gate;
 - focused README, container runbook, workflow, design, and handoff updates.
 
 It does not own Ticket 04 spine hardening or any Ticket 05 implementation,
