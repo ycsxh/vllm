@@ -876,6 +876,19 @@ def test_hit_requires_an_executed_synchronized_prime() -> None:
     assert executor.execute_calls == 0
 
 
+def test_real_request_factory_populates_prefix_cache_block_hashes() -> None:
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(prefix_caching_hash_algo="sha256"),
+        hash_block_size=16,
+    )
+
+    request = prefill_profile._make_request_factory(scheduler)(
+        "prime:warmup:0:r0", list(range(32))
+    )
+
+    assert len(request.block_hashes) == 2
+
+
 def test_cpu_prime_executes_but_never_claims_hardware_validation() -> None:
     point = _adapter_point()
     adapter, executor = _adapter(_fake_output({}, active_ids=()))

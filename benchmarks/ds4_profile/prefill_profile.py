@@ -206,6 +206,35 @@ class _AllocatorSnapshot:
     refusal_proven: bool
 
 
+def _make_request_factory(scheduler: Any) -> Callable[[str, list[int]], Any]:
+    from vllm.sampling_params import SamplingParams
+    from vllm.utils.hashing import get_hash_fn_by_name
+    from vllm.v1.core.kv_cache_utils import (
+        get_request_block_hasher,
+        init_none_hash,
+    )
+    from vllm.v1.request import Request
+
+    caching_hash_fn = get_hash_fn_by_name(
+        scheduler.cache_config.prefix_caching_hash_algo
+    )
+    init_none_hash(caching_hash_fn)
+    block_hasher = get_request_block_hasher(
+        scheduler.hash_block_size, caching_hash_fn
+    )
+
+    def make_request(request_id: str, tokens: list[int]) -> Any:
+        return Request(
+            request_id,
+            tokens,
+            SamplingParams(max_tokens=1, temperature=0.0),
+            None,
+            block_hasher=block_hasher,
+        )
+
+    return make_request
+
+
 class VllmSchedulerCacheAdapter:
     """Version-specific boundary around Scheduler and live KV cache state."""
 
@@ -242,17 +271,6 @@ class VllmSchedulerCacheAdapter:
         import torch
 
         from vllm.model_executor.models.utils import extract_layer_index
-        from vllm.sampling_params import SamplingParams
-        from vllm.v1.request import Request
-
-        def make_request(request_id: str, tokens: list[int]) -> Any:
-            return Request(
-                request_id,
-                tokens,
-                SamplingParams(max_tokens=1, temperature=0.0),
-                None,
-            )
-
         insertion_order = tuple(
             layer_name
             for tensor in scheduler.kv_cache_config.kv_cache_tensors
@@ -280,7 +298,7 @@ class VllmSchedulerCacheAdapter:
             scheduler,
             executor,
             worker,
-            request_factory=make_request,
+            request_factory=_make_request_factory(scheduler),
             synchronize_gpu=lambda: torch.accelerator.synchronize(
                 torch.device("cuda:0")
             ),
