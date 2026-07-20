@@ -945,6 +945,19 @@ def test_artifacts_validate_a_zero_eviction_pilot(tmp_path: Path) -> None:
     assert "Pilot eviction pressure observed: no" in (output / "result.md").read_text()
 
 
+def test_validator_initializes_hashing_for_pinned_input_reconstruction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from benchmarks.ds4_profile import kv_cache_replay
+
+    output = _write_valid_result(tmp_path)
+    monkeypatch.setattr(kv_cache_replay, "_HASHING_INITIALIZED", False)
+
+    kv_cache_replay.validate_result_dir(output)
+
+    assert kv_cache_replay._HASHING_INITIALIZED is True
+
+
 def test_writer_refuses_to_overwrite_and_preserves_failed_artifacts(
     tmp_path: Path,
 ) -> None:

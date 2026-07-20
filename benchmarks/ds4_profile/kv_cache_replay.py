@@ -1812,6 +1812,7 @@ def _validate_event_rows(
 
 
 def validate_result_dir(result_dir: Path) -> None:
+    _initialize_hashing()
     required = {
         "cache_events.parquet",
         "turn_summaries.parquet",
