@@ -21,15 +21,15 @@ Zero pilot evictions are a workload observation, not a vLLM manager failure.
 ## Accepted source and image
 
 The accepted clean source SHA is
-`b25fe1c0b6144511b81b97eac269f27afdf0baf1`. The later handoff-only commit does
+`9eda6b3cf751d3fc519e7cd9eb36ad0d400169f2`. The later handoff-only commit does
 not change or replace this acceptance boundary.
 
 - final image tag: `local/vllm-ds4-profile:ticket-07`;
 - final image ID:
-  `sha256:53f0eed60c359c8a01267335778431f960079d69ce4f82746178a831b2788f4a`;
+  `sha256:83014fde24c11ba5b9c92f90183ece1001860361e74341748a7f4350a14dbf78`;
 - source dirty label: `false`;
 - final image inspect SHA-256:
-  `3debaa45c8e348998d5ba7af08808587ba965e954eb6304ba40c8bc64129837a`;
+  `c89e335756989709676fad70f0423e002d912a8a587d8c668fc02f745dbd55d0`;
 - reused immutable Ticket 03 base ID:
   `sha256:892b612fbcbea36cdfcd567c3f76b4993861e2d36a543ab96b56265839f872a1`.
 
@@ -43,12 +43,12 @@ not reused or modified.
 ## Planning and pinned selection
 
 The final clean planning checkpoint was
-`b25fe1c0b6144511b81b97eac269f27afdf0baf1` in image
-`sha256:53f0eed60c359c8a01267335778431f960079d69ce4f82746178a831b2788f4a`.
+`9eda6b3cf751d3fc519e7cd9eb36ad0d400169f2` in image
+`sha256:83014fde24c11ba5b9c92f90183ece1001860361e74341748a7f4350a14dbf78`.
 The final container planning record is retained at:
 
 ```text
-/home/lyc/ds4-storage/results/ticket-07-selection-b25fe1c0.json
+/home/lyc/ds4-storage/results/ticket-07-selection-9eda6b3c.json
 ```
 
 - planning record file SHA-256:
@@ -111,7 +111,7 @@ The accepted result directory is:
 
 ```text
 /home/lyc/ds4-storage/results/ticket-07/
-  ds4-kv-replay-20260720T085917Z-45aef5db
+  ds4-kv-replay-20260720T091929Z-caec3eb2
 ```
 
 The real path was `Request` → `KVCacheManager.get_computed_blocks` →
@@ -133,8 +133,8 @@ The real path was `Request` → `KVCacheManager.get_computed_blocks` →
 The artifact provenance directly binds the run to the clean source SHA, image
 ID, complete host and container invocations, deterministic environment, and
 installed package versions. Request hashing was measured for every turn; the
-minimum recorded hash duration was `363,363 ns` and the total was
-`24,159,107 ns`.
+minimum recorded hash duration was `339,565 ns` and the total was
+`23,275,404 ns`.
 
 The result says exactly `Metadata only: yes`,
 `Pilot eviction pressure observed: no`, `Native eviction count: 0`, and
@@ -143,13 +143,13 @@ The result says exactly `Metadata only: yes`,
 Artifact SHA-256 values:
 
 - `cache_events.parquet`:
-  `93c3893bca4eef0b289a85c3bb9d43430a0590d848598b3682ec9cc2e9c2f16d`;
+  `69d907e20b970659a2f538b58def42dd249390277362064a3df0b18e34978ab3`;
 - `turn_summaries.parquet`:
-  `57da3fcbc03554812d19dbf0b8f380cc2ff6f3dbe16af929352384a5156c42be`;
+  `bc42633123b43082d30eafc7bb6cba0c2d69e06aa4382b768b4e0f70beba9db9`;
 - `run-config.json`:
-  `00ed3a177c7c61dc4f425f13fdb58ee98bc62017e28fb9460b591f99f90fe2ca`;
+  `def3af20fc56577639ac6b99383756cdd33a9083db7092d77a10d3055dae80fb`;
 - `provenance.json`:
-  `5ab4eb72171dca4adb5572412085ef18b9580270df5ff2744a5424583d336380`;
+  `29d593c375dd6008101e38d33751d2c05ce319cd86dfe2d21b2cf2772c4d4ed9`;
 - `result.md`:
   `3fb1cdefc5c6682891c845c7a1f05788e8e82071f72e6a8a9ba4571457d0cf25`.
 
@@ -162,15 +162,15 @@ export PYTHONHASHSEED=0
 export VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0
 ```
 
-- host Ticket 07 plus container workflow: **57 passed**;
+- host Ticket 07 plus container workflow: **61 passed**;
 - real upstream manager regressions: **3 passed, 14 Torch deprecation
   warnings**;
-- final-image focused Ticket 07 suite: **43 passed, 2 non-functional
+- final-image focused Ticket 07 suite: **47 passed, 2 non-functional
   warnings**;
 - final-image pytest exec record:
-  `/home/lyc/ds4-storage/results/ticket-07-pytest-b25fe1c0.json`;
+  `/home/lyc/ds4-storage/results/ticket-07-pytest-9eda6b3c.json`;
 - final-image pytest exec-record SHA-256:
-  `5412c91324518280c1f6966a991994f9094092f8432778dc4ea3446cdd335002`.
+  `0a294be55d32e7cc9019948ee1e3571927584c877ead4ad1acdbe0e202b77e39`.
 
 The final immutable image packages only the focused Ticket 07 test file. The
 suite passed directly in that image without a mounted checkout or ephemeral
@@ -188,7 +188,9 @@ does not naturally exercise.
 
 The independent validator now reconstructs active, cached-resident, and free
 occupancy from observer/native physical block events and rejects a
-self-consistent ledger-only tamper. Focused tests also prove that both
+self-consistent ledger-only tamper. It also reconstructs nested eviction-check,
+allocation, and native-store order; reconciles every timing summary; and
+rejects any `result.md` claim drift. Focused tests also prove that both
 out-of-capacity and pre-event invalid runs finalize schema-stable partial
 artifacts with a complete ordered manifest prefix and a non-success provenance
 status.
@@ -210,9 +212,24 @@ No failed or partial evidence was deleted:
   `ticket-07-image-pre-validator-init-failure.json`;
 - missing-`tblib` image pytest record: `ticket-07-pytest-final.json`.
 
-The old accepted image remains tagged
+The first accepted image remains tagged
 `local/vllm-ds4-profile:ticket-07-pre-spec-review`; its results remain retained
-but are superseded by the `b25fe1c0` acceptance above.
+but are superseded by the `9eda6b3c` acceptance above. The intermediate image
+is retained as `local/vllm-ds4-profile:ticket-07-pre-final-validator`.
+
+## Final branch review
+
+The fixed-base Standards and Spec reviews found no remaining documented hard
+violation, missing requirement, scope creep, or implemented-looking-but-wrong
+behavior after the final corrections. The Spec review's provenance,
+exact-image, partial/OOC, occupancy, hash timing, event order, timing-summary,
+and result-summary findings are all covered by focused regression tests.
+
+Standards review retained non-blocking maintainability observations: the
+single replay module is large, event dictionaries form a data clump, and CLI
+dispatch contains repeated switches. These are refactoring opportunities, not
+Ticket 07 correctness or acceptance failures; splitting them now would enlarge
+the accepted surface without improving the metadata evidence.
 
 Both new-process hashing defects were in Ticket 07 CLI wiring, not vLLM cache
 manager semantics. Each was reproduced by a failing test before the fix.
