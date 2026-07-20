@@ -219,9 +219,7 @@ def _make_request_factory(scheduler: Any) -> Callable[[str, list[int]], Any]:
         scheduler.cache_config.prefix_caching_hash_algo
     )
     init_none_hash(caching_hash_fn)
-    block_hasher = get_request_block_hasher(
-        scheduler.hash_block_size, caching_hash_fn
-    )
+    block_hasher = get_request_block_hasher(scheduler.hash_block_size, caching_hash_fn)
 
     def make_request(request_id: str, tokens: list[int]) -> Any:
         request_key = request_id.rsplit(":", 1)[-1]
@@ -273,6 +271,7 @@ class VllmSchedulerCacheAdapter:
         import torch
 
         from vllm.model_executor.models.utils import extract_layer_index
+
         insertion_order = tuple(
             layer_name
             for tensor in scheduler.kv_cache_config.kv_cache_tensors
@@ -582,9 +581,7 @@ class VllmSchedulerCacheAdapter:
             )
             self.scheduler.add_request(scheduler_request)
 
-    def probe_out_of_capacity(
-        self, point: PPointPlan
-    ) -> AllocationEvidence | None:
+    def probe_out_of_capacity(self, point: PPointPlan) -> AllocationEvidence | None:
         """Prove full-batch admission failure before partial scheduling."""
         if self.request_factory is None:
             raise RuntimeError("capacity probe requires a real request factory")
@@ -1167,9 +1164,9 @@ def _run_point_repetition_impl(
             adapter, "completed_prime_evidence", lambda: prime_evidence
         )()
         completed_evidence.extend(snapshot)
-    capacity_failure = getattr(
-        adapter, "probe_out_of_capacity", lambda _point: None
-    )(point)
+    capacity_failure = getattr(adapter, "probe_out_of_capacity", lambda _point: None)(
+        point
+    )
     if capacity_failure is not None:
         chunk = point.chunks[0]
         scheduled = ScheduledChunk(
@@ -2071,6 +2068,8 @@ def _assemble_result(
         "hardware_validated": worker_passed,
         "preflight": preflight,
         "image": {"id": worker.get("image_id", "unknown")},
+        "model": config.get("model"),
+        "runtime": config.get("runtime"),
         "source": config.get("source", {}),
         "worker": {
             "command": worker.get("command"),

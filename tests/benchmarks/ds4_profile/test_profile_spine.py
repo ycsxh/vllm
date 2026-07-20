@@ -109,7 +109,9 @@ def _write_v2_result(tmp_path: Path) -> Path:
         "points": points,
         "canonical_full_manifest": point_ids,
         "expected_manifest": point_ids,
+        "model": {"revision": "model-revision"},
         "profile": {"noisy_cv_threshold": 0.05},
+        "runtime": {"effective_max_model_len": 8192},
     }
     raw_rows = []
     turn_rows = []
@@ -268,7 +270,15 @@ def _write_v2_result(tmp_path: Path) -> Path:
     ):
         pq.write_table(pa.Table.from_pylist(rows, schema=schema), output_dir / name)
     (output_dir / "run-config.json").write_text(json.dumps(config))
-    (output_dir / "provenance.json").write_text(json.dumps({"run_id": "v2-fixture"}))
+    (output_dir / "provenance.json").write_text(
+        json.dumps(
+            {
+                "run_id": "v2-fixture",
+                "model": config["model"],
+                "runtime": config["runtime"],
+            }
+        )
+    )
     (output_dir / "result.md").write_text("fixture\n")
     return output_dir
 
@@ -331,6 +341,19 @@ def test_v2_validator_rejects_each_unknown_enum(tmp_path: Path) -> None:
         output_dir / "raw_samples.parquet",
     )
     with pytest.raises(ValueError, match="unknown role"):
+        profile_spine._validate_result_dir(output_dir)
+
+
+def test_v2_validator_rejects_unfrozen_provenance_runtime(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    output_dir = _write_v2_result(tmp_path)
+    path = output_dir / "provenance.json"
+    provenance = json.loads(path.read_text())
+    provenance["runtime"]["effective_max_model_len"] = 32768
+    path.write_text(json.dumps(provenance))
+
+    with pytest.raises(ValueError, match="provenance model/runtime"):
         profile_spine._validate_result_dir(output_dir)
 
 

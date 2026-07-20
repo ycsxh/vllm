@@ -169,6 +169,18 @@ def test_checked_in_p_profile_config_freezes_hardware_contract() -> None:
     assert config["runtime"]["enable_chunked_prefill"] is True
     assert config["runtime"]["enforce_eager"] is False
     assert config["runtime"]["allow_long_max_model_len"] is True
+    assert config["model"]["hf_overrides"] == {
+        "rope_parameters": {
+            "factor": 4.0,
+            "original_max_position_embeddings": 32768,
+            "rope_type": "yarn",
+        },
+        "rope_scaling": {
+            "factor": 4.0,
+            "original_max_position_embeddings": 32768,
+            "type": "yarn",
+        },
+    }
     buckets = [128, 256, 512, 1024, 2048, 4096]
     assert config["runtime"]["compilation"]["compile_sizes"] == buckets
     assert config["runtime"]["compilation"]["capture_sizes"] == buckets
@@ -524,6 +536,8 @@ def test_p_profile_preserves_bootstrap_failure_before_planner_load(
     provenance = json.loads((output_dir / "provenance.json").read_text())
     assert provenance["validation_state"] == "remote_failed"
     assert provenance["hardware_validated"] is False
+    assert provenance["model"] == config["model"]
+    assert provenance["runtime"] == config["runtime"]
     assert "FileNotFoundError" in provenance["validation_error"]
     assert (output_dir / "preflight.json").is_file()
     assert {
@@ -656,11 +670,9 @@ class _FakeScheduler:
             kv_cache_groups=(
                 SimpleNamespace(
                     layer_names=("layer.0",),
-                    kv_cache_spec=SimpleNamespace(
-                        block_size=16, page_size_bytes=64
-                    ),
+                    kv_cache_spec=SimpleNamespace(block_size=16, page_size_bytes=64),
                 ),
-            )
+            ),
         )
         self.kv_cache_manager = _FakeKvCacheManager(free_blocks)
         self.kv_cache_manager.owner = self
@@ -1643,6 +1655,105 @@ def test_long_model_len_override_requires_explicit_runtime_opt_in(
     with pytest.raises(ValueError, match="allow_long_max_model_len"):
         gpu_profile._configure_long_model_len({"allow_long_max_model_len": "yes"})
     assert "VLLM_ALLOW_LONG_MAX_MODEL_LEN" not in os.environ
+
+
+def test_vllm_config_applies_the_frozen_model_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from benchmarks.ds4_profile import gpu_profile
+    from vllm.engine import arg_utils
+
+    path = (
+        Path(__file__).parents[3]
+        / "benchmarks/ds4_profile/config/p-prefill-profile.json"
+    )
+    config = json.loads(path.read_text())
+    config["runtime"]["effective_max_model_len"] = 39308
+    captured: dict[str, Any] = {}
+
+    class EngineArgs:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def create_engine_config(self) -> Any:
+            return SimpleNamespace(
+                model_config=SimpleNamespace(
+                    enforce_eager=False,
+                    hf_text_config=SimpleNamespace(
+                        rope_parameters={
+                            "factor": 4.0,
+                            "original_max_position_embeddings": 32768,
+                            "rope_type": "yarn",
+                        }
+                    ),
+                ),
+                use_v2_model_runner=False,
+                compilation_config=captured["compilation_config"],
+            )
+
+    monkeypatch.setattr(arg_utils, "EngineArgs", EngineArgs)
+
+    gpu_profile._create_vllm_config(config)
+
+    assert captured["hf_overrides"] == config["model"]["hf_overrides"]
+    assert list(captured["hf_overrides"])[-2:] == [
+        "rope_scaling",
+        "rope_parameters",
+    ]
+
+
+def test_hf_override_order_preserves_modern_yarn_parameters() -> None:
+    from transformers import Qwen2Config
+
+    from benchmarks.ds4_profile import gpu_profile
+    from vllm.transformers_utils.config import patch_rope_parameters
+
+    path = (
+        Path(__file__).parents[3]
+        / "benchmarks/ds4_profile/config/p-prefill-profile.json"
+    )
+    model = json.loads(path.read_text())["model"]
+    interpreted = Qwen2Config()
+    for key, value in gpu_profile._ordered_hf_overrides(model).items():
+        interpreted.update({key: value})
+    patch_rope_parameters(interpreted)
+
+    assert interpreted.rope_parameters["rope_type"] == "yarn"
+    assert interpreted.rope_parameters["factor"] == 4.0
+    assert interpreted.rope_parameters["original_max_position_embeddings"] == 32768
+
+
+@pytest.mark.parametrize(
+    "rope_parameters",
+    [
+        None,
+        {"rope_type": "default"},
+        {
+            "factor": 4.0,
+            "original_max_position_embeddings": 32768,
+            "rope_type": "default",
+        },
+    ],
+)
+def test_long_context_rope_validation_fails_closed(
+    rope_parameters: dict[str, Any] | None,
+) -> None:
+    from benchmarks.ds4_profile import gpu_profile
+
+    path = (
+        Path(__file__).parents[3]
+        / "benchmarks/ds4_profile/config/p-prefill-profile.json"
+    )
+    config = json.loads(path.read_text())
+    config["runtime"]["effective_max_model_len"] = 39308
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(rope_parameters=rope_parameters)
+        )
+    )
+
+    with pytest.raises(ValueError, match="did not interpret"):
+        gpu_profile._validate_long_context_rope(config, vllm_config)
 
 
 def test_run_prefill_matrix_uses_public_runtime_and_always_shuts_down(

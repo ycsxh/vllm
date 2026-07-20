@@ -1634,6 +1634,8 @@ def _validate_v2_result_dir(result_dir: Path, config: dict[str, Any]) -> None:
             or config.get("canonical_full_manifest") != []
             or config.get("expected_manifest") != []
             or provenance.get("run_id") != config.get("run_id")
+            or provenance.get("model") != config.get("model")
+            or provenance.get("runtime") != config.get("runtime")
             or provenance.get("validation_state") != "remote_failed"
             or provenance.get("hardware_validated") is not False
             or not isinstance(provenance.get("validation_error"), str)
@@ -1673,6 +1675,10 @@ def _validate_v2_result_dir(result_dir: Path, config: dict[str, Any]) -> None:
     }
     point_views = {point.point_id: point for point in _point_plans_from_config(config)}
     provenance = json.loads((result_dir / "provenance.json").read_text())
+    if provenance.get("model") != config.get("model") or provenance.get(
+        "runtime"
+    ) != config.get("runtime"):
+        raise ValueError("provenance model/runtime differs from run config")
     validation_state = provenance.get("validation_state")
     if validation_state is not None and validation_state not in V2_VALIDATION_STATES:
         raise ValueError("unknown validation_state")

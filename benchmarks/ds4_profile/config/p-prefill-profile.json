@@ -4,6 +4,18 @@
     "workload_plan": "/mnt/ds4/ticket-02/workload_plan.json"
   },
   "model": {
+    "hf_overrides": {
+      "rope_parameters": {
+        "factor": 4.0,
+        "original_max_position_embeddings": 32768,
+        "rope_type": "yarn"
+      },
+      "rope_scaling": {
+        "factor": 4.0,
+        "original_max_position_embeddings": 32768,
+        "type": "yarn"
+      }
+    },
     "repo_id": "Qwen/Qwen2.5-Coder-7B-Instruct",
     "revision": "c03e6d358207e414f1eca0bb1891e29f1db0e242",
     "tokenizer": "/mnt/ds4/tokenizers/qwen2.5-coder-7b-instruct/c03e6d358207e414f1eca0bb1891e29f1db0e242"

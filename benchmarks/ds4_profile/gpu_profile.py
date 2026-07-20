@@ -31,6 +31,55 @@ def _configure_long_model_len(runtime: dict[str, Any]) -> None:
         os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
 
 
+def _validate_long_context_rope(config: dict[str, Any], vllm_config: Any) -> None:
+    runtime = config["runtime"]
+    if not runtime.get("allow_long_max_model_len", False):
+        return
+    overrides = config["model"].get("hf_overrides", {})
+    legacy = overrides.get("rope_scaling")
+    expected = overrides.get("rope_parameters")
+    if not isinstance(legacy, dict) or not isinstance(expected, dict):
+        raise ValueError("long max model length requires frozen rope_scaling")
+    original = expected.get("original_max_position_embeddings")
+    factor = expected.get("factor")
+    if (
+        expected.get("rope_type") != "yarn"
+        or legacy.get("type") != expected.get("rope_type")
+        or legacy.get("factor") != factor
+        or legacy.get("original_max_position_embeddings") != original
+        or not isinstance(original, int)
+        or isinstance(factor, bool)
+        or not isinstance(factor, (int, float))
+    ):
+        raise ValueError("long max model length requires the pinned YaRN contract")
+    interpreted = vllm_config.model_config.hf_text_config.rope_parameters
+    if (
+        not isinstance(interpreted, dict)
+        or interpreted.get("rope_type", interpreted.get("type")) != "yarn"
+        or interpreted.get("original_max_position_embeddings") != original
+        or interpreted.get("factor") != factor
+    ):
+        raise ValueError("vLLM did not interpret the pinned YaRN contract")
+    if runtime["effective_max_model_len"] > original * factor:
+        raise ValueError("effective max model length exceeds the YaRN limit")
+
+
+def _ordered_hf_overrides(model: dict[str, Any]) -> dict[str, Any]:
+    overrides = model.get("hf_overrides", {})
+    if not isinstance(overrides, dict):
+        raise ValueError("model hf_overrides must be an object")
+    ordered = {
+        key: value
+        for key, value in overrides.items()
+        if key not in {"rope_scaling", "rope_parameters"}
+    }
+    if "rope_scaling" in overrides:
+        ordered["rope_scaling"] = overrides["rope_scaling"]
+    if "rope_parameters" in overrides:
+        ordered["rope_parameters"] = overrides["rope_parameters"]
+    return ordered
+
+
 def _create_vllm_config(config: dict[str, Any]):
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
     _configure_long_model_len(config["runtime"])
@@ -46,6 +95,7 @@ def _create_vllm_config(config: dict[str, Any]):
         model=config["model"]["repo_id"],
         tokenizer=config["model"]["tokenizer"],
         revision=config["model"]["revision"],
+        hf_overrides=_ordered_hf_overrides(config["model"]),
         dtype=runtime["dtype"],
         kv_cache_dtype=runtime["kv_cache_dtype"],
         tensor_parallel_size=runtime["tensor_parallel_size"],
@@ -68,6 +118,7 @@ def _create_vllm_config(config: dict[str, Any]):
         ),
     )
     vllm_config = engine_args.create_engine_config()
+    _validate_long_context_rope(config, vllm_config)
     if vllm_config.model_config.enforce_eager:
         raise ValueError("Ticket 04 GPU runs may not enable eager execution")
     if vllm_config.use_v2_model_runner:
