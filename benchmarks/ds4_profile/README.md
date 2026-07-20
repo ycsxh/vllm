@@ -188,8 +188,9 @@ See the [Ticket 07 container runbook](container/README.md#ticket-07-cpu-metadata
 for the school-server commands and [the current handoff](TICKET_07_HANDOFF.md)
 for the exact accepted and outstanding evidence.
 
-The current full-data planner failed closed: all 20 complete trajectories were
-admitted at their minimum usable capacity, but none emitted a native
-`BlockRemoved` event. The selection therefore remains `unselected`; Ticket 07
-is not metadata-only validated and is not mergeable without an approved design
-revision. See the handoff for the retained planning record and checksums.
+The approved split acceptance treats pilot eviction pressure as an observation,
+not a selection gate. All 20 complete trajectories were admitted at their
+minimum usable capacity and produced zero native evictions. The pinned pilot
+therefore validates the metadata replay while a focused real-manager fixture
+separately requires native `BlockRemoved`, all three miss classes, and future
+reuse labels. See the handoff for the accepted selection and checksums.

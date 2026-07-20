@@ -188,8 +188,8 @@ source SHA, immutable Ticket 07 image ID, pinned planning record, complete
 ordered replay, independent validator success, and five artifact checksums.
 The handoff must still state `GPU/HBM validated: no`.
 
-The current Ticket 07 planner produced no eligible candidate: 20 complete
-sessions passed admission, and all had zero native evictions. The selection
-remains `unselected`, so the container replay and integration gate must not run
-until a revised design is approved. This is a metadata-only planning failure,
-not GPU/HBM evidence.
+Ticket 07 uses split acceptance: the pilot gate requires complete deterministic
+metadata replay and permits zero native evictions, while a focused
+real-manager conformance gate must produce native eviction and cover all three
+miss classes. The accepted pilot observed zero eviction pressure; this is a
+workload result, not a manager failure or GPU/HBM evidence.

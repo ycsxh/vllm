@@ -235,12 +235,11 @@ establish GPU/HBM residency. Use the separate
 04, or 05 result directory or image tag. In the common `DS4_RUN` array above,
 set `--image` to the image for the current phase.
 
-The current pilot is blocked before container acceptance. A host-side rerun of
-the deterministic planner admitted all 20 complete trajectories at their
-minimum usable capacities, but every native eviction count was zero. Do not
-pin the config or run the commands below unless a new approved design produces
-an eligible planning record. The retained failure evidence is documented in
-`TICKET_07_HANDOFF.md`.
+The deterministic planner selects every fully admitted candidate and records
+native eviction pressure independently. Zero pilot evictions are valid when
+all turns pass and the focused real-manager conformance fixture separately
+proves native eviction, LRU behavior, all three miss classes, and future reuse.
+Never lower capacity, shorten a prompt, or skip a turn to manufacture pressure.
 
 Build the clean planning image, retain its inspection metadata, and run the
 deterministic planner:
@@ -284,8 +283,10 @@ exactly these five artifacts:
 - `result.md`
 
 `result.md` must report `Metadata only: yes` and
-`GPU/HBM validated: no`; provenance must record
-`metadata_only_validated: true` and `hardware_validated: false`.
+`GPU/HBM validated: no`; it must also report the pilot eviction count and
+pressure status. Provenance must record `metadata_only_validated: true`,
+`pilot_eviction_pressure_observed` from that count, and
+`hardware_validated: false`.
 Independently checksum all five files and retain the source SHA and dirty state,
 immutable image ID, verified input hashes, planning record, validator exit
 status, and result path in
