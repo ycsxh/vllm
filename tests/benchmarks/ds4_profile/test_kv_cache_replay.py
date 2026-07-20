@@ -987,6 +987,46 @@ def test_validate_cli_reports_independent_validation_failure(tmp_path: Path) -> 
     assert "validation failed: unknown operation" in result.stderr
 
 
+def test_run_cli_initializes_hashing_before_manifest_reconstruction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from benchmarks.ds4_profile import kv_cache_replay
+
+    config, _, _ = _artifact_fixture(tmp_path)
+    config_path = tmp_path / "config.json"
+    planning_record_path = tmp_path / "planning.json"
+    config_path.write_text(json.dumps(config))
+    planning_record_path.write_text(json.dumps(config["planning_record"]))
+    turns = [
+        _replay_turn(0, [1, 1, 2, 2, 3]),
+        _replay_turn(1, [1, 1, 9, 9, 8, 8]),
+        _replay_turn(2, [1, 1, 2, 2, 7]),
+    ]
+    monkeypatch.setattr(kv_cache_replay, "_HASHING_INITIALIZED", False)
+    monkeypatch.setattr(kv_cache_replay, "verify_pinned_selection", lambda *_: None)
+    monkeypatch.setattr(kv_cache_replay, "load_full_turns", lambda _: turns)
+    monkeypatch.setattr(kv_cache_replay, "write_result", lambda *_: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "kv_cache_replay",
+            "run",
+            "--config",
+            str(config_path),
+            "--planning-record",
+            str(planning_record_path),
+            "--output-dir",
+            str(tmp_path / "result"),
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        kv_cache_replay.main()
+
+    assert exit_info.value.code == 0
+
+
 def test_container_runtime_prints_cpu_only_cache_replay_plan(tmp_path: Path) -> None:
     result = subprocess.run(
         [

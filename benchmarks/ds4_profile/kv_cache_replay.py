@@ -1886,6 +1886,7 @@ def _plan_cli(config_path: Path, output: Path) -> int:
 
 
 def _run_cli(config_path: Path, planning_record_path: Path, output_dir: Path) -> int:
+    _initialize_hashing()
     config = _load_json_object(config_path)
     plan = _load_json_object(planning_record_path)
     verify_pinned_selection(config, plan)
