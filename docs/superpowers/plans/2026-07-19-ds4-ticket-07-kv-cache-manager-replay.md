@@ -1155,14 +1155,17 @@ and rejecting duplicates or gaps. Each ordered row contains exactly
 `block_hashes_sha256` (SHA-256 of compact JSON canonical chained block hashes).
 Hash the complete ordered row list as `turn_manifest_sha256`.
 
-Group turns by trajectory. For each group, set capacity to the maximum `ceil(prompt_tokens / block_size)`, run the real metadata replay, and mark it eligible only when every turn passed and at least one native eviction occurred:
+Group turns by trajectory. For each group, set capacity to the maximum
+`ceil(prompt_tokens / block_size)`, run the real metadata replay, and mark it
+eligible when every turn passed. Preserve `eviction_count` as a zero-or-more
+pilot observation rather than a selection gate:
 
 ```python
 def _select_candidate(candidates: Sequence[dict[str, Any]]) -> dict[str, Any]:
     reasoning_rank = {"no_think": 0, "think_high": 1}
     eligible = [item for item in candidates if item["status"] == "eligible"]
     if not eligible:
-        raise ValueError("no full trajectory admits all turns with eviction pressure")
+        raise ValueError("no full trajectory admits all turns")
     return min(
         eligible,
         key=lambda item: (
@@ -1210,7 +1213,7 @@ def build_selection_plan(
                 "turn_manifest_sha256": _canonical_json_sha256(selected_turns),
                 "status": (
                     "eligible"
-                    if result.status == "passed" and result.eviction_count > 0
+                    if result.status == "passed"
                     else "rejected"
                 ),
                 "reason": result.error,
@@ -1687,7 +1690,10 @@ observer, and native rows. It must:
 - recompute manager-forced-recompute counts separately from all miss classes;
 - require `cached_tokens + recomputed_tokens == prompt_tokens`;
 - require all successful configured turns in increasing serial order;
-- require at least one eviction for a passed result; and
+- require native eviction counts to match the event rows, allowing zero for a
+  passed pilot result;
+- require `pilot_eviction_pressure_observed` to equal whether the native
+  eviction count is nonzero;
 - recompute and verify every manifest, Ticket 01/02 data/provenance, and
   tokenizer input size/SHA from provenance, then verify the canonical input-set
   and planning-record digests; and
@@ -2090,7 +2096,7 @@ from pathlib import Path
 p = Path.home() / "ds4-storage/results/ticket-07-selection.json"
 value = json.loads(p.read_text())
 assert value["status"] == "selected"
-assert value["selected"]["eviction_count"] > 0
+assert value["selected"]["eviction_count"] >= 0
 assert {
     "manifest",
     "ticket_01_data",
@@ -2101,6 +2107,7 @@ assert {
 assert any(item["logical_name"].startswith("tokenizer:") for item in value["inputs"])
 print(json.dumps({
     "capacity_blocks": value["selected"]["capacity_blocks"],
+    "eviction_count": value["selected"]["eviction_count"],
     "input_set_sha256": value["selected"]["input_set_sha256"],
     "planning_sha256": value["sha256"],
     "reasoning_mode": value["selected"]["reasoning_mode"],
@@ -2113,7 +2120,8 @@ print(json.dumps({
 
 Expected: exit `0` and one complete JSON `selection` object. The planner
 candidate list shows every rejected/eligible trajectory, every admitted
-selected turn, and at least one native eviction. Its hashed input inventory
+selected turn, and each trajectory's native eviction count, including zero.
+Its hashed input inventory
 covers both ticket data/provenance pairs and every tokenizer file, and it
 contains no completion/decode token field. The selected ordered turn manifest
 contains every selected turn exactly once with prompt-token and block-hash
@@ -2177,10 +2185,12 @@ sha256sum \
   "$RESULT_DIR/result.md"
 ```
 
-Expected: run and validator exit `0`; all configured turns pass; at least one
-eviction exists; manager-forced recomputes are separate from misses; observer
-eviction timing reconciles with native removals; every pinned input SHA is
-recomputed; result text contains `Metadata only: yes` and
+Expected: run and validator exit `0`; all configured turns pass; the pilot's
+native eviction count is recorded exactly, including zero; manager-forced
+recomputes are separate from misses; any observer eviction timing reconciles
+with native removals; every pinned input SHA is recomputed; provenance sets
+`pilot_eviction_pressure_observed` from that count; result text contains
+`Metadata only: yes`, the pilot eviction-pressure status, and
 `GPU/HBM validated: no`; five checksums are printed.
 
 - [ ] **Step 6: Run the focused tests in the exact image**
@@ -2213,9 +2223,10 @@ Expected: the evidence commit changes only the handoff. Acceptance remains bound
 
 - [ ] Confirm `git diff 65de0de0ab4a5799284e97b823e673d5ac73ef05 HEAD --name-only` contains only the Ticket 07 files listed in the File Map plus this approved design/plan.
 - [ ] Confirm no diff exists in `profile_spine.py`, `gpu_profile.py`, Ticket 05 files, or vLLM core manager/pool implementations.
-- [ ] Confirm the planner's selected capacity is exactly the maximum live prompt block count for the selected trajectory and that the planner observed at least one native `BlockRemoved` event.
+- [ ] Confirm the planner's selected capacity is exactly the maximum live prompt block count for the selected trajectory and that its native `BlockRemoved` count is preserved exactly, including zero.
 - [ ] Confirm every event/turn artifact uses schema version `1.0.0`, stable IDs, validated enum values, and cross-file run/trajectory/turn integrity.
-- [ ] Confirm all native evictions have complementary `useful_later`/`never_reused` labels and correct nullability/reuse distance.
+- [ ] Confirm the focused real-manager conformance fixture observes at least one native `BlockRemoved` and all three miss classes.
+- [ ] Confirm all native evictions, when present, have complementary `useful_later`/`never_reused` labels and correct nullability/reuse distance; a zero-eviction pilot has no such rows.
 - [ ] Confirm admission failure is preserved rather than changing capacity or prompt length.
 - [ ] Confirm `PYTHONHASHSEED=0` is present in local commands and Docker, null-hash initialization occurs once per process, and equal prefixes in separate requests produce equal hashes.
 - [ ] Confirm `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` is set before every test/CLI/container process imports vLLM, is recorded in config/provenance, and native/prepass hashes remain the same 32-byte SHA values.
