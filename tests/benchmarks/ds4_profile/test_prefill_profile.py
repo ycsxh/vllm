@@ -622,6 +622,8 @@ class _FakeKvCacheManager:
     watermark_blocks = 0
 
     def __init__(self, free_blocks: int) -> None:
+        self.empty_kv_cache_blocks = SimpleNamespace(blocks=((),))
+        self.max_model_len = 4096
         self.block_pool = _FakeBlockPool(free_blocks)
         self.coordinator = _FakeCoordinator()
         self.owner: Any = None
@@ -643,16 +645,20 @@ class _FakeKvCacheManager:
 
 class _FakeScheduler:
     def __init__(self, output, *, free_blocks: int = 120) -> None:
+        self.block_size = 16
         self.output = output
         self.requests = {request_id: object() for request_id in output.active_ids}
         self.running = [SimpleNamespace(request_id=item) for item in output.active_ids]
         self.waiting: list[SimpleNamespace] = []
         self.scheduler_config = SimpleNamespace(long_prefill_token_threshold=0)
         self.kv_cache_config = SimpleNamespace(
+            num_blocks=128,
             kv_cache_groups=(
                 SimpleNamespace(
                     layer_names=("layer.0",),
-                    kv_cache_spec=SimpleNamespace(page_size_bytes=64),
+                    kv_cache_spec=SimpleNamespace(
+                        block_size=16, page_size_bytes=64
+                    ),
                 ),
             )
         )
@@ -1126,6 +1132,45 @@ def test_allocator_ooc_requires_pressure_and_clean_reset() -> None:
     assert allocation.clean_reset_proven
 
 
+def test_full_batch_capacity_probe_requires_a_real_allocator_refusal() -> None:
+    point = _adapter_point()
+    adapter, _ = _adapter(_fake_output({}, active_ids=()), free_blocks=0)
+    adapter.scheduler.kv_cache_config.num_blocks = 1
+    adapter.scheduler.kv_cache_manager.coordinator.required_blocks = 2
+    adapter.request_factory = lambda request_id, tokens: SimpleNamespace(
+        request_id=request_id,
+        prompt_token_ids=tokens,
+        num_tokens=len(tokens),
+        skip_reading_prefix_cache=False,
+    )
+
+    allocation = adapter.probe_out_of_capacity(point)
+
+    assert allocation is not None
+    assert allocation.state == "out_of_capacity"
+    assert allocation.requested_blocks > allocation.allocatable_blocks
+    assert allocation.allocator_pressure_proven
+    assert allocation.clean_reset_proven
+
+
+def test_capacity_probe_uses_coordinator_admission_caps() -> None:
+    point = _adapter_point()
+    adapter, _ = _adapter(_fake_output({}, active_ids=()), free_blocks=0)
+    adapter.scheduler.kv_cache_config.num_blocks = 3
+    group = adapter.scheduler.kv_cache_config.kv_cache_groups[0]
+    adapter.scheduler.kv_cache_config.kv_cache_groups = (group, group)
+    adapter.scheduler.kv_cache_manager.coordinator.required_blocks = 2
+    adapter.request_factory = lambda request_id, tokens: SimpleNamespace(
+        request_id=request_id,
+        prompt_token_ids=tokens,
+        num_tokens=len(tokens),
+        skip_reading_prefix_cache=False,
+    )
+
+    assert adapter.probe_out_of_capacity(point) is None
+    assert adapter.scheduler.requests == {}
+
+
 def test_allocator_ooc_records_authoritative_manager_requirement() -> None:
     point = _adapter_point()
     adapter, _ = _adapter(_fake_output({}, active_ids=("r0",)), free_blocks=2)
@@ -1315,6 +1360,46 @@ def test_allocator_pressure_emits_one_untimed_terminal_row() -> None:
     assert result["rows"][0]["runtime_mode"] is None
     assert isinstance(result["rows"][0]["cache_epoch"], int)
     assert events == ["reset", "prime_gpu0", "clean_reset"]
+
+
+def test_capacity_probe_preserves_hit_prime_evidence_before_terminal_ooc() -> None:
+    events: list[str] = []
+    adapter: Any = _OrchestrationAdapter(events)
+
+    def prime(*_args):
+        events.append("prime_gpu0")
+        return (_prime_evidence(),)
+
+    def probe(_point):
+        events.append("capacity_probe")
+        return prefill_profile.AllocationEvidence(
+            state="out_of_capacity",
+            requested_blocks=9,
+            allocated_blocks=0,
+            allocatable_blocks=8,
+            requested_bytes=576,
+            allocated_bytes=0,
+            lookup_time_ms=0.1,
+            allocation_time_ms=0.1,
+            allocator_pressure_proven=True,
+            clean_reset_proven=True,
+        )
+
+    adapter.prime = prime
+    adapter.probe_out_of_capacity = probe
+    result = prefill_profile.run_point_repetition(
+        _adapter_point(),
+        phase="warmup",
+        ordinal=0,
+        adapter=adapter,
+        execute_timed=_timed_executor(events),
+    )
+
+    assert result["status"] == "out_of_capacity"
+    assert len(result["prefix_evidence"]) == 1
+    assert events == ["reset", "prime_gpu0", "capacity_probe"]
+    assert result["rows"][0]["actual_scheduled_tokens_by_request"] == []
+    assert result["rows"][0]["runner_wall_time_ms"] is None
 
 
 def test_later_allocator_pressure_preserves_only_completed_chunk_timing() -> None:

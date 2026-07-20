@@ -11,7 +11,7 @@ import os
 import sys
 import tempfile
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Literal
@@ -582,6 +582,94 @@ class VllmSchedulerCacheAdapter:
             )
             self.scheduler.add_request(scheduler_request)
 
+    def probe_out_of_capacity(
+        self, point: PPointPlan
+    ) -> AllocationEvidence | None:
+        """Prove full-batch admission failure before partial scheduling."""
+        if self.request_factory is None:
+            raise RuntimeError("capacity probe requires a real request factory")
+        manager = self.scheduler.kv_cache_manager
+        empty_blocks = manager.empty_kv_cache_blocks.blocks
+        requested_sequence_blocks = 0
+        for request in point.requests:
+            scheduler_request = self.request_factory(
+                request.request_key, list(request.prompt_token_ids)
+            )
+            full_num_tokens = min(scheduler_request.num_tokens, manager.max_model_len)
+            requested_sequence_blocks += int(
+                manager.coordinator.get_num_blocks_to_allocate(
+                    request_id=scheduler_request.request_id,
+                    num_tokens=full_num_tokens,
+                    new_computed_blocks=empty_blocks,
+                    num_encoder_tokens=0,
+                    total_computed_tokens=0,
+                    num_local_computed_tokens=0,
+                    num_tokens_main_model=full_num_tokens,
+                    apply_admission_cap=True,
+                )
+            )
+        capacity = int(self.scheduler.kv_cache_config.num_blocks)
+        if requested_sequence_blocks <= capacity:
+            return None
+
+        self.add_measurement_requests(point)
+        allocated_blocks = 0
+        started = perf_counter()
+        for request in point.requests:
+            scheduler_request = self.scheduler.requests[request.request_key]
+            required_calls: list[int] = []
+            original_required = manager.coordinator.get_num_blocks_to_allocate
+
+            def tracked_required(
+                *args: Any,
+                _original: Callable[..., Any] = original_required,
+                _calls: list[int] = required_calls,
+                **kwargs: Any,
+            ) -> int:
+                required = int(_original(*args, **kwargs))
+                _calls.append(required)
+                return required
+
+            manager.coordinator.get_num_blocks_to_allocate = tracked_required
+            free_blocks = int(manager.block_pool.get_num_free_blocks())
+            has_scheduled = allocated_blocks > 0
+            try:
+                blocks = manager.allocate_slots(
+                    scheduler_request,
+                    scheduler_request.num_tokens,
+                    full_sequence_must_fit=True,
+                    has_scheduled_reqs=has_scheduled,
+                )
+            finally:
+                manager.coordinator.get_num_blocks_to_allocate = original_required
+            if blocks is not None:
+                groups = getattr(blocks, "blocks", blocks)
+                allocated_blocks += sum(len(group) for group in groups)
+                continue
+            if not required_calls:
+                raise RuntimeError("capacity probe refusal omitted block demand")
+            watermark = int(manager.watermark_blocks) if has_scheduled else 0
+            required_blocks = required_calls[0] + watermark
+            if required_blocks <= free_blocks:
+                raise RuntimeError("capacity probe refusal lacked allocator pressure")
+            elapsed_ms = (perf_counter() - started) * 1000
+            allocation = AllocationEvidence(
+                state="out_of_capacity",
+                requested_blocks=allocated_blocks + required_blocks,
+                allocated_blocks=allocated_blocks,
+                allocatable_blocks=allocated_blocks + free_blocks,
+                requested_bytes=0,
+                allocated_bytes=0,
+                lookup_time_ms=elapsed_ms,
+                allocation_time_ms=elapsed_ms,
+                allocator_pressure_proven=True,
+                clean_reset_proven=False,
+            )
+            self.reset_epoch()
+            return replace(allocation, clean_reset_proven=True)
+        self.reset_epoch()
+        raise RuntimeError("capacity probe did not produce an allocator refusal")
+
     def update_after_execute(self, scheduler_output: Any, model_output: Any) -> None:
         """Apply one completed worker step to Scheduler state."""
         self.scheduler.update_from_output(scheduler_output, model_output)
@@ -1079,6 +1167,47 @@ def _run_point_repetition_impl(
             adapter, "completed_prime_evidence", lambda: prime_evidence
         )()
         completed_evidence.extend(snapshot)
+    capacity_failure = getattr(
+        adapter, "probe_out_of_capacity", lambda _point: None
+    )(point)
+    if capacity_failure is not None:
+        chunk = point.chunks[0]
+        scheduled = ScheduledChunk(
+            scheduler_output=None,
+            expected_request_ids=tuple(chunk.scheduled_tokens_by_request),
+            actual_request_ids=(),
+            expected_tokens_by_request=dict(chunk.scheduled_tokens_by_request),
+            actual_tokens_by_request={},
+            preempted_request_ids=(),
+            unrelated_request_ids=(),
+            allocation=capacity_failure,
+        )
+        allocation = _allocation_payload(
+            adapter,
+            scheduled,
+            capacity_failure,
+            cache_epoch=cache_epoch,
+            runtime_mode=None,
+        )
+        completed_rows.append(
+            make_prefill_chunk_row(
+                run_id=run_id,
+                point=point,
+                phase=phase,
+                ordinal=ordinal,
+                chunk=chunk,
+                runner_wall_time_ms=None,
+                cuda_model_time_ms=None,
+                allocation=allocation,
+                status="out_of_capacity",
+                error=None,
+            )
+        )
+        return {
+            "status": "out_of_capacity",
+            "rows": completed_rows,
+            "prefix_evidence": tuple(completed_evidence),
+        }
     adapter.add_measurement_requests(point)
     rows = completed_rows
     for chunk in point.chunks:
