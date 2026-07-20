@@ -1813,6 +1813,7 @@ def test_planner_preserves_requests_and_pairs_conditions() -> None:
         selected["trajectory_id"],
         selected["turn_index"],
     )
+    assert replay.composition == "none"
 
 
 def test_full_recompute_chunks_context_and_removes_completed_requests() -> None:

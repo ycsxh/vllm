@@ -1981,7 +1981,7 @@ def build_prefill_points(
             _expand_condition_pair(
                 workload_family="exact_replay",
                 selector=selector,
-                composition="quantile",
+                composition="none",
                 requests=requests,
                 planner_digest=planner_digest,
                 seed=seed,
