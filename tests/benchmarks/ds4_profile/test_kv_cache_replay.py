@@ -4,6 +4,8 @@
 import hashlib
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +19,12 @@ assert os.environ["VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES"] == "0"
 pytestmark = pytest.mark.skip_global_cleanup
 
 
-def _artifact_fixture(tmp_path: Path) -> tuple[dict, object, Path]:
+def _artifact_fixture(
+    tmp_path: Path,
+    *,
+    turns: list | None = None,
+    capacity_blocks: int = 3,
+) -> tuple[dict, Any, Path]:
     from benchmarks.ds4_profile.kv_cache_replay import (
         _canonical_json_sha256,
         _selected_turn_manifest,
@@ -35,11 +42,12 @@ def _artifact_fixture(tmp_path: Path) -> tuple[dict, object, Path]:
             "sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
         }
     ]
-    turns = [
-        _replay_turn(0, [1, 1, 2, 2, 3]),
-        _replay_turn(1, [1, 1, 9, 9, 8, 8]),
-        _replay_turn(2, [1, 1, 2, 2, 7]),
-    ]
+    if turns is None:
+        turns = [
+            _replay_turn(0, [1, 1, 2, 2, 3]),
+            _replay_turn(1, [1, 1, 9, 9, 8, 8]),
+            _replay_turn(2, [1, 1, 2, 2, 7]),
+        ]
     selected_turns = _selected_turn_manifest(turns, 2)
     input_sha = _canonical_json_sha256(inputs)
     turn_sha = _canonical_json_sha256(selected_turns)
@@ -52,7 +60,7 @@ def _artifact_fixture(tmp_path: Path) -> tuple[dict, object, Path]:
             "selected": {
                 "trajectory_id": "task:no_think",
                 "reasoning_mode": "no_think",
-                "capacity_blocks": 3,
+                "capacity_blocks": capacity_blocks,
                 "input_set_sha256": input_sha,
                 "turns": selected_turns,
                 "turn_manifest_sha256": turn_sha,
@@ -78,7 +86,7 @@ def _artifact_fixture(tmp_path: Path) -> tuple[dict, object, Path]:
             "status": "pinned",
             "trajectory_id": "task:no_think",
             "reasoning_mode": "no_think",
-            "capacity_blocks": 3,
+            "capacity_blocks": capacity_blocks,
             "input_set_sha256": input_sha,
             "planning_sha256": plan["sha256"],
             "turn_manifest_sha256": turn_sha,
@@ -90,7 +98,7 @@ def _artifact_fixture(tmp_path: Path) -> tuple[dict, object, Path]:
         replay_session(
             run_id="fixture-run",
             turns=turns,
-            capacity_blocks=3,
+            capacity_blocks=capacity_blocks,
             block_size=2,
             max_model_len=32,
         ),
@@ -595,7 +603,7 @@ def test_selection_plan_uses_real_replay_and_is_deterministic(tmp_path: Path) ->
     )
 
 
-def test_selection_plan_preserves_no_candidate_failure(
+def test_selection_plan_accepts_a_fully_admitted_zero_eviction_pilot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from benchmarks.ds4_profile import kv_cache_replay
@@ -627,12 +635,11 @@ def test_selection_plan_preserves_no_candidate_failure(
 
     plan = kv_cache_replay.build_selection_plan(config, [_replay_turn(0, [1, 1, 2, 2])])
 
-    assert plan["status"] == "no_selection"
-    assert plan["selected"] is None
-    assert plan["error"] == (
-        "no full trajectory admits all turns with eviction pressure"
-    )
-    assert plan["candidates"][0]["status"] == "rejected"
+    assert plan["status"] == "selected"
+    assert plan["selected"]["eviction_count"] == 0
+    assert plan["selected"]["trajectory_id"] == "task:no_think"
+    assert plan["candidates"][0]["status"] == "eligible"
+    assert plan["candidates"][0]["reason"] is None
 
 
 def test_verify_pinned_selection_rejects_drift() -> None:
@@ -920,6 +927,24 @@ def test_artifacts_are_versioned_metadata_only_and_cross_validated(
     assert "GPU/HBM validated: no" in markdown
 
 
+def test_artifacts_validate_a_zero_eviction_pilot(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import (
+        validate_result_dir,
+        write_result,
+    )
+
+    turns = [_replay_turn(0, [1, 1, 2, 2])]
+    config, result, output = _artifact_fixture(tmp_path, turns=turns, capacity_blocks=2)
+    assert result.eviction_count == 0
+
+    write_result(config, result, output)
+    validate_result_dir(output)
+
+    provenance = json.loads((output / "provenance.json").read_text())
+    assert provenance["pilot_eviction_pressure_observed"] is False
+    assert "Pilot eviction pressure observed: no" in (output / "result.md").read_text()
+
+
 def test_writer_refuses_to_overwrite_and_preserves_failed_artifacts(
     tmp_path: Path,
 ) -> None:
@@ -938,6 +963,74 @@ def test_validator_rejects_unknown_enum(tmp_path: Path) -> None:
     _rewrite_event_rows(output, lambda rows: rows[0].update(operation="unknown"))
     with pytest.raises(ValueError, match="unknown operation"):
         validate_result_dir(output)
+
+
+def test_validate_cli_reports_independent_validation_failure(tmp_path: Path) -> None:
+    output = _write_valid_result(tmp_path)
+    _rewrite_event_rows(output, lambda rows: rows[0].update(operation="unknown"))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "benchmarks.ds4_profile.kv_cache_replay",
+            "validate",
+            "--result-dir",
+            str(output),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "validation failed: unknown operation" in result.stderr
+
+
+def test_container_runtime_prints_cpu_only_cache_replay_plan(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "benchmarks.ds4_profile.container.runtime",
+            "kv-cache-replay",
+            "plan",
+            "--config",
+            "/mnt/ds4/config/kv-cache-replay.json",
+            "--output",
+            str(tmp_path / "selection.json"),
+            "--print-plan",
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "benchmarks.ds4_profile.kv_cache_replay plan" in result.stdout
+    assert "--config /mnt/ds4/config/kv-cache-replay.json" in result.stdout
+
+
+def test_container_wrapper_marks_cache_replay_as_cpu_only() -> None:
+    result = subprocess.run(
+        [
+            "bash",
+            "benchmarks/ds4_profile/container/run.sh",
+            "--dry-run",
+            "kv-cache-replay",
+            "plan",
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "ai.vllm.ds4.runtime=cpu" in result.stdout
+    assert "--gpus" not in result.stdout
+    assert "SYS_NICE" not in result.stdout
+    assert "PYTHONHASHSEED=0" in result.stdout
+    assert "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0" in result.stdout
 
 
 def test_validator_recomputes_miss_attribution(tmp_path: Path) -> None:

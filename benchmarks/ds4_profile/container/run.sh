@@ -93,10 +93,14 @@ else
     HF_HUB_OFFLINE=1
 fi
 
-gpu_args=(--label ai.vllm.ds4.runtime=cpu)
-if [[ "$1" != "cache-model" && "$1" != "cpu-dry-run" ]]; then
-    gpu_args=(--gpus all --cpuset-cpus=0-11 --cap-add SYS_NICE)
-fi
+case "$1" in
+    cache-model|cpu-dry-run|kv-cache-replay)
+        gpu_args=(--label ai.vllm.ds4.runtime=cpu)
+        ;;
+    *)
+        gpu_args=(--gpus all --cpuset-cpus=0-11 --cap-add SYS_NICE)
+        ;;
+esac
 
 if [[ "${DRY_RUN}" == true ]]; then
     IMAGE_ID=dry-run
@@ -152,11 +156,13 @@ run=(
     --env "HF_HUB_OFFLINE=${HF_HUB_OFFLINE}"
     --env HOME=/mnt/ds4/cache/runtime/home
     --env LOGNAME=ds4-profile
+    --env PYTHONHASHSEED=0
     --env TORCHINDUCTOR_CACHE_DIR=/mnt/ds4/cache/runtime/torchinductor
     --env TRITON_CACHE_DIR=/mnt/ds4/cache/runtime/triton
     --env USER=ds4-profile
     --env UV_CACHE_DIR=/mnt/ds4/cache/uv
     --env VLLM_CACHE_ROOT=/mnt/ds4/cache/runtime/vllm
+    --env VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0
     --volume "${SNAPSHOT_DIR}:/mnt/ds4/raw:ro"
     --volume "${TICKET_01_DIR}:/mnt/ds4/ticket-01:ro"
     --volume "${TICKET_02_DIR}:/mnt/ds4/ticket-02:ro"

@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import argparse
 import hashlib
 import json
 import os
+import sys
 import tempfile
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -1108,7 +1110,7 @@ def _select_candidate(candidates: Sequence[dict[str, Any]]) -> dict[str, Any]:
     reasoning_rank = {"no_think": 0, "think_high": 1}
     eligible = [item for item in candidates if item["status"] == "eligible"]
     if not eligible:
-        raise ValueError("no full trajectory admits all turns with eviction pressure")
+        raise ValueError("no full trajectory admits all turns")
     return min(
         eligible,
         key=lambda item: (
@@ -1151,10 +1153,8 @@ def build_selection_plan(
             block_size=block_size,
             max_model_len=config["replay"]["max_model_len"],
         )
-        eligible = result.status == "passed" and result.eviction_count > 0
+        eligible = result.status == "passed"
         reason = result.error
-        if result.status == "passed" and result.eviction_count == 0:
-            reason = "no native eviction pressure"
         candidates.append(
             {
                 "trajectory_id": trajectory_id,
@@ -1449,10 +1449,14 @@ def _normalized_turn_rows(
 
 
 def _result_markdown(result: ReplayResult) -> str:
+    pilot_eviction_pressure_observed = result.eviction_count > 0
     return (
         "# DS4 Ticket 07 KV Cache Replay\n\n"
         f"Status: {result.status}\n\n"
         "Metadata only: yes\n\n"
+        "Pilot eviction pressure observed: "
+        f"{'yes' if pilot_eviction_pressure_observed else 'no'}\n\n"
+        f"Native eviction count: {result.eviction_count}\n\n"
         "GPU/HBM validated: no\n"
     )
 
@@ -1482,6 +1486,7 @@ def write_result(
         "environment": config["environment"],
         "inputs": config["inputs"],
         "metadata_only_validated": result.status == "passed",
+        "pilot_eviction_pressure_observed": result.eviction_count > 0,
         "planning_record": config["planning_record"],
         "planning_sha256": config["selection"]["planning_sha256"],
         "run_id": config["run_id"],
@@ -1854,8 +1859,86 @@ def validate_result_dir(result_dir: Path) -> None:
         raise ValueError("metadata-only validation status mismatch")
     _validate_manifests(config, provenance, turns)
     _validate_event_rows(events, turns, config["selection"]["capacity_blocks"])
-    if status == "passed" and not any(
+    pilot_eviction_pressure_observed = any(
         row["event_source"] == "native" and row["operation"] == "evict"
         for row in events
+    )
+    if (
+        provenance.get("pilot_eviction_pressure_observed")
+        is not pilot_eviction_pressure_observed
     ):
-        raise ValueError("passed replay has no native eviction")
+        raise ValueError("pilot eviction pressure status mismatch")
+
+
+def _load_json_object(path: Path) -> dict[str, Any]:
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict):
+        raise ValueError(f"expected a JSON object: {path}")
+    return value
+
+
+def _plan_cli(config_path: Path, output: Path) -> int:
+    config = _load_json_object(config_path)
+    plan = build_selection_plan(config, load_full_turns(config))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(output, plan)
+    return 0 if plan["status"] == "selected" else 2
+
+
+def _run_cli(config_path: Path, planning_record_path: Path, output_dir: Path) -> int:
+    config = _load_json_object(config_path)
+    plan = _load_json_object(planning_record_path)
+    verify_pinned_selection(config, plan)
+    all_turns = load_full_turns(config)
+    trajectory_id = config["selection"]["trajectory_id"]
+    turns = [turn for turn in all_turns if turn.trajectory_id == trajectory_id]
+    selected_turns = _selected_turn_manifest(turns, config["replay"]["block_size"])
+    if selected_turns != plan["selected"]["turns"]:
+        raise ValueError("selected turn manifest mismatch")
+    effective_config = {
+        **config,
+        "inputs": plan["inputs"],
+        "planning_record": plan,
+        "selected_turns": selected_turns,
+    }
+    result = replay_session(
+        run_id=effective_config["run_id"],
+        turns=turns,
+        capacity_blocks=effective_config["selection"]["capacity_blocks"],
+        block_size=effective_config["replay"]["block_size"],
+        max_model_len=effective_config["replay"]["max_model_len"],
+    )
+    write_result(effective_config, result, output_dir)
+    return 0 if result.status == "passed" else 2
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="DS4 Ticket 07 metadata replay")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    plan = subparsers.add_parser("plan")
+    plan.add_argument("--config", type=Path, required=True)
+    plan.add_argument("--output", type=Path, required=True)
+    run = subparsers.add_parser("run")
+    run.add_argument("--config", type=Path, required=True)
+    run.add_argument("--planning-record", type=Path, required=True)
+    run.add_argument("--output-dir", type=Path, required=True)
+    validate = subparsers.add_parser("validate")
+    validate.add_argument("--result-dir", type=Path, required=True)
+    args = parser.parse_args()
+    try:
+        if args.command == "plan":
+            returncode = _plan_cli(args.config, args.output)
+        elif args.command == "run":
+            returncode = _run_cli(args.config, args.planning_record, args.output_dir)
+        else:
+            validate_result_dir(args.result_dir)
+            returncode = 0
+    except (FileNotFoundError, KeyError, TypeError, ValueError) as error:
+        failure_name = "validation" if args.command == "validate" else args.command
+        print(f"{failure_name} failed: {error}", file=sys.stderr)
+        returncode = 2
+    raise SystemExit(returncode)
+
+
+if __name__ == "__main__":
+    main()
