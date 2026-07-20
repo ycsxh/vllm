@@ -23,6 +23,8 @@ ENV DS4_VLLM_DIRTY=${VLLM_BUILD_DIRTY}
 WORKDIR /vllm-workspace
 
 COPY benchmarks/ds4_profile /vllm-workspace/benchmarks/ds4_profile
+COPY tests/benchmarks/ds4_profile/test_kv_cache_replay.py \
+    /vllm-workspace/tests/benchmarks/ds4_profile/test_kv_cache_replay.py
 
 RUN --mount=type=cache,target=/opt/uv/cache \
     uv venv --system-site-packages /opt/ds4-profile && \

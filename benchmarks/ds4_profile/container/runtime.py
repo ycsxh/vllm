@@ -959,6 +959,9 @@ def _effective_kv_cache_replay_config(config_path: Path) -> dict[str, Any]:
     if actual_environment != expected_environment:
         raise ValueError("kv-cache-replay deterministic environment mismatch")
     config["environment"] = actual_environment
+    config["host_invocation"] = os.environ.get("DS4_HOST_INVOCATION")
+    config["image"] = {"id": os.environ.get("DS4_IMAGE_ID", "unknown")}
+    config["installed_versions"] = _installed_versions()
     return config
 
 
@@ -992,6 +995,7 @@ def _kv_cache_replay(
         return 0
     if replay_command == "run":
         assert work_dir is not None
+        config["invocation"] = command
         _write_json(command_config_path, config)
     return subprocess.run(command, check=False).returncode
 

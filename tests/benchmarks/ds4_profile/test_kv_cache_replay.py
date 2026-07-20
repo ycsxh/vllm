@@ -91,6 +91,17 @@ def _artifact_fixture(
             "planning_sha256": plan["sha256"],
             "turn_manifest_sha256": turn_sha,
         },
+        "host_invocation": (
+            "benchmarks/ds4_profile/container/run.sh kv-cache-replay run"
+        ),
+        "image": {"id": "sha256:fixture-image"},
+        "installed_versions": {"pyarrow": "fixture", "vllm": "fixture"},
+        "invocation": [
+            "/opt/ds4-profile/bin/python",
+            "-m",
+            "benchmarks.ds4_profile.kv_cache_replay",
+            "run",
+        ],
         "source": {"commit": "abc123", "dirty": False},
     }
     return (
@@ -341,6 +352,7 @@ def test_replay_records_status_occupancy_and_lookup_timing() -> None:
         result.turn_rows[0]["cached_resident_blocks_after_free"]
         == free["cached_resident_blocks_after"]
     )
+    assert result.turn_rows[0]["hash_time_ns"] > 0
 
 
 def test_replay_marks_non_atomic_admission_failure_invalid(
@@ -945,6 +957,86 @@ def test_artifacts_validate_a_zero_eviction_pilot(tmp_path: Path) -> None:
     assert "Pilot eviction pressure observed: no" in (output / "result.md").read_text()
 
 
+def test_provenance_binds_the_run_to_image_invocation_and_versions(
+    tmp_path: Path,
+) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import validate_result_dir, write_result
+
+    config, result, output = _artifact_fixture(tmp_path)
+    write_result(config, result, output)
+
+    provenance = json.loads((output / "provenance.json").read_text())
+    assert provenance["host_invocation"] == config["host_invocation"]
+    assert provenance["image"] == config["image"]
+    assert provenance["installed_versions"] == config["installed_versions"]
+    assert provenance["invocation"] == config["invocation"]
+
+    del provenance["image"]
+    (output / "provenance.json").write_text(
+        json.dumps(provenance, indent=2, sort_keys=True) + "\n"
+    )
+    with pytest.raises(ValueError, match="provenance binding mismatch"):
+        validate_result_dir(output)
+
+
+def test_out_of_capacity_artifacts_finalize_with_the_completed_prefix(
+    tmp_path: Path,
+) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import validate_result_dir, write_result
+
+    turns = [
+        _replay_turn(0, [1, 1]),
+        _replay_turn(1, [1, 1, 2, 2, 3, 3]),
+        _replay_turn(2, [1, 1]),
+    ]
+    config, result, output = _artifact_fixture(tmp_path, turns=turns, capacity_blocks=2)
+    assert result.status == "out_of_capacity"
+
+    write_result(config, result, output)
+    validate_result_dir(output)
+
+    summaries = pq.read_table(output / "turn_summaries.parquet").to_pylist()
+    assert [row["turn_index"] for row in summaries] == [0, 1]
+    assert summaries[-1]["status"] == "out_of_capacity"
+    provenance = json.loads((output / "provenance.json").read_text())
+    assert provenance["status"] == "out_of_capacity"
+    assert provenance["metadata_only_validated"] is False
+
+
+def test_invalid_artifacts_finalize_when_failure_precedes_manager_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from benchmarks.ds4_profile import kv_cache_replay
+
+    turns = [_replay_turn(0, [1, 1]), _replay_turn(1, [2, 2])]
+    config, _, output = _artifact_fixture(tmp_path, turns=turns, capacity_blocks=2)
+
+    original_make_request = kv_cache_replay.make_request
+
+    def fail_request(turn, block_size, request_id):
+        if request_id.startswith("fixture-run:"):
+            raise RuntimeError("fixture failure")
+        return original_make_request(turn, block_size, request_id)
+
+    monkeypatch.setattr(kv_cache_replay, "make_request", fail_request)
+    result = kv_cache_replay.replay_session(
+        run_id="fixture-run",
+        turns=turns,
+        capacity_blocks=2,
+        block_size=2,
+        max_model_len=32,
+    )
+    assert result.status == "invalid"
+    assert result.event_rows == []
+
+    kv_cache_replay.write_result(config, result, output)
+    kv_cache_replay.validate_result_dir(output)
+
+    events = pq.read_table(output / "cache_events.parquet").to_pylist()
+    assert [row["operation"] for row in events] == ["hash"]
+    assert events[0]["status"] == "invalid"
+
+
 def test_validator_initializes_hashing_for_pinned_input_reconstruction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1153,6 +1245,21 @@ def test_validator_replays_occupancy_transitions(tmp_path: Path) -> None:
 
     output = _write_valid_result(tmp_path)
     _rewrite_event_rows(output, lambda rows: rows[1].update(active_blocks_before=99))
+    with pytest.raises(ValueError, match="occupancy transition mismatch"):
+        validate_result_dir(output)
+
+
+def test_validator_independently_reconstructs_occupancy(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile.kv_cache_replay import validate_result_dir
+
+    output = _write_valid_result(tmp_path)
+
+    def corrupt(rows) -> None:
+        for row in rows:
+            row["cached_blocks_before"] += 1
+            row["cached_blocks_after"] += 1
+
+    _rewrite_event_rows(output, corrupt)
     with pytest.raises(ValueError, match="occupancy transition mismatch"):
         validate_result_dir(output)
 

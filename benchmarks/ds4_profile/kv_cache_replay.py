@@ -668,6 +668,7 @@ def _turn_row(
     free_count: int,
     occupancy_before: PoolOccupancy,
     occupancy_after: PoolOccupancy,
+    hash_time_ns: int = 0,
     lookup_time_ns: int = 0,
     allocation_time_ns: int = 0,
     eviction_time_ns: int = 0,
@@ -692,6 +693,7 @@ def _turn_row(
         "cached_resident_blocks_after_free": occupancy_after.cached_resident_blocks,
         "occupancy_before": occupancy_before.active_blocks,
         "occupancy_after": occupancy_after.active_blocks,
+        "hash_time_ns": hash_time_ns,
         "lookup_time_ns": lookup_time_ns,
         "allocation_time_ns": allocation_time_ns,
         "eviction_time_ns": eviction_time_ns,
@@ -707,6 +709,7 @@ def _out_of_capacity_result(
     manager: KVCacheManager,
     error: str,
     occupancy_before: PoolOccupancy,
+    hash_time_ns: int,
     lookup_time_ns: int,
 ) -> ReplayResult:
     occupancy = _pool_occupancy(manager)
@@ -739,6 +742,7 @@ def _out_of_capacity_result(
             free_count=0,
             occupancy_before=occupancy_before,
             occupancy_after=occupancy,
+            hash_time_ns=hash_time_ns,
             lookup_time_ns=lookup_time_ns,
         )
     )
@@ -801,8 +805,11 @@ def replay_session(
 
     for turn in turns:
         occupancy_before = _pool_occupancy(manager)
+        hash_time_ns = 0
         try:
+            hash_started = perf_counter_ns()
             request = make_request(turn, block_size, f"{run_id}:{turn.turn_index}")
+            hash_time_ns = perf_counter_ns() - hash_started
             resident_before = _resident_hashes(manager)
             lookup_started = perf_counter_ns()
             computed, hit_tokens, _ = manager.get_computed_blocks(request)
@@ -1031,6 +1038,7 @@ def replay_session(
                     manager=manager,
                     error="KV cache admission failed at pinned capacity",
                     occupancy_before=occupancy_before,
+                    hash_time_ns=hash_time_ns,
                     lookup_time_ns=lookup_time_ns,
                 )
 
@@ -1059,6 +1067,7 @@ def replay_session(
                     free_count=sum(call.operation == "free" for call in pool_calls),
                     occupancy_before=occupancy_before,
                     occupancy_after=occupancy_after_free,
+                    hash_time_ns=hash_time_ns,
                     lookup_time_ns=lookup_time_ns,
                     allocation_time_ns=allocation_time_ns,
                     eviction_time_ns=eviction_time_ns,
@@ -1091,6 +1100,7 @@ def replay_session(
                     free_count=0,
                     occupancy_before=occupancy_before,
                     occupancy_after=occupancy_after,
+                    hash_time_ns=hash_time_ns,
                 )
             )
             return ReplayResult(
@@ -1250,17 +1260,24 @@ def _normalized_event_rows(
     summaries = {
         (row["trajectory_id"], row["turn_index"]): row for row in result.turn_rows
     }
-    state = (0, 0)
+    active_blocks: set[int] = set()
+    cached_blocks: set[int] = set()
 
-    def append(raw: dict[str, Any], *, transition: bool = False) -> None:
-        nonlocal state
-        before = state
-        after = before
-        if transition:
-            after = (
-                raw["active_blocks_after"],
-                raw["cached_resident_blocks_after"],
-            )
+    def append(raw: dict[str, Any]) -> None:
+        before = (len(active_blocks), len(cached_blocks))
+        operation = raw["operation"]
+        event_source = raw["event_source"]
+        block_id = raw.get("block_id")
+        if block_id is not None:
+            if event_source == "observer" and operation in {"touch", "allocate"}:
+                active_blocks.add(block_id)
+            elif event_source == "observer" and operation == "free":
+                active_blocks.discard(block_id)
+            elif event_source == "native" and operation == "store":
+                cached_blocks.add(block_id)
+            elif event_source == "native" and operation == "evict":
+                cached_blocks.discard(block_id)
+        after = (len(active_blocks), len(cached_blocks))
         ordinal = len(
             [
                 row
@@ -1269,7 +1286,6 @@ def _normalized_event_rows(
                 == (raw["trajectory_id"], raw["turn_index"])
             ]
         )
-        operation = raw["operation"]
         normalized.append(
             {
                 "schema_version": SCHEMA_VERSION,
@@ -1313,12 +1329,11 @@ def _normalized_event_rows(
                 "error": raw.get("error"),
             }
         )
-        state = after
 
-    for key in sorted(grouped):
-        rows = grouped[key]
+    for key in sorted(summaries):
+        rows = grouped.get(key, [])
         summary = summaries[key]
-        seed = rows[0]
+        seed = rows[0] if rows else summary
         append(
             seed
             | {
@@ -1358,8 +1373,8 @@ def _normalized_event_rows(
             if operation == "free":
                 deferred_free.append(call_rows)
                 continue
-            for occurrence, row in enumerate(call_rows):
-                append(row, transition=occurrence == 0)
+            for row in call_rows:
+                append(row)
             if operation == "evict" and call_rows[0]["observer_evicted"]:
                 native = native_evictions[call_index]
                 append(native | {"block_id": call_rows[0]["block_id"]})
@@ -1367,11 +1382,11 @@ def _normalized_event_rows(
                 for native in native_stores:
                     append(native)
         for call_rows in deferred_free:
-            for occurrence, row in enumerate(call_rows):
-                append(row, transition=occurrence == 0)
+            for row in call_rows:
+                append(row)
         for row in rows:
             if row["operation"] == "admission_failure":
-                append(row, transition=True)
+                append(row)
     return normalized
 
 
@@ -1483,6 +1498,10 @@ def write_result(
     provenance = {
         "artifact_schema_version": SCHEMA_VERSION,
         "hardware_validated": False,
+        "host_invocation": config["host_invocation"],
+        "image": config["image"],
+        "installed_versions": config["installed_versions"],
+        "invocation": config["invocation"],
         "environment": config["environment"],
         "inputs": config["inputs"],
         "metadata_only_validated": result.status == "passed",
@@ -1549,8 +1568,27 @@ def _validate_manifests(
         }
         for row in selected
     ]
-    if artifact_manifest != selected_projection:
+    status = provenance.get("status")
+    expected_artifact_manifest = (
+        selected_projection
+        if status == "passed"
+        else selected_projection[: len(artifact_manifest)]
+    )
+    if artifact_manifest != expected_artifact_manifest:
         raise ValueError("selected turn manifest mismatch: artifact turns")
+    turn_statuses = [row["status"] for row in turns]
+    if status == "passed":
+        valid_statuses = turn_statuses and all(
+            item == "passed" for item in turn_statuses
+        )
+    else:
+        valid_statuses = (
+            bool(turn_statuses)
+            and all(item == "passed" for item in turn_statuses[:-1])
+            and turn_statuses[-1] == status
+        )
+    if not valid_statuses:
+        raise ValueError("artifact completion status mismatch")
 
     records = [InputRecord(**row) for row in provenance.get("inputs", [])]
     verify_input_records(records)
@@ -1649,6 +1687,7 @@ def _validate_event_rows(
 
     summary_by_key = {(row["trajectory_id"], row["turn_index"]): row for row in turns}
     resident: dict[int, str] = {}
+    active: set[int] = set()
     ever_stored: set[str] = set()
     max_seen_depth = 0
     for key in sorted(summary_by_key):
@@ -1726,7 +1765,28 @@ def _validate_event_rows(
                 raise ValueError("miss attribution mismatch")
 
         for row in rows:
-            if row["event_source"] == "native" and row["operation"] == "store":
+            expected_before = (len(active), len(resident), capacity - len(active))
+            actual_before = (
+                row["active_blocks_before"],
+                row["cached_blocks_before"],
+                row["free_blocks_before"],
+            )
+            if actual_before != expected_before:
+                raise ValueError("occupancy transition mismatch")
+            block_id = row["block_id"]
+            if (
+                row["event_source"] == "observer"
+                and row["operation"] in {"touch", "allocate"}
+                and block_id is not None
+            ):
+                active.add(block_id)
+            elif (
+                row["event_source"] == "observer"
+                and row["operation"] == "free"
+                and block_id is not None
+            ):
+                active.discard(block_id)
+            elif row["event_source"] == "native" and row["operation"] == "store":
                 if row["block_id"] is None or row["block_hash"] is None:
                     raise ValueError("native store lacks physical identity")
                 resident[row["block_id"]] = row["block_hash"]
@@ -1735,6 +1795,14 @@ def _validate_event_rows(
                 if resident.get(row["block_id"]) != row["block_hash"]:
                     raise ValueError("native eviction physical accounting mismatch")
                 del resident[row["block_id"]]
+            expected_after = (len(active), len(resident), capacity - len(active))
+            actual_after = (
+                row["active_blocks_after"],
+                row["cached_blocks_after"],
+                row["free_blocks_after"],
+            )
+            if actual_after != expected_after:
+                raise ValueError("occupancy transition mismatch")
         max_seen_depth = max(max_seen_depth, len(lookups))
 
         summary = summary_by_key[key]
@@ -1763,6 +1831,8 @@ def _validate_event_rows(
         }
         if any(summary[field] != value for field, value in expected_counts.items()):
             raise ValueError("turn summary count mismatch")
+        if summary["cached_resident_blocks_after_free"] != len(resident):
+            raise ValueError("occupancy transition mismatch")
         if (
             summary["cached_tokens"] + summary["recomputed_tokens"]
             != summary["prompt_tokens"]
@@ -1855,6 +1925,27 @@ def validate_result_dir(result_dir: Path) -> None:
         raise ValueError("KV event hash format mismatch")
     if provenance.get("hardware_validated") is not False:
         raise ValueError("hardware validation claim is forbidden")
+    bindings = {
+        field: config.get(field)
+        for field in (
+            "host_invocation",
+            "image",
+            "installed_versions",
+            "invocation",
+            "source",
+        )
+    }
+    if (
+        any(provenance.get(field) != value for field, value in bindings.items())
+        or not isinstance(bindings["host_invocation"], str)
+        or not bindings["host_invocation"]
+        or not isinstance(bindings["image"], dict)
+        or not bindings["image"].get("id")
+        or not isinstance(bindings["installed_versions"], dict)
+        or not isinstance(bindings["invocation"], list)
+        or not bindings["invocation"]
+    ):
+        raise ValueError("provenance binding mismatch")
     status = provenance.get("status")
     if provenance.get("metadata_only_validated") != (status == "passed"):
         raise ValueError("metadata-only validation status mismatch")
