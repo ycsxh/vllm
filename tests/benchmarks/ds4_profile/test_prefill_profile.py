@@ -889,6 +889,23 @@ def test_real_request_factory_populates_prefix_cache_block_hashes() -> None:
     assert len(request.block_hashes) == 2
 
 
+def test_real_request_factory_isolates_logical_request_prefixes() -> None:
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(prefix_caching_hash_algo="sha256"),
+        hash_block_size=16,
+    )
+    factory = prefill_profile._make_request_factory(scheduler)
+    tokens = list(range(32))
+
+    prime = factory("prime:warmup:0:r0", tokens)
+    measured = factory("r0", tokens)
+    other_request = factory("r1", tokens)
+
+    assert prime.cache_salt == measured.cache_salt == "r0"
+    assert prime.block_hashes == measured.block_hashes
+    assert prime.block_hashes != other_request.block_hashes
+
+
 def test_cpu_prime_executes_but_never_claims_hardware_validation() -> None:
     point = _adapter_point()
     adapter, executor = _adapter(_fake_output({}, active_ids=()))

@@ -224,11 +224,13 @@ def _make_request_factory(scheduler: Any) -> Callable[[str, list[int]], Any]:
     )
 
     def make_request(request_id: str, tokens: list[int]) -> Any:
+        request_key = request_id.rsplit(":", 1)[-1]
         return Request(
             request_id,
             tokens,
             SamplingParams(max_tokens=1, temperature=0.0),
             None,
+            cache_salt=request_key,
             block_hasher=block_hasher,
         )
 
