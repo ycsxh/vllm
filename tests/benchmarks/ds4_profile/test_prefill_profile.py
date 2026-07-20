@@ -1057,6 +1057,27 @@ def test_full_recompute_requires_zero_cached_tokens() -> None:
     assert executor.execute_calls == 0
 
 
+@pytest.mark.parametrize(
+    ("cache_condition", "skip_reading_prefix_cache"),
+    [("prefix_hit", False), ("full_recompute", True)],
+)
+def test_recompute_requests_cannot_read_same_batch_prefix_cache(
+    cache_condition, skip_reading_prefix_cache
+) -> None:
+    point = _adapter_point(cache_condition)
+    adapter, _ = _adapter(_fake_output({}, active_ids=()))
+    adapter.request_factory = lambda request_id, tokens: SimpleNamespace(
+        request_id=request_id,
+        prompt_token_ids=tokens,
+        skip_reading_prefix_cache=False,
+    )
+
+    adapter.add_measurement_requests(point)
+
+    request = adapter.scheduler.requests["r0"]
+    assert request.skip_reading_prefix_cache is skip_reading_prefix_cache
+
+
 def test_reset_epoch_rejects_failed_prefix_cache_reset() -> None:
     adapter, _ = _adapter(_fake_output({"r0": 16}))
     adapter.scheduler.reset_succeeds = False

@@ -572,11 +572,13 @@ class VllmSchedulerCacheAdapter:
         if self._scheduler_request_ids() or self._queue_request_ids():
             raise RuntimeError("measurement epoch contains unrelated requests")
         for request in point.requests:
-            self.scheduler.add_request(
-                self.request_factory(
-                    request.request_key, list(request.prompt_token_ids)
-                )
+            scheduler_request = self.request_factory(
+                request.request_key, list(request.prompt_token_ids)
             )
+            scheduler_request.skip_reading_prefix_cache = (
+                point.cache_condition == "full_recompute"
+            )
+            self.scheduler.add_request(scheduler_request)
 
     def update_after_execute(self, scheduler_output: Any, model_output: Any) -> None:
         """Apply one completed worker step to Scheduler state."""
