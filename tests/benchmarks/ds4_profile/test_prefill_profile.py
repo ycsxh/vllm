@@ -924,6 +924,57 @@ def test_real_request_factory_isolates_logical_request_prefixes() -> None:
     assert prime.block_hashes != other_request.block_hashes
 
 
+def test_zero_cached_request_does_not_require_prefix_evidence() -> None:
+    point = _adapter_point()
+    uncached = replace(
+        point.requests[0],
+        request_key="r1",
+        cached_tokens=0,
+        new_tokens=32,
+    )
+    point = replace(point, requests=(*point.requests, uncached), batch_size=2)
+    output = _fake_output({"r0": 16, "r1": 32}, active_ids=("r0", "r1"))
+    output.scheduled_new_reqs = [
+        SimpleNamespace(req_id="r0", num_computed_tokens=16, block_ids=([10],)),
+        SimpleNamespace(req_id="r1", num_computed_tokens=0, block_ids=([11, 12],)),
+    ]
+    adapter, _ = _adapter(output)
+    adapter._prime_evidence["r0"] = _prime_evidence()
+    adapter._inspect_worker_groups = lambda *_args, **_kwargs: (
+        prefill_profile.WorkerKvTensorGroupEvidence(
+            group_index=0,
+            tensor_names=("layer.0",),
+            tensor_devices=("cuda:0",),
+            tensor_shapes=((128, 2),),
+            block_axis=0,
+            block_dimension=128,
+            verified_block_ids=(10,),
+            live_cuda_tensor_proven=True,
+        ),
+    )
+
+    adapter.verify_hit(point, output)
+
+    output.scheduled_new_reqs[1].num_computed_tokens = 16
+    with pytest.raises(RuntimeError, match="zero-cached request"):
+        adapter.verify_hit(point, output)
+
+
+def test_zero_cached_request_is_not_primed() -> None:
+    point = _adapter_point()
+    request = replace(point.requests[0], cached_tokens=0, new_tokens=32)
+    point = replace(point, requests=(request,))
+    adapter, executor = _adapter(_fake_output({}, active_ids=()))
+    adapter.request_factory = lambda request_id, tokens: SimpleNamespace(
+        request_id=request_id, prompt_token_ids=tokens
+    )
+
+    evidence = adapter.prime(point, "warmup", 0)
+
+    assert evidence == ()
+    assert executor.execute_calls == 0
+
+
 def test_cpu_prime_executes_but_never_claims_hardware_validation() -> None:
     point = _adapter_point()
     adapter, executor = _adapter(_fake_output({}, active_ids=()))

@@ -1405,7 +1405,9 @@ def _validate_v2_evidence(
         }:
             continue
         request_keys = [
-            request["request_key"] for request in payload.get("requests", [])
+            request["request_key"]
+            for request in payload.get("requests", [])
+            if request["cached_tokens"] > 0
         ]
         for phase in ("warmup", "steady"):
             for ordinal in range(3 if phase == "warmup" else 10):

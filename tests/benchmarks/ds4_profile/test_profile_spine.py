@@ -500,6 +500,43 @@ def test_v2_validator_requires_exact_prefix_evidence_groups(tmp_path: Path) -> N
         profile_spine._validate_result_dir(extra_dir)
 
 
+def test_v2_validator_does_not_require_evidence_for_zero_cached_requests() -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    point_id = "mixed-hit"
+    expected_points = {
+        point_id: {
+            "payload": {
+                "cache_condition": "prefix_hit",
+                "requests": [
+                    {"request_key": "r0", "cached_tokens": 16},
+                    {"request_key": "r1", "cached_tokens": 0},
+                ],
+            }
+        }
+    }
+    rows = [
+        {
+            "point_id": point_id,
+            "phase": phase,
+            "ordinal": ordinal,
+            "request_key": "r0",
+            "kv_cache_group": "0",
+            "hardware_validated": False,
+        }
+        for phase, count in (("warmup", 3), ("steady", 10))
+        for ordinal in range(count)
+    ]
+
+    profile_spine._validate_v2_evidence(
+        rows,
+        expected_points,
+        {point_id: "passed"},
+        frozenset({"0"}),
+        [],
+    )
+
+
 def test_v2_validator_requires_exact_manifest_and_coordinates(tmp_path: Path) -> None:
     from benchmarks.ds4_profile import profile_spine
 

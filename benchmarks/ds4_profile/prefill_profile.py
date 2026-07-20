@@ -761,6 +761,8 @@ class VllmSchedulerCacheAdapter:
             raise RuntimeError("prefix priming requires a real request factory")
         evidence = []
         for request in point.requests:
+            if request.cached_tokens == 0:
+                continue
             prime_id = f"prime:{phase}:{ordinal}:{request.request_key}"
             prefix = list(request.prompt_token_ids[: request.cached_tokens])
             self.scheduler.add_request(self.request_factory(prime_id, prefix))
@@ -905,6 +907,11 @@ class VllmSchedulerCacheAdapter:
         """Prove that measured lookup reuses synchronized resident GPU0 blocks."""
         _, request_data = self._scheduled_vectors(scheduler_output)
         for request in point.requests:
+            measured = request_data.get(request.request_key)
+            if request.cached_tokens == 0:
+                if measured is None or self._computed_tokens(measured) != 0:
+                    raise RuntimeError("zero-cached request unexpectedly reused blocks")
+                continue
             prime = self._prime_evidence.get(request.request_key)
             if (
                 prime is None
@@ -912,7 +919,6 @@ class VllmSchedulerCacheAdapter:
                 or not prime.prime_synchronized
             ):
                 raise RuntimeError("prefix was not executed on GPU0")
-            measured = request_data.get(request.request_key)
             if (
                 measured is None
                 or self._computed_tokens(measured) != request.cached_tokens
