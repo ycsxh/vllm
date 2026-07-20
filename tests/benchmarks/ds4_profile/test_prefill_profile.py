@@ -1209,9 +1209,14 @@ def test_reset_epoch_synchronizes_the_gpu_flush() -> None:
     assert synchronizations == ["sync"]
 
 
-def test_allocator_ooc_requires_pressure_and_clean_reset() -> None:
+def test_allocator_ooc_requires_pressure_and_clean_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     point = _adapter_point()
     adapter, executor = _adapter(_fake_output({}, active_ids=("r0",)), free_blocks=0)
+    clock = [1.0]
+    monkeypatch.setattr(prefill_profile, "perf_counter", lambda: clock[0])
+    adapter.reset_epoch = lambda: clock.__setitem__(0, clock[0] + 0.002)
     scheduled = adapter.schedule_chunk(point, point.chunks[0])
 
     allocation = adapter.classify_out_of_capacity(point, point.chunks[0], scheduled)
@@ -1220,6 +1225,28 @@ def test_allocator_ooc_requires_pressure_and_clean_reset() -> None:
     assert allocation.state == "out_of_capacity"
     assert allocation.allocator_pressure_proven
     assert allocation.clean_reset_proven
+    assert adapter._consume_cleanup_reset_time_ms() == pytest.approx(2.0)
+
+
+def test_allocator_ooc_preserves_failed_cleanup_reset_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    point = _adapter_point()
+    adapter, _ = _adapter(_fake_output({}, active_ids=("r0",)), free_blocks=0)
+    scheduled = adapter.schedule_chunk(point, point.chunks[0])
+    clock = [1.0]
+    monkeypatch.setattr(prefill_profile, "perf_counter", lambda: clock[0])
+
+    def fail_reset() -> None:
+        clock[0] += 0.002
+        raise RuntimeError("cleanup reset failed")
+
+    adapter.reset_epoch = fail_reset
+
+    with pytest.raises(RuntimeError, match="cleanup reset failed"):
+        adapter.classify_out_of_capacity(point, point.chunks[0], scheduled)
+
+    assert adapter._consume_cleanup_reset_time_ms() == pytest.approx(2.0)
 
 
 def test_full_batch_capacity_probe_requires_a_real_allocator_refusal() -> None:
@@ -1243,6 +1270,29 @@ def test_full_batch_capacity_probe_requires_a_real_allocator_refusal() -> None:
     assert allocation.clean_reset_proven
     assert allocation.lookup_time_ms == 0.0
     assert allocation.allocation_time_ms > 0.0
+
+
+def test_full_batch_capacity_probe_times_cleanup_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    point = _adapter_point()
+    adapter, _ = _adapter(_fake_output({}, active_ids=()), free_blocks=0)
+    clock = [1.0]
+    monkeypatch.setattr(prefill_profile, "perf_counter", lambda: clock[0])
+    adapter.reset_epoch = lambda: clock.__setitem__(0, clock[0] + 0.002)
+    adapter.scheduler.kv_cache_config.num_blocks = 1
+    adapter.scheduler.kv_cache_manager.coordinator.required_blocks = 2
+    adapter.request_factory = lambda request_id, tokens: SimpleNamespace(
+        request_id=request_id,
+        prompt_token_ids=tokens,
+        num_tokens=len(tokens),
+        skip_reading_prefix_cache=False,
+    )
+
+    allocation = adapter.probe_out_of_capacity(point)
+
+    assert allocation is not None
+    assert adapter._consume_cleanup_reset_time_ms() == pytest.approx(2.0)
 
 
 def test_capacity_probe_uses_coordinator_admission_caps() -> None:
@@ -1306,6 +1356,7 @@ class _OrchestrationAdapter:
     def __init__(self, events: list[str], outcome: str = "complete") -> None:
         self.events = events
         self.outcome = outcome
+        self.cleanup_reset_time_ms = 0.0
 
     def reset_epoch(self) -> None:
         self.events.append("reset")
@@ -1366,6 +1417,7 @@ class _OrchestrationAdapter:
         ):
             return None
         self.events.append("clean_reset")
+        self.cleanup_reset_time_ms = 1.5
         return replace(
             scheduled.allocation,
             state="out_of_capacity",
@@ -1377,6 +1429,11 @@ class _OrchestrationAdapter:
             allocator_pressure_proven=True,
             clean_reset_proven=True,
         )
+
+    def _consume_cleanup_reset_time_ms(self) -> float:
+        elapsed_ms = self.cleanup_reset_time_ms
+        self.cleanup_reset_time_ms = 0.0
+        return elapsed_ms
 
     def require_complete_chunk(self, scheduled) -> None:
         prefill_profile.VllmSchedulerCacheAdapter.require_complete_chunk(scheduled)
@@ -1518,8 +1575,58 @@ def test_allocator_pressure_emits_one_untimed_terminal_row() -> None:
     assert events == ["reset", "prime_gpu0", "clean_reset"]
 
 
-def test_capacity_probe_preserves_hit_prime_evidence_before_terminal_ooc() -> None:
+def test_cleanup_reset_failure_preserves_attempt_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     events: list[str] = []
+    clock = iter((1.0, 1.002, 2.0, 2.003))
+    monkeypatch.setattr(prefill_profile, "perf_counter", lambda: next(clock))
+    adapter: Any = _OrchestrationAdapter(events)
+
+    def fail_cleanup(*_args):
+        adapter.cleanup_reset_time_ms = 1.5
+        raise RuntimeError("cleanup reset failed")
+
+    adapter.classify_out_of_capacity = fail_cleanup
+    result = prefill_profile.run_point_repetition(
+        _adapter_point(),
+        phase="warmup",
+        ordinal=0,
+        adapter=adapter,
+        execute_timed=_timed_executor(events),
+    )
+
+    assert result["status"] == "failed"
+    assert result["rows"][0]["cache_reset_time_ms"] == pytest.approx(3.5)
+
+
+def test_ooc_allocation_payload_failure_preserves_cleanup_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    clock = iter((1.0, 1.002, 2.0, 2.003))
+    monkeypatch.setattr(prefill_profile, "perf_counter", lambda: next(clock))
+    adapter: Any = _OrchestrationAdapter(events, "ooc")
+    adapter._kv_page_bytes = lambda: (64, 128)
+
+    result = prefill_profile.run_point_repetition(
+        _adapter_point(),
+        phase="warmup",
+        ordinal=0,
+        adapter=adapter,
+        execute_timed=_timed_executor(events),
+    )
+
+    assert result["status"] == "failed"
+    assert result["rows"][0]["cache_reset_time_ms"] == pytest.approx(3.5)
+
+
+def test_capacity_probe_preserves_hit_prime_evidence_before_terminal_ooc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    clock = iter((1.0, 1.002, 2.0, 2.003))
+    monkeypatch.setattr(prefill_profile, "perf_counter", lambda: next(clock))
     adapter: Any = _OrchestrationAdapter(events)
 
     def prime(*_args):
@@ -1528,6 +1635,7 @@ def test_capacity_probe_preserves_hit_prime_evidence_before_terminal_ooc() -> No
 
     def probe(_point):
         events.append("capacity_probe")
+        adapter.cleanup_reset_time_ms = 1.5
         return prefill_profile.AllocationEvidence(
             state="out_of_capacity",
             requested_blocks=9,
@@ -1557,10 +1665,15 @@ def test_capacity_probe_preserves_hit_prime_evidence_before_terminal_ooc() -> No
     assert events == ["reset", "prime_gpu0", "capacity_probe"]
     assert result["rows"][0]["actual_scheduled_tokens_by_request"] == []
     assert result["rows"][0]["runner_wall_time_ms"] is None
+    assert result["rows"][0]["cache_reset_time_ms"] == pytest.approx(3.5)
 
 
-def test_later_allocator_pressure_preserves_only_completed_chunk_timing() -> None:
+def test_later_allocator_pressure_preserves_only_completed_chunk_timing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     events: list[str] = []
+    clock = iter((1.0, 1.002, 2.0, 2.003))
+    monkeypatch.setattr(prefill_profile, "perf_counter", lambda: next(clock))
     result = prefill_profile.run_point_repetition(
         _artifact_point("prefix_hit"),
         phase="warmup",
@@ -1576,6 +1689,8 @@ def test_later_allocator_pressure_preserves_only_completed_chunk_timing() -> Non
     ]
     assert result["rows"][0]["runner_wall_time_ms"] == 1.0
     assert result["rows"][1]["runner_wall_time_ms"] is None
+    assert result["rows"][0]["cache_reset_time_ms"] == pytest.approx(3.5)
+    assert result["rows"][1]["cache_reset_time_ms"] is None
     assert events.count("timed:0") == 1
 
 

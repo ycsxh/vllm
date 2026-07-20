@@ -260,6 +260,20 @@ class VllmSchedulerCacheAdapter:
         self.block_axes = block_axes
         self.layer_order = layer_order
         self._prime_evidence: dict[str, PrefixPrimeEvidence] = {}
+        self._cleanup_reset_time_ms = 0.0
+
+    def _reset_after_out_of_capacity(self) -> None:
+        self._cleanup_reset_time_ms = 0.0
+        started = perf_counter()
+        try:
+            self.reset_epoch()
+        finally:
+            self._cleanup_reset_time_ms = (perf_counter() - started) * 1000
+
+    def _consume_cleanup_reset_time_ms(self) -> float:
+        elapsed_ms = self._cleanup_reset_time_ms
+        self._cleanup_reset_time_ms = 0.0
+        return elapsed_ms
 
     @classmethod
     def from_runtime(
@@ -687,9 +701,9 @@ class VllmSchedulerCacheAdapter:
                 clean_reset_proven=False,
                 scheduler_time_ms=0.0,
             )
-            self.reset_epoch()
+            self._reset_after_out_of_capacity()
             return replace(allocation, clean_reset_proven=True)
-        self.reset_epoch()
+        self._reset_after_out_of_capacity()
         raise RuntimeError("capacity probe did not produce an allocator refusal")
 
     def update_after_execute(self, scheduler_output: Any, model_output: Any) -> None:
@@ -1003,7 +1017,7 @@ class VllmSchedulerCacheAdapter:
         allocation = scheduled.allocation
         if not allocation.allocator_pressure_proven:
             raise RuntimeError("partial SchedulerOutput lacks allocator-pressure proof")
-        self.reset_epoch()
+        self._reset_after_out_of_capacity()
         return AllocationEvidence(
             state="out_of_capacity",
             requested_blocks=allocation.requested_blocks,
@@ -1221,9 +1235,14 @@ def _run_point_repetition_impl(
             adapter, "completed_prime_evidence", lambda: prime_evidence
         )()
         completed_evidence.extend(snapshot)
-    capacity_failure = getattr(adapter, "probe_out_of_capacity", lambda _point: None)(
-        point
-    )
+    try:
+        capacity_failure = getattr(
+            adapter, "probe_out_of_capacity", lambda _point: None
+        )(point)
+    finally:
+        setup_timings["cache_reset_time_ms"] += getattr(
+            adapter, "_consume_cleanup_reset_time_ms", lambda: 0.0
+        )()
     if capacity_failure is not None:
         chunk = point.chunks[0]
         scheduled = ScheduledChunk(
@@ -1275,7 +1294,21 @@ def _run_point_repetition_impl(
         failure_scheduled[0] = None
         scheduled = adapter.schedule_chunk(point, chunk)
         failure_scheduled[0] = scheduled
-        out_of_capacity = adapter.classify_out_of_capacity(point, chunk, scheduled)
+        cleanup_reset_time_ms = 0.0
+        try:
+            out_of_capacity = adapter.classify_out_of_capacity(point, chunk, scheduled)
+        finally:
+            cleanup_reset_time_ms = getattr(
+                adapter, "_consume_cleanup_reset_time_ms", lambda: 0.0
+            )()
+            setup_timings["cache_reset_time_ms"] += cleanup_reset_time_ms
+            if chunk.chunk_index > 0 and cleanup_reset_time_ms:
+                first_reset_time_ms = rows[0]["cache_reset_time_ms"]
+                if first_reset_time_ms is None:
+                    raise RuntimeError("first chunk omitted cache reset timing")
+                rows[0]["cache_reset_time_ms"] = (
+                    first_reset_time_ms + cleanup_reset_time_ms
+                )
         if out_of_capacity is not None:
             allocation = _allocation_payload(
                 adapter,
