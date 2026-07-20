@@ -161,6 +161,10 @@ def _write_v2_result(tmp_path: Path) -> Path:
                         scheduled_tokens=512,
                         context_tokens=512,
                         new_tokens=512,
+                        cache_reset_time_ms=0.1,
+                        prefix_prime_time_ms=(
+                            0.1 if payload["cache_condition"] == "prefix_hit" else None
+                        ),
                         runner_wall_time_ms=elapsed,
                         cuda_model_time_ms=elapsed,
                         runtime_mode="FULL",
@@ -192,6 +196,10 @@ def _write_v2_result(tmp_path: Path) -> Path:
                         allocated_kv_blocks=1,
                         requested_kv_bytes=1,
                         allocated_kv_bytes=1,
+                        cache_reset_time_ms=0.1,
+                        prefix_prime_time_ms=(
+                            0.1 if payload["cache_condition"] == "prefix_hit" else 0.0
+                        ),
                         runner_wall_time_ms=elapsed,
                         cuda_model_time_ms=elapsed,
                         throughput_tokens_per_s=512_000.0 / elapsed,
@@ -371,6 +379,20 @@ def test_v2_validator_rejects_invalid_setup_timing(
     pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), raw_path)
 
     with pytest.raises(ValueError, match="setup timing"):
+        profile_spine._validate_result_dir(output_dir)
+
+
+def test_v2_validator_requires_first_chunk_setup_timing(tmp_path: Path) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    output_dir = _write_v2_result(tmp_path)
+    raw_path = output_dir / "raw_samples.parquet"
+    table = pq.read_table(raw_path)
+    rows = table.to_pylist()
+    rows[0]["cache_reset_time_ms"] = None
+    pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), raw_path)
+
+    with pytest.raises(ValueError, match="inconsistent setup timing"):
         profile_spine._validate_result_dir(output_dir)
 
 

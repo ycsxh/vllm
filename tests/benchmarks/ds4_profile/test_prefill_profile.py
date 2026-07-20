@@ -885,7 +885,7 @@ def test_schedule_chunk_records_distinct_scheduler_lookup_and_allocation_times(
 
     allocation = adapter.schedule_chunk(point, point.chunks[0]).allocation
 
-    assert allocation.scheduler_time_ms == pytest.approx(10.0)
+    assert allocation.scheduler_time_ms == pytest.approx(5.0)
     assert allocation.lookup_time_ms == pytest.approx(2.0)
     assert allocation.allocation_time_ms == pytest.approx(3.0)
 
@@ -1403,14 +1403,10 @@ def _timed_executor(events: list[str]):
     return execute
 
 
-def test_hit_repetition_primes_and_verifies_before_any_timed_chunk(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_hit_repetition_primes_and_verifies_before_any_timed_chunk() -> None:
     events: list[str] = []
-    clock = iter((1.0, 1.002, 2.0, 2.003))
-    monkeypatch.setattr(prefill_profile, "perf_counter", lambda: next(clock))
     result = prefill_profile.run_point_repetition(
-        _artifact_point("prefix_hit"),
+        _adapter_point(),
         phase="steady",
         ordinal=0,
         adapter=_OrchestrationAdapter(events),
@@ -1419,12 +1415,29 @@ def test_hit_repetition_primes_and_verifies_before_any_timed_chunk(
 
     assert events[:4] == ["reset", "prime_gpu0", "verify_resident", "timed:0"]
     assert result["status"] == "passed"
+
+
+def test_setup_timings_are_recorded_once_per_repetition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    clock = iter((1.0, 1.002, 2.0, 2.003))
+    monkeypatch.setattr(prefill_profile, "perf_counter", lambda: next(clock))
+
+    result = prefill_profile.run_point_repetition(
+        _artifact_point("prefix_hit"),
+        phase="steady",
+        ordinal=0,
+        adapter=_OrchestrationAdapter(events),
+        execute_timed=_timed_executor(events),
+    )
+
     first, second = result["rows"]
     assert first["cache_reset_time_ms"] == pytest.approx(2.0)
     assert first["prefix_prime_time_ms"] == pytest.approx(3.0)
     assert first["scheduler_time_ms"] == pytest.approx(0.4)
-    assert second["cache_reset_time_ms"] == 0.0
-    assert second["prefix_prime_time_ms"] == 0.0
+    assert second["cache_reset_time_ms"] is None
+    assert second["prefix_prime_time_ms"] is None
 
 
 def test_recompute_repetition_records_no_prefix_prime_time(
@@ -1443,7 +1456,28 @@ def test_recompute_repetition_records_no_prefix_prime_time(
     )
 
     assert result["status"] == "passed"
-    assert all(row["prefix_prime_time_ms"] == 0.0 for row in result["rows"])
+    assert all(row["prefix_prime_time_ms"] is None for row in result["rows"])
+
+
+def test_failed_first_chunk_preserves_completed_setup_timings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    clock = iter((1.0, 1.002, 2.0, 2.003))
+    monkeypatch.setattr(prefill_profile, "perf_counter", lambda: next(clock))
+
+    result = prefill_profile.run_point_repetition(
+        _adapter_point(),
+        phase="steady",
+        ordinal=0,
+        adapter=_OrchestrationAdapter(events, "partial_tokens"),
+        execute_timed=_timed_executor(events),
+    )
+
+    failed = result["rows"][0]
+    assert result["status"] == "failed"
+    assert failed["cache_reset_time_ms"] == pytest.approx(2.0)
+    assert failed["prefix_prime_time_ms"] == pytest.approx(3.0)
 
 
 @pytest.mark.parametrize(
@@ -2221,8 +2255,12 @@ def _passed_chunk_row(
             "lookup_time_ms": 0.2,
             "allocation_time_ms": 0.3,
             "scheduler_time_ms": 0.6,
-            "cache_reset_time_ms": 0.7 if chunk.chunk_index == 0 else 0.0,
-            "prefix_prime_time_ms": 0.8 if chunk.chunk_index == 0 else 0.0,
+            "cache_reset_time_ms": 0.7 if chunk.chunk_index == 0 else None,
+            "prefix_prime_time_ms": (
+                0.8
+                if chunk.chunk_index == 0 and point.cache_condition == "prefix_hit"
+                else None
+            ),
             "runtime_mode": "FULL",
         },
         status="passed",

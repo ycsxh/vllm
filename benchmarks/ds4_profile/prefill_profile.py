@@ -891,7 +891,7 @@ class VllmSchedulerCacheAdapter:
         )
         started = perf_counter()
         output, allocator = self._schedule_with_allocator_evidence()
-        scheduler_time_ms = (perf_counter() - started) * 1000
+        total_scheduler_time_ms = (perf_counter() - started) * 1000
         actual, _ = self._scheduled_vectors(output)
         actual_ids = tuple(actual)
         preempted = tuple(
@@ -899,6 +899,12 @@ class VllmSchedulerCacheAdapter:
         )
         unrelated = tuple(
             sorted(set(actual_ids) - set(expected_ids) | set(unrelated_state))
+        )
+        scheduler_time_ms = max(
+            0.0,
+            total_scheduler_time_ms
+            - allocator.lookup_time_ms
+            - allocator.allocation_time_ms,
         )
         allocation = self._allocation_snapshot(allocator, scheduler_time_ms)
         return ScheduledChunk(
@@ -1124,8 +1130,8 @@ def make_prefill_chunk_row(
         "lookup_time_ms": allocation["lookup_time_ms"],
         "allocation_time_ms": allocation["allocation_time_ms"],
         "scheduler_time_ms": allocation.get("scheduler_time_ms", 0.0),
-        "cache_reset_time_ms": allocation.get("cache_reset_time_ms", 0.0),
-        "prefix_prime_time_ms": allocation.get("prefix_prime_time_ms", 0.0),
+        "cache_reset_time_ms": allocation.get("cache_reset_time_ms"),
+        "prefix_prime_time_ms": allocation.get("prefix_prime_time_ms"),
         "runner_wall_time_ms": runner_wall_time_ms,
         "cuda_model_time_ms": cuda_model_time_ms,
         "runtime_mode": allocation["runtime_mode"],
@@ -1140,8 +1146,8 @@ def _allocation_payload(
     *,
     cache_epoch: int,
     runtime_mode: str | None,
-    cache_reset_time_ms: float = 0.0,
-    prefix_prime_time_ms: float = 0.0,
+    cache_reset_time_ms: float | None = None,
+    prefix_prime_time_ms: float | None = None,
 ) -> dict[str, Any]:
     page_bytes = adapter._kv_page_bytes()
     if len(set(page_bytes)) != 1:
@@ -1188,6 +1194,7 @@ def _run_point_repetition_impl(
     completed_rows: list[dict[str, Any]],
     completed_evidence: list[PrefixPrimeEvidence],
     failure_scheduled: list[ScheduledChunk | None],
+    setup_timings: dict[str, float],
     run_id: str = "unit-run",
 ) -> dict[str, Any]:
     """Run one reset-isolated point repetition in fail-closed order."""
@@ -1196,14 +1203,16 @@ def _run_point_repetition_impl(
         (1 << 63) - 1
     )
     reset_started = perf_counter()
-    adapter.reset_epoch()
-    cache_reset_time_ms = (perf_counter() - reset_started) * 1000
+    try:
+        adapter.reset_epoch()
+    finally:
+        setup_timings["cache_reset_time_ms"] = (perf_counter() - reset_started) * 1000
     prime_evidence = ()
     prime_started = perf_counter()
     try:
         prime_evidence = adapter.prime(point, phase, ordinal)
     finally:
-        prefix_prime_time_ms = (
+        setup_timings["prefix_prime_time_ms"] = (
             (perf_counter() - prime_started) * 1000
             if point.cache_condition == "prefix_hit"
             else 0.0
@@ -1233,8 +1242,12 @@ def _run_point_repetition_impl(
             capacity_failure,
             cache_epoch=cache_epoch,
             runtime_mode=None,
-            cache_reset_time_ms=cache_reset_time_ms,
-            prefix_prime_time_ms=prefix_prime_time_ms,
+            cache_reset_time_ms=setup_timings["cache_reset_time_ms"],
+            prefix_prime_time_ms=(
+                setup_timings["prefix_prime_time_ms"]
+                if point.cache_condition == "prefix_hit"
+                else None
+            ),
         )
         completed_rows.append(
             make_prefill_chunk_row(
@@ -1271,10 +1284,14 @@ def _run_point_repetition_impl(
                 cache_epoch=cache_epoch,
                 runtime_mode=None,
                 cache_reset_time_ms=(
-                    cache_reset_time_ms if chunk.chunk_index == 0 else 0.0
+                    setup_timings["cache_reset_time_ms"]
+                    if chunk.chunk_index == 0
+                    else None
                 ),
                 prefix_prime_time_ms=(
-                    prefix_prime_time_ms if chunk.chunk_index == 0 else 0.0
+                    setup_timings["prefix_prime_time_ms"]
+                    if chunk.chunk_index == 0 and point.cache_condition == "prefix_hit"
+                    else None
                 ),
             )
             rows.append(
@@ -1314,10 +1331,12 @@ def _run_point_repetition_impl(
             cache_epoch=cache_epoch,
             runtime_mode=mode,
             cache_reset_time_ms=(
-                cache_reset_time_ms if chunk.chunk_index == 0 else 0.0
+                setup_timings["cache_reset_time_ms"] if chunk.chunk_index == 0 else None
             ),
             prefix_prime_time_ms=(
-                prefix_prime_time_ms if chunk.chunk_index == 0 else 0.0
+                setup_timings["prefix_prime_time_ms"]
+                if chunk.chunk_index == 0 and point.cache_condition == "prefix_hit"
+                else None
             ),
         )
         rows.append(
@@ -1351,6 +1370,10 @@ def run_point_repetition(
     completed_rows: list[dict[str, Any]] = []
     completed_evidence: list[PrefixPrimeEvidence] = []
     failure_scheduled: list[ScheduledChunk | None] = [None]
+    setup_timings = {
+        "cache_reset_time_ms": 0.0,
+        "prefix_prime_time_ms": 0.0,
+    }
     try:
         return _run_point_repetition_impl(
             point,
@@ -1363,6 +1386,7 @@ def run_point_repetition(
             completed_rows=completed_rows,
             completed_evidence=completed_evidence,
             failure_scheduled=failure_scheduled,
+            setup_timings=setup_timings,
         )
     except Exception as error:
         chunk = failure_coordinate[0]
@@ -1407,8 +1431,14 @@ def run_point_repetition(
             "scheduler_time_ms": (
                 0.0 if scheduled is None else scheduled.allocation.scheduler_time_ms
             ),
-            "cache_reset_time_ms": 0.0,
-            "prefix_prime_time_ms": 0.0,
+            "cache_reset_time_ms": (
+                setup_timings["cache_reset_time_ms"] if chunk.chunk_index == 0 else None
+            ),
+            "prefix_prime_time_ms": (
+                setup_timings["prefix_prime_time_ms"]
+                if chunk.chunk_index == 0 and point.cache_condition == "prefix_hit"
+                else None
+            ),
             "runtime_mode": None,
         }
         error_text = f"{type(error).__name__}: {error}"

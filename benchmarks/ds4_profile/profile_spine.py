@@ -419,7 +419,8 @@ def summarize_turn_samples(
             raise ValueError("turn samples require every planned chunk")
         first = chunks[0]
         totals = {
-            field: sum(row[field] for row in chunks) for field in _TURN_TOTAL_FIELDS
+            field: sum(row[field] or 0.0 for row in chunks)
+            for field in _TURN_TOTAL_FIELDS
         }
         wall_time = totals["runner_wall_time_ms"]
         runtime_modes = {row["runtime_mode"] for row in chunks}
@@ -1470,9 +1471,7 @@ def _validate_v2_turn_totals(
             raise ValueError("turn sample does not match raw chunk totals")
         for field in _TURN_TOTAL_FIELDS:
             values = [row[field] for row in chunks]
-            if any(value is None for value in values) or not _same_float(
-                turn[field], sum(values)
-            ):
+            if not _same_float(turn[field], sum(value or 0.0 for value in values)):
                 raise ValueError("turn sample does not match raw chunk totals")
         expected_throughput = (
             turn["new_tokens"] * 1000 / turn["runner_wall_time_ms"]
@@ -1627,36 +1626,6 @@ def _validate_v2_result_dir(result_dir: Path, config: dict[str, Any]) -> None:
     evidence_rows = _validate_v2_schema(
         result_dir / "prefix_evidence.parquet", V2_PREFIX_EVIDENCE_SCHEMA
     )
-    setup_timing_fields = (
-        "lookup_time_ms",
-        "allocation_time_ms",
-        "scheduler_time_ms",
-        "cache_reset_time_ms",
-        "prefix_prime_time_ms",
-    )
-    if any(
-        not math.isfinite(row[field]) or row[field] < 0
-        for row in raw_rows
-        for field in setup_timing_fields
-    ):
-        raise ValueError("raw sample has invalid setup timing")
-    if any(
-        (
-            row["chunk_index"] != 0
-            and (row["cache_reset_time_ms"] != 0 or row["prefix_prime_time_ms"] != 0)
-        )
-        or (
-            row["cache_condition"] == "full_recompute"
-            and row["prefix_prime_time_ms"] != 0
-        )
-        or (
-            row["status"] == "passed"
-            and row["scheduler_time_ms"] + 1e-9
-            < row["lookup_time_ms"] + row["allocation_time_ms"]
-        )
-        for row in raw_rows
-    ):
-        raise ValueError("raw sample has inconsistent setup timing")
     for rows, name in (
         (raw_rows, "raw_samples.parquet"),
         (turn_rows, "turn_samples.parquet"),
@@ -1665,6 +1634,33 @@ def _validate_v2_result_dir(result_dir: Path, config: dict[str, Any]) -> None:
         (evidence_rows, "prefix_evidence.parquet"),
     ):
         _require_v2_enums(rows, name)
+    required_setup_timing_fields = (
+        "lookup_time_ms",
+        "allocation_time_ms",
+        "scheduler_time_ms",
+    )
+    if any(
+        not math.isfinite(row[field]) or row[field] < 0
+        for row in raw_rows
+        for field in required_setup_timing_fields
+    ) or any(
+        value is not None and (not math.isfinite(value) or value < 0)
+        for row in raw_rows
+        for value in (
+            row["cache_reset_time_ms"],
+            row["prefix_prime_time_ms"],
+        )
+    ):
+        raise ValueError("raw sample has invalid setup timing")
+    if any(
+        ((row["chunk_index"] == 0) != (row["cache_reset_time_ms"] is not None))
+        or (
+            (row["chunk_index"] == 0 and row["cache_condition"] == "prefix_hit")
+            != (row["prefix_prime_time_ms"] is not None)
+        )
+        for row in raw_rows
+    ):
+        raise ValueError("raw sample has inconsistent setup timing")
     if config.get("bootstrap_failure") is True:
         provenance = json.loads((result_dir / "provenance.json").read_text())
         if any((raw_rows, turn_rows, aggregate_rows, comparison_rows, evidence_rows)):
