@@ -246,6 +246,9 @@ V2_RAW_SAMPLE_SCHEMA = _v2_schema(
         pa.field("recomputed_tokens", pa.int32(), nullable=False),
         pa.field("lookup_time_ms", pa.float64()),
         pa.field("allocation_time_ms", pa.float64()),
+        pa.field("scheduler_time_ms", pa.float64()),
+        pa.field("cache_reset_time_ms", pa.float64()),
+        pa.field("prefix_prime_time_ms", pa.float64()),
         pa.field("runner_wall_time_ms", pa.float64()),
         pa.field("cuda_model_time_ms", pa.float64()),
         pa.field("runtime_mode", pa.string()),
@@ -282,6 +285,9 @@ V2_TURN_SAMPLE_SCHEMA = _v2_schema(
         pa.field("allocated_kv_bytes", pa.int64(), nullable=False),
         pa.field("lookup_time_ms", pa.float64(), nullable=False),
         pa.field("allocation_time_ms", pa.float64(), nullable=False),
+        pa.field("scheduler_time_ms", pa.float64(), nullable=False),
+        pa.field("cache_reset_time_ms", pa.float64(), nullable=False),
+        pa.field("prefix_prime_time_ms", pa.float64(), nullable=False),
         pa.field("runner_wall_time_ms", pa.float64(), nullable=False),
         pa.field("cuda_model_time_ms", pa.float64(), nullable=False),
         pa.field("throughput_tokens_per_s", pa.float64(), nullable=False),
@@ -1443,6 +1449,9 @@ _TURN_TOTAL_FIELDS = (
     "allocated_kv_bytes",
     "lookup_time_ms",
     "allocation_time_ms",
+    "scheduler_time_ms",
+    "cache_reset_time_ms",
+    "prefix_prime_time_ms",
     "runner_wall_time_ms",
     "cuda_model_time_ms",
 )
@@ -1618,6 +1627,36 @@ def _validate_v2_result_dir(result_dir: Path, config: dict[str, Any]) -> None:
     evidence_rows = _validate_v2_schema(
         result_dir / "prefix_evidence.parquet", V2_PREFIX_EVIDENCE_SCHEMA
     )
+    setup_timing_fields = (
+        "lookup_time_ms",
+        "allocation_time_ms",
+        "scheduler_time_ms",
+        "cache_reset_time_ms",
+        "prefix_prime_time_ms",
+    )
+    if any(
+        not math.isfinite(row[field]) or row[field] < 0
+        for row in raw_rows
+        for field in setup_timing_fields
+    ):
+        raise ValueError("raw sample has invalid setup timing")
+    if any(
+        (
+            row["chunk_index"] != 0
+            and (row["cache_reset_time_ms"] != 0 or row["prefix_prime_time_ms"] != 0)
+        )
+        or (
+            row["cache_condition"] == "full_recompute"
+            and row["prefix_prime_time_ms"] != 0
+        )
+        or (
+            row["status"] == "passed"
+            and row["scheduler_time_ms"] + 1e-9
+            < row["lookup_time_ms"] + row["allocation_time_ms"]
+        )
+        for row in raw_rows
+    ):
+        raise ValueError("raw sample has inconsistent setup timing")
     for rows, name in (
         (raw_rows, "raw_samples.parquet"),
         (turn_rows, "turn_samples.parquet"),

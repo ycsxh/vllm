@@ -180,6 +180,7 @@ class AllocationEvidence:
     allocated_bytes: int
     lookup_time_ms: float
     allocation_time_ms: float
+    scheduler_time_ms: float
     allocator_pressure_proven: bool
     clean_reset_proven: bool
 
@@ -204,6 +205,8 @@ class _AllocatorSnapshot:
     requested_bytes: int
     allocated_bytes: int
     refusal_proven: bool
+    lookup_time_ms: float
+    allocation_time_ms: float
 
 
 def _make_request_factory(scheduler: Any) -> Callable[[str, list[int]], Any]:
@@ -386,7 +389,7 @@ class VllmSchedulerCacheAdapter:
     def _allocation_snapshot(
         self,
         allocator: _AllocatorSnapshot,
-        elapsed_ms: float,
+        scheduler_time_ms: float,
     ) -> AllocationEvidence:
         return AllocationEvidence(
             state="allocated",
@@ -395,10 +398,11 @@ class VllmSchedulerCacheAdapter:
             allocatable_blocks=allocator.allocatable_blocks,
             requested_bytes=allocator.requested_bytes,
             allocated_bytes=allocator.allocated_bytes,
-            lookup_time_ms=elapsed_ms,
-            allocation_time_ms=elapsed_ms,
+            lookup_time_ms=allocator.lookup_time_ms,
+            allocation_time_ms=allocator.allocation_time_ms,
             allocator_pressure_proven=allocator.refusal_proven,
             clean_reset_proven=False,
+            scheduler_time_ms=scheduler_time_ms,
         )
 
     def _schedule_with_allocator_evidence(
@@ -407,14 +411,29 @@ class VllmSchedulerCacheAdapter:
         """Capture exact manager values when ``allocate_slots`` refuses."""
         manager = self.scheduler.kv_cache_manager
         original_allocate = manager.allocate_slots
+        original_lookup = manager.get_computed_blocks
         page_bytes = self._kv_page_bytes()
         allocated_blocks = 0
         allocated_bytes = 0
         requested_blocks = 0
         requested_bytes = 0
         refusal: tuple[int, int, int] | None = None
+        lookup_time_ms = 0.0
+        allocation_time_ms = 0.0
+
+        def tracked_lookup(*args: Any, **kwargs: Any) -> Any:
+            nonlocal lookup_time_ms
+            started = perf_counter()
+            try:
+                return original_lookup(*args, **kwargs)
+            finally:
+                lookup_time_ms += (perf_counter() - started) * 1000
 
         def tracked_allocate(*args: Any, **kwargs: Any) -> Any:
+            nonlocal allocation_time_ms
+            nonlocal allocated_blocks, allocated_bytes
+            nonlocal requested_blocks, requested_bytes, refusal
+            started = perf_counter()
             coordinator = manager.coordinator
             original_required = coordinator.get_num_blocks_to_allocate
             required_calls: list[int] = []
@@ -451,8 +470,7 @@ class VllmSchedulerCacheAdapter:
                 allocation_result = original_allocate(*args, **kwargs)
             finally:
                 coordinator.get_num_blocks_to_allocate = original_required
-            nonlocal allocated_blocks, allocated_bytes
-            nonlocal requested_blocks, requested_bytes, refusal
+                allocation_time_ms += (perf_counter() - started) * 1000
             if allocation_result is None:
                 if not required_calls:
                     raise RuntimeError(
@@ -512,10 +530,12 @@ class VllmSchedulerCacheAdapter:
             return allocation_result
 
         manager.allocate_slots = tracked_allocate
+        manager.get_computed_blocks = tracked_lookup
         try:
             output = self.scheduler.schedule()
         finally:
             manager.allocate_slots = original_allocate
+            manager.get_computed_blocks = original_lookup
         free_blocks = int(manager.block_pool.get_num_free_blocks())
         if refusal is None:
             return output, _AllocatorSnapshot(
@@ -525,6 +545,8 @@ class VllmSchedulerCacheAdapter:
                 requested_bytes=requested_bytes,
                 allocated_bytes=allocated_bytes,
                 refusal_proven=False,
+                lookup_time_ms=lookup_time_ms,
+                allocation_time_ms=allocation_time_ms,
             )
         refused_blocks, available_blocks, refused_bytes = refusal
         return output, _AllocatorSnapshot(
@@ -534,6 +556,8 @@ class VllmSchedulerCacheAdapter:
             requested_bytes=allocated_bytes + refused_bytes,
             allocated_bytes=allocated_bytes,
             refusal_proven=refused_blocks > available_blocks,
+            lookup_time_ms=lookup_time_ms,
+            allocation_time_ms=allocation_time_ms,
         )
 
     def reset_epoch(self) -> None:
@@ -657,10 +681,11 @@ class VllmSchedulerCacheAdapter:
                 allocatable_blocks=allocated_blocks + free_blocks,
                 requested_bytes=0,
                 allocated_bytes=0,
-                lookup_time_ms=elapsed_ms,
+                lookup_time_ms=0.0,
                 allocation_time_ms=elapsed_ms,
                 allocator_pressure_proven=True,
                 clean_reset_proven=False,
+                scheduler_time_ms=0.0,
             )
             self.reset_epoch()
             return replace(allocation, clean_reset_proven=True)
@@ -866,7 +891,7 @@ class VllmSchedulerCacheAdapter:
         )
         started = perf_counter()
         output, allocator = self._schedule_with_allocator_evidence()
-        elapsed_ms = (perf_counter() - started) * 1000
+        scheduler_time_ms = (perf_counter() - started) * 1000
         actual, _ = self._scheduled_vectors(output)
         actual_ids = tuple(actual)
         preempted = tuple(
@@ -875,7 +900,7 @@ class VllmSchedulerCacheAdapter:
         unrelated = tuple(
             sorted(set(actual_ids) - set(expected_ids) | set(unrelated_state))
         )
-        allocation = self._allocation_snapshot(allocator, elapsed_ms)
+        allocation = self._allocation_snapshot(allocator, scheduler_time_ms)
         return ScheduledChunk(
             scheduler_output=output,
             expected_request_ids=expected_ids,
@@ -982,6 +1007,7 @@ class VllmSchedulerCacheAdapter:
             allocated_bytes=allocation.allocated_bytes,
             lookup_time_ms=allocation.lookup_time_ms,
             allocation_time_ms=allocation.allocation_time_ms,
+            scheduler_time_ms=allocation.scheduler_time_ms,
             allocator_pressure_proven=True,
             clean_reset_proven=True,
         )
@@ -1097,6 +1123,9 @@ def make_prefill_chunk_row(
         "recomputed_tokens": recomputed,
         "lookup_time_ms": allocation["lookup_time_ms"],
         "allocation_time_ms": allocation["allocation_time_ms"],
+        "scheduler_time_ms": allocation.get("scheduler_time_ms", 0.0),
+        "cache_reset_time_ms": allocation.get("cache_reset_time_ms", 0.0),
+        "prefix_prime_time_ms": allocation.get("prefix_prime_time_ms", 0.0),
         "runner_wall_time_ms": runner_wall_time_ms,
         "cuda_model_time_ms": cuda_model_time_ms,
         "runtime_mode": allocation["runtime_mode"],
@@ -1111,6 +1140,8 @@ def _allocation_payload(
     *,
     cache_epoch: int,
     runtime_mode: str | None,
+    cache_reset_time_ms: float = 0.0,
+    prefix_prime_time_ms: float = 0.0,
 ) -> dict[str, Any]:
     page_bytes = adapter._kv_page_bytes()
     if len(set(page_bytes)) != 1:
@@ -1131,6 +1162,9 @@ def _allocation_payload(
         "kv_block_bytes": page_bytes[0],
         "lookup_time_ms": allocation.lookup_time_ms,
         "allocation_time_ms": allocation.allocation_time_ms,
+        "scheduler_time_ms": allocation.scheduler_time_ms,
+        "cache_reset_time_ms": cache_reset_time_ms,
+        "prefix_prime_time_ms": prefix_prime_time_ms,
         "runtime_mode": runtime_mode,
     }
 
@@ -1161,11 +1195,19 @@ def _run_point_repetition_impl(
     cache_epoch = int.from_bytes(hashlib.sha256(epoch_payload).digest()[:8], "big") & (
         (1 << 63) - 1
     )
+    reset_started = perf_counter()
     adapter.reset_epoch()
+    cache_reset_time_ms = (perf_counter() - reset_started) * 1000
     prime_evidence = ()
+    prime_started = perf_counter()
     try:
         prime_evidence = adapter.prime(point, phase, ordinal)
     finally:
+        prefix_prime_time_ms = (
+            (perf_counter() - prime_started) * 1000
+            if point.cache_condition == "prefix_hit"
+            else 0.0
+        )
         snapshot = getattr(
             adapter, "completed_prime_evidence", lambda: prime_evidence
         )()
@@ -1191,6 +1233,8 @@ def _run_point_repetition_impl(
             capacity_failure,
             cache_epoch=cache_epoch,
             runtime_mode=None,
+            cache_reset_time_ms=cache_reset_time_ms,
+            prefix_prime_time_ms=prefix_prime_time_ms,
         )
         completed_rows.append(
             make_prefill_chunk_row(
@@ -1226,6 +1270,12 @@ def _run_point_repetition_impl(
                 out_of_capacity,
                 cache_epoch=cache_epoch,
                 runtime_mode=None,
+                cache_reset_time_ms=(
+                    cache_reset_time_ms if chunk.chunk_index == 0 else 0.0
+                ),
+                prefix_prime_time_ms=(
+                    prefix_prime_time_ms if chunk.chunk_index == 0 else 0.0
+                ),
             )
             rows.append(
                 make_prefill_chunk_row(
@@ -1263,6 +1313,12 @@ def _run_point_repetition_impl(
             scheduled.allocation,
             cache_epoch=cache_epoch,
             runtime_mode=mode,
+            cache_reset_time_ms=(
+                cache_reset_time_ms if chunk.chunk_index == 0 else 0.0
+            ),
+            prefix_prime_time_ms=(
+                prefix_prime_time_ms if chunk.chunk_index == 0 else 0.0
+            ),
         )
         rows.append(
             make_prefill_chunk_row(
@@ -1348,6 +1404,11 @@ def run_point_repetition(
             "allocation_time_ms": (
                 0.0 if scheduled is None else scheduled.allocation.allocation_time_ms
             ),
+            "scheduler_time_ms": (
+                0.0 if scheduled is None else scheduled.allocation.scheduler_time_ms
+            ),
+            "cache_reset_time_ms": 0.0,
+            "prefix_prime_time_ms": 0.0,
             "runtime_mode": None,
         }
         error_text = f"{type(error).__name__}: {error}"
@@ -1535,6 +1596,9 @@ def run_prefill_matrix(
                         "kv_block_bytes": 0,
                         "lookup_time_ms": 0.0,
                         "allocation_time_ms": 0.0,
+                        "scheduler_time_ms": 0.0,
+                        "cache_reset_time_ms": 0.0,
+                        "prefix_prime_time_ms": 0.0,
                         "runtime_mode": None,
                     },
                     status="failed",

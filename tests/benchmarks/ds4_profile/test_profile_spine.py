@@ -357,6 +357,23 @@ def test_v2_validator_rejects_unfrozen_provenance_runtime(tmp_path: Path) -> Non
         profile_spine._validate_result_dir(output_dir)
 
 
+@pytest.mark.parametrize("bad_value", (-1.0, float("nan"), float("inf")))
+def test_v2_validator_rejects_invalid_setup_timing(
+    tmp_path: Path, bad_value: float
+) -> None:
+    from benchmarks.ds4_profile import profile_spine
+
+    output_dir = _write_v2_result(tmp_path)
+    raw_path = output_dir / "raw_samples.parquet"
+    table = pq.read_table(raw_path)
+    rows = table.to_pylist()
+    rows[0]["cache_reset_time_ms"] = bad_value
+    pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), raw_path)
+
+    with pytest.raises(ValueError, match="setup timing"):
+        profile_spine._validate_result_dir(output_dir)
+
+
 @pytest.mark.parametrize(
     ("field", "path"),
     [

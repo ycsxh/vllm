@@ -652,6 +652,9 @@ class _FakeKvCacheManager:
             self.block_pool.free_blocks -= required
         return ([0],)
 
+    def get_computed_blocks(self, _request):
+        return self.empty_kv_cache_blocks, 0, 0
+
     def get_block_ids(self, _request_id):
         assert self.owner is not None
         return (list(range((self.owner.prime_progress + 15) // 16)),)
@@ -861,6 +864,30 @@ def test_schedule_chunk_preserves_exact_planned_request_vector() -> None:
 
     assert scheduled.actual_tokens_by_request == {"r0": 16}
     assert executor.execute_calls == 0
+
+
+def test_schedule_chunk_records_distinct_scheduler_lookup_and_allocation_times(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    point = _adapter_point()
+    adapter, _ = _adapter(_fake_output({"r0": 16}))
+    manager = adapter.scheduler.kv_cache_manager
+    manager.get_computed_blocks = lambda _request: ((), 0, 0)
+    original_schedule = adapter.scheduler.schedule
+
+    def schedule():
+        manager.get_computed_blocks(SimpleNamespace())
+        return original_schedule()
+
+    adapter.scheduler.schedule = schedule
+    clock = iter((0.0, 0.001, 0.003, 0.004, 0.007, 0.010))
+    monkeypatch.setattr(prefill_profile, "perf_counter", lambda: next(clock))
+
+    allocation = adapter.schedule_chunk(point, point.chunks[0]).allocation
+
+    assert allocation.scheduler_time_ms == pytest.approx(10.0)
+    assert allocation.lookup_time_ms == pytest.approx(2.0)
+    assert allocation.allocation_time_ms == pytest.approx(3.0)
 
 
 @pytest.mark.parametrize(
@@ -1214,6 +1241,8 @@ def test_full_batch_capacity_probe_requires_a_real_allocator_refusal() -> None:
     assert allocation.requested_blocks > allocation.allocatable_blocks
     assert allocation.allocator_pressure_proven
     assert allocation.clean_reset_proven
+    assert allocation.lookup_time_ms == 0.0
+    assert allocation.allocation_time_ms > 0.0
 
 
 def test_capacity_probe_uses_coordinator_admission_caps() -> None:
@@ -1318,6 +1347,7 @@ class _OrchestrationAdapter:
             allocation_time_ms=0.1,
             allocator_pressure_proven=False,
             clean_reset_proven=False,
+            scheduler_time_ms=0.4,
         )
         return prefill_profile.ScheduledChunk(
             scheduler_output=SimpleNamespace(),
@@ -1373,10 +1403,14 @@ def _timed_executor(events: list[str]):
     return execute
 
 
-def test_hit_repetition_primes_and_verifies_before_any_timed_chunk() -> None:
+def test_hit_repetition_primes_and_verifies_before_any_timed_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     events: list[str] = []
+    clock = iter((1.0, 1.002, 2.0, 2.003))
+    monkeypatch.setattr(prefill_profile, "perf_counter", lambda: next(clock))
     result = prefill_profile.run_point_repetition(
-        _adapter_point(),
+        _artifact_point("prefix_hit"),
         phase="steady",
         ordinal=0,
         adapter=_OrchestrationAdapter(events),
@@ -1385,6 +1419,31 @@ def test_hit_repetition_primes_and_verifies_before_any_timed_chunk() -> None:
 
     assert events[:4] == ["reset", "prime_gpu0", "verify_resident", "timed:0"]
     assert result["status"] == "passed"
+    first, second = result["rows"]
+    assert first["cache_reset_time_ms"] == pytest.approx(2.0)
+    assert first["prefix_prime_time_ms"] == pytest.approx(3.0)
+    assert first["scheduler_time_ms"] == pytest.approx(0.4)
+    assert second["cache_reset_time_ms"] == 0.0
+    assert second["prefix_prime_time_ms"] == 0.0
+
+
+def test_recompute_repetition_records_no_prefix_prime_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    clock = iter((1.0, 1.002, 2.0, 2.003))
+    monkeypatch.setattr(prefill_profile, "perf_counter", lambda: next(clock))
+
+    result = prefill_profile.run_point_repetition(
+        _artifact_point("full_recompute"),
+        phase="steady",
+        ordinal=0,
+        adapter=_OrchestrationAdapter(events),
+        execute_timed=_timed_executor(events),
+    )
+
+    assert result["status"] == "passed"
+    assert all(row["prefix_prime_time_ms"] == 0.0 for row in result["rows"])
 
 
 @pytest.mark.parametrize(
@@ -1444,6 +1503,7 @@ def test_capacity_probe_preserves_hit_prime_evidence_before_terminal_ooc() -> No
             allocated_bytes=0,
             lookup_time_ms=0.1,
             allocation_time_ms=0.1,
+            scheduler_time_ms=0.2,
             allocator_pressure_proven=True,
             clean_reset_proven=True,
         )
@@ -2160,6 +2220,9 @@ def _passed_chunk_row(
             "kv_block_bytes": 1024,
             "lookup_time_ms": 0.2,
             "allocation_time_ms": 0.3,
+            "scheduler_time_ms": 0.6,
+            "cache_reset_time_ms": 0.7 if chunk.chunk_index == 0 else 0.0,
+            "prefix_prime_time_ms": 0.8 if chunk.chunk_index == 0 else 0.0,
             "runtime_mode": "FULL",
         },
         status="passed",
@@ -2195,6 +2258,9 @@ def test_turn_statistics_are_recomputed_from_chunks() -> None:
     hit_turn = next(row for row in turns if row["cache_condition"] == "prefix_hit")
     assert hit_turn["runner_wall_time_ms"] == 10.0
     assert hit_turn["throughput_tokens_per_s"] == 10_000.0
+    assert hit_turn["scheduler_time_ms"] == pytest.approx(1.2)
+    assert hit_turn["cache_reset_time_ms"] == pytest.approx(0.7)
+    assert hit_turn["prefix_prime_time_ms"] == pytest.approx(0.8)
 
 
 def test_aggregates_use_exactly_ten_steady_turns() -> None:
