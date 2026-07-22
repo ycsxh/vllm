@@ -1,173 +1,221 @@
-# DS4 dual-3090 profile workflow
+# Qwen3.5 1P1D profile workflow
 
-This workflow applies only to the staged DS4 P/D profiling project under
-`benchmarks/ds4_profile/`. It is not a repository-wide vLLM contribution rule.
-Its purpose is to keep local development, school-server execution, evidence,
-and personal-fork Git history tied to the same source revision.
+This workflow turns the approved profile design into a small, auditable result.
+It applies only to `benchmarks/ds4_profile/` and does not replace repository-wide
+vLLM development policy.
 
-The words **must** and **must not** below are reserved for result-integrity and
-remote-safety gates. Branch names, archive layouts, and example commands are
-recommendations that may be adapted to the current ticket.
+[`AUTHORITATIVE_SPEC.md`](AUTHORITATIVE_SPEC.md) is normative. This file defines
+the order of work, environment boundaries, handoff evidence, and promotion
+gates. It deliberately contains no commands for modules that have not been
+implemented yet.
 
-## Stage overview
+## Working rules
 
-| Stage | Primary environment | Inputs | Outputs | Exit gate |
-| --- | --- | --- | --- | --- |
-| Local development | Developer workstation Codex | Ticket, pinned prior artifacts, personal-fork `main` | Tests, fixture artifacts, feature-branch commit, handoff | Commit is pushed to the personal fork and identified by SHA |
-| Hardware acceptance | School-server Codex CLI | Exact feature-branch SHA, persistent caches, two RTX 3090s | GPU artifacts, checksums, acceptance summary | Hardware result passes on the same SHA and clean/dirty state is recorded |
-| Integration | Personal fork | Reviewed code and hardware evidence | PR and merge to personal-fork `main` | Human review is complete |
+- Optimize for a visible, trustworthy profile result rather than a reusable
+  research platform.
+- Use official vLLM serving, NIXL, metrics, cache-reset, and benchmark
+  interfaces wherever they satisfy the experiment contract.
+- Run explicit experiment points. Do not generate a hidden Cartesian product.
+- Keep local contract testing separate from target-machine hardware evidence.
+- Never convert a skipped, unsupported, noisy, OOM, or failed point into a
+  passing result.
+- Preserve unrelated working-tree changes.
+- Keep model caches, raw datasets, and full run directories outside Git.
 
-Local fixture success is not hardware validation. A preflight or GPU failure
-must remain `skipped` or `invalid`; it must not be rewritten as a passing run.
+## Environment boundary
 
-## Remote boundary
+| Environment | Responsibilities | Must not claim |
+| --- | --- | --- |
+| Developer workstation | Adapter/protocol implementation, CPU tests, fixtures, result parsing, documentation | Qwen3.5 1P1D hardware acceptance |
+| Dual-3090 server | NIXL/NUMA smoke, controlled measurements, raw evidence, failure diagnosis | Validation of code other than the checked-out revision |
+| Personal fork | Reviewable commits, branch history, concise evidence summaries | Mutation of `vllm-project/vllm` |
 
-The working remote is the personal fork:
+All Git state changes target the personal fork `ycsxh/vllm`. Upstream is a
+read-only reference. Before a server handoff, record the exact commit and
+working-tree state. A result from an older commit does not validate a newer
+one.
+
+## Phase 0 — Freeze inputs
+
+Before implementing or running a ticket:
+
+1. confirm the authoritative specification has not changed;
+2. record the vLLM commit and dirty state;
+3. pin the full Qwen3.5 model/tokenizer revision;
+4. retain the existing immutable DS4 manifest and file hashes;
+5. record the two-GPU topology and intended NUMA assignment;
+6. choose external directories for model/data caches and run artifacts.
+
+Changing the model, precision, metric definitions, cache protocol, experiment
+axes, or ticket boundaries requires updating the authoritative specification
+before implementation continues.
+
+## Phase 1 — Ticket 2 hardware feasibility
+
+Ticket 2 runs first because Qwen3.5 hybrid state transfer on the target machine
+is the highest-risk assumption.
+
+Build only a fixed-topology launcher based on official NIXL patterns:
+
+- P on GPU 0 and its local CPU NUMA node;
+- D on GPU 1 and its local CPU NUMA node;
+- TP=1 for both roles;
+- identical pinned model, BF16, backend, cache dtype, block size, and cache
+  mode;
+- prefix caching and chunked prefill enabled;
+- NIXL configured to fail closed;
+- bounded readiness, request, shutdown, and cleanup timeouts;
+- complete P, D, and proxy logs.
+
+Run one cold deterministic request and one repeated-prefix request. The smoke
+proves functional transfer; it is not a transfer-performance experiment.
+
+### Gate A — continue or stop
+
+Continue only when:
+
+- Qwen3.5-4B BF16 completes the real P-to-D request;
+- cold and repeated requests produce identical greedy output;
+- D external-transfer tokens and successful transfer metrics increase;
+- the repeated request shows the expected prefix-cache evidence;
+- no hang, OOM, compatibility mismatch, failed transfer, or silent fallback
+  occurs.
+
+If 4B fails, use Qwen3.5-0.8B only to distinguish environment failure from a
+4B/HMA failure. It cannot satisfy Gate A. Stop and review the model/runtime
+decision if the 4B smoke remains invalid.
+
+## Phase 2 — Ticket 1 minimal dataset adapter
+
+After or alongside stabilization of Gate A, implement only the dataset contract
+required by the profile:
+
+1. verify the pinned manifest and raw file hashes;
+2. select assistant turns deterministically;
+3. render prompts with the pinned Qwen3.5 chat template;
+4. calculate input and source-output token lengths using the authoritative
+   longest-common-prefix rule;
+5. write CustomDataset JSONL plus a small provenance/row sidecar.
+
+Do not generate normalized Parquet, trajectory analytics, natural hit-rate
+estimates, teacher-forced tokens, or DS4-to-Qwen vocabulary mappings.
+
+### Gate B — adapter acceptance
+
+- repeated runs with the same inputs are byte-identical;
+- recorded input lengths match prompt token IDs;
+- every row has positive output length and source identity;
+- source, revision, hash, tokenizer, and rendering failures fail closed;
+- focused CPU tests use the existing network-free fixtures.
+
+## Phase 3 — Ticket 3 controlled MVP
+
+Implement one narrow orchestrator around official interfaces. It accepts an
+explicit point file and prepared dataset, starts or validates the fixed 1P1D
+deployment, controls cache state, invokes `vllm bench serve`, and saves raw
+official results plus metrics deltas.
+
+The cache protocol for every measured repetition is:
 
 ```text
-origin    https://github.com/ycsxh/vllm.git
-upstream  https://github.com/vllm-project/vllm.git
+wait idle
+→ reset P and D
+→ warm each nonzero P prefix
+→ wait for transfers
+→ reset D only
+→ snapshot P/D metrics
+→ run the official benchmark
+→ snapshot metrics again
+→ validate and persist the point
 ```
 
-This project may fetch upstream for comparison, but it must not push branches,
-open issues or PRs, or otherwise mutate `vllm-project/vllm`. Feature branches,
-PRs, and merges described here target `origin` only.
+Engine/CUDA Graph warmup happens before measured repetitions. Benchmark
+readiness and implicit warmup requests are disabled so they cannot mutate the
+prepared cache state. P and D run with `VLLM_SERVER_DEV_MODE=1` only in this
+isolated experiment environment to expose the reset endpoint.
 
-Check the boundary before work that uses a remote:
+The first visible point is:
 
-```bash
-git remote -v
-git status --short --branch
+```text
+hit=75%
+P max_num_batched_tokens=4096
+max_concurrency=1
+output_tokens=1
 ```
 
-## Stage 1: local development
+After it succeeds, run the six-point minimum matrix defined in
+[`AUTHORITATIVE_SPEC.md`](AUTHORITATIVE_SPEC.md#92-minimum-credible-matrix).
 
-Start from the personal fork's reviewed baseline and use one feature branch per
-ticket. Preserve unrelated working-tree files.
+### Gate C — MVP acceptance
 
-Inputs:
+- the first point has complete benchmark, metrics, log, configuration, and
+  provenance artifacts;
+- every minimum-matrix point has three measured runs or an explicit retained
+  failure;
+- actual P hit agrees with the aligned plan within one block;
+- 0% points show no unintended local reuse;
+- D external-transfer evidence is present;
+- one-token TTFT points omit TPOT instead of reporting zero;
+- no result depends on a private GPU runner or custom latency calculation.
 
-- the ticket and overall DS4 profile specification;
-- immutable Ticket 01/02 artifacts and revisions;
-- the Ticket 03 container contract and persistent-mount layout; and
-- the personal fork's current `main` commit.
+If the six points do not show interpretable differences, stop before expanding
+the experiment and diagnose construction or measurement semantics.
 
-Responsibilities:
+## Phase 4 — Ticket 4 selected pilot and report
 
-- design the public CLI and artifact seam before implementation;
-- implement and run CPU/static contract tests locally;
-- exercise a deterministic fixture through raw samples, aggregates,
-  provenance, and Markdown rendering;
-- keep hardware-dependent tests gated and make skipped status explicit; and
-- document the exact server command and expected result files.
+Only after Gate C:
 
-The local stage must stay lightweight. It must not load the Qwen model, set
-`DS4_PROFILE_SPINE_GPU_SMOKE=1`, run `profile-spine` without `--print-plan`, or
-attempt to reproduce the dual-GPU acceptance path on CPU. Those commands are
-reserved for Stage 2. During ordinary iteration, run the focused CPU contract
-test or static plan inspection; rerun the broader DS4 suite only when a change
-affects its shared contracts.
+- run the controlled hit-ratio main effect;
+- run the chunk-budget main effect;
+- run concurrency and input/output-length main effects;
+- add only the selected two-factor interactions in the authoritative plan;
+- aggregate three runs, report p50/p90, mean/CV, and label noisy points;
+- generate `summary.csv`, a concise `report.md`, and only necessary plots.
 
-Recommended checks for Ticket 04 are:
+Profiler-enabled runs, if a representative point needs diagnosis, are stored
+separately and excluded from latency statistics.
 
-```bash
-.venv/bin/python -m pytest \
-  --confcutdir=tests/benchmarks/ds4_profile \
-  tests/benchmarks/ds4_profile/test_profile_spine.py -v
+### Gate D — replacement acceptance
 
-.venv/bin/python -m benchmarks.ds4_profile.container.runtime \
-  profile-spine --print-plan
-```
+The human reviewer verifies that every claim traces to official benchmark JSON,
+P/D metric deltas, frozen configuration, and logs. The report must state the
+hardware, topology, model revision, BF16 precision, cache mode, limitations,
+unsupported points, and noisy results.
 
-The lightweight local environment may not contain torch. In that case the CPU
-contract suite remains valid with `--confcutdir`; GPU execution remains a
-school-server responsibility.
+After Gate D passes:
 
-Before handoff, commit the implementation on the feature branch and push that
-branch to `origin`. Record:
+1. promote the new commands into this README and workflow;
+2. retire the legacy `gpu_profile.py` and `profile_spine.py` path;
+3. remove Qwen2.5 mapping, teacher forcing, and old result-contract tests;
+4. move retained historical evidence to an explicitly discarded/archive area;
+5. keep only one documented future workflow.
 
-```bash
-git rev-parse HEAD
-git status --short
-git log -1 --oneline
-```
+## Ticket verification and handoff
 
-The handoff must name the branch and exact commit, list local verification and
-its results, identify every unresolved hardware-only check, and link this
-workflow and the container runbook. Large model caches and raw result Parquet
-remain outside Git.
+Each ticket handoff records:
 
-## Stage 2: school-server acceptance
+- branch, exact commit, and dirty state;
+- local commands run and exact results;
+- unresolved hardware-only checks;
+- target-machine command/configuration when implemented;
+- model and dataset revisions;
+- result path, checksums, and acceptance verdict;
+- failures, reruns, and noise decisions without omission.
 
-The server must execute the exact pushed commit named by the handoff. Fetch the
-personal fork, check out that revision, and verify source state before building:
+Use `.venv/bin/python -m pytest` for focused Python tests and the repository's
+`pre-commit` hooks for changed files. Do not use system Python or bare `pip`.
+Exact focused test commands belong beside the implementation that introduces
+them; this workflow must not advertise nonexistent modules or stale commands.
 
-```bash
-git fetch origin <feature-branch>
-git switch --detach <handoff-commit>
-test "$(git rev-parse HEAD)" = "<handoff-commit>"
-git status --short
-```
+## Failure handling
 
-A clean checkout is recommended. If a diagnostic patch is necessary, the run
-may proceed only when the dirty state and diff are retained in provenance; it
-cannot validate the original clean commit.
+- Cache reset failure: wait for idle and retry a bounded number of times, then
+  retain an invalid repetition.
+- NIXL failure or silent fallback: invalidate the point.
+- OOM: record the point as unsupported; do not silently lower its parameters.
+- Hit mismatch beyond one block: invalidate and diagnose before proceeding.
+- CV above 5%: label noisy and selectively rerun only that point.
+- Partial execution: retain completed artifacts and the exact failed phase.
 
-Inputs:
-
-- the handoff commit and feature-branch name;
-- `container-contract.json` and `profile-spine.json` from that commit;
-- pinned raw, Ticket 01, Ticket 02, and tokenizer mounts;
-- the pinned Qwen model cache; and
-- two exclusive RTX 3090 GPUs with the documented NUMA assignment.
-
-Run the Ticket 03 prechecks, then the Ticket 04 spine through the same image:
-
-```bash
-"${DS4_RUN[@]}" preflight
-"${DS4_RUN[@]}" cpu-dry-run
-"${DS4_RUN[@]}" profile-spine
-```
-
-`profile-spine` prints its run-specific result directory. A complete result
-contains:
-
-- `run-config.json`;
-- `raw_samples.parquet`;
-- `aggregates.parquet`;
-- `provenance.json`; and
-- `result.md`.
-
-`run-config.json` freezes the effective engine, sampling, compile, CUDA Graph,
-cache, model-length, and measurement parameters. `raw_samples.parquet` records
-the actual CUDA Graph runtime mode and prompt/context/cached/scheduled/new-token
-counts; partial failures retain completed rows and the failed point/phase.
-
-Validate the artifact contract independently:
-
-```bash
-"${DS4_RUN[@]}" exec \
-  --output /mnt/ds4/results/ticket-04-validation.json \
-  -- /opt/ds4-profile/bin/python -m benchmarks.ds4_profile.profile_spine \
-  validate --result-dir /mnt/ds4/results/ticket-04/<run-id>
-```
-
-Archive or checksum the result directory outside the repository. The server
-handoff back to local development should include the source SHA and dirty
-state, image ID, exact invocation, result path, validation result, checksums,
-and any rerun/noise decision.
-
-## Stage 3: personal-fork integration
-
-Only hardware-validated work proceeds to a PR against the personal fork's
-`main`. Evidence summaries or runbook corrections may be committed to the same
-feature branch; large results stay in persistent storage and are referenced by
-path and checksum.
-
-The submitting human reviews every changed line, understands the result
-contract, and confirms the test and hardware evidence before merge. The school
-server then returns to the merged personal-fork `main` for the next ticket.
-
-If hardware validation changes code, push the updated feature branch and rerun
-against its new exact commit. Evidence from an older commit does not validate a
-newer one.
+No latency value is an acceptance threshold. Functional evidence and result
+integrity determine whether a stage passes.

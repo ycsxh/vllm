@@ -1,5 +1,10 @@
 # Ticket 03 Handoff
 
+> [!CAUTION]
+> Historical pre-refactor evidence only. Do not use this handoff to start new
+> profile work. See [`AUTHORITATIVE_SPEC.md`](AUTHORITATIVE_SPEC.md) and
+> [`WORKFLOW.md`](WORKFLOW.md) for the replacement Qwen3.5 1P1D path.
+
 ## Purpose
 
 Use this handoff when reviewing the Ticket 03 acceptance archive or starting

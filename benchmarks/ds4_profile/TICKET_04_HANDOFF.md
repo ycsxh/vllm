@@ -1,5 +1,11 @@
 # Ticket 04 school-server handoff
 
+> [!CAUTION]
+> Historical pre-refactor evidence only. Its Qwen2.5 profile-spine commands and
+> acceptance results do not govern new work. See
+> [`AUTHORITATIVE_SPEC.md`](AUTHORITATIVE_SPEC.md) and
+> [`WORKFLOW.md`](WORKFLOW.md).
+
 ## Local development status
 
 The implementation and school-server acceptance stages are complete on branch

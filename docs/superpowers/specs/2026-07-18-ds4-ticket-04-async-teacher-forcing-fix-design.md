@@ -1,5 +1,10 @@
 # DS4 Ticket 04 Async Teacher-Forcing Fix Design
 
+> [!CAUTION]
+> Superseded pre-refactor design retained for historical traceability only.
+> Teacher forcing is excluded from the replacement profile. See
+> [`../../../benchmarks/ds4_profile/AUTHORITATIVE_SPEC.md`](../../../benchmarks/ds4_profile/AUTHORITATIVE_SPEC.md).
+
 ## Incident and scope
 
 The first dual-RTX-3090 run against `c8625b4e9f` exposed a serious correctness

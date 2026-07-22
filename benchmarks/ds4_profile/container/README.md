@@ -1,5 +1,12 @@
 # DS4 school-server container runbook
 
+> [!CAUTION]
+> This runbook belongs to the retained legacy Ticket 03/04 runtime. Do not use
+> it to implement or run the replacement profile. The new runtime contract is
+> governed by [`../AUTHORITATIVE_SPEC.md`](../AUTHORITATIVE_SPEC.md) and
+> [`../WORKFLOW.md`](../WORKFLOW.md); this file remains only until replacement
+> hardware acceptance.
+
 This workflow builds the current personal-fork checkout into a local OCI image.
 It never downloads vLLM source during the build. Docker is the validated primary
 runtime; the Apptainer notes at the end are a conversion route only.
