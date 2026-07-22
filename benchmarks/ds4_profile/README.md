@@ -26,12 +26,12 @@ autoscaling.
 
 ## Implementation tickets
 
-| Ticket | Scope | Exit result |
+| Ticket | Scope | Current gate |
 | --- | --- | --- |
-| 1 | Minimal DS4-to-CustomDataset adapter | Deterministic profile-ready JSONL |
-| 2 | Qwen3.5 NIXL 1P1D feasibility and fixed launcher | Target-machine cold and prefix-hit smoke |
-| 3 | Controlled serving-metric MVP | First visible point and six-point minimum matrix |
-| 4 | Selected measurements and report | Aggregated pilot, concise report, replacement acceptance |
+| 1 | Minimal DS4-to-CustomDataset adapter | Local contract verified; pinned real-tokenizer run pending |
+| 2 | Qwen3.5 NIXL 1P1D feasibility and fixed launcher | Local launcher verified; target-machine Gate A pending |
+| 3 | Controlled serving-metric MVP | Blocked by Tickets 1 and 2 |
+| 4 | Selected measurements and report | Blocked by Ticket 3 Gate C |
 
 Execution is risk-first: Ticket 2 smoke precedes the remaining implementation.
 The detailed gates are in
@@ -41,8 +41,12 @@ The detailed gates are in
 
 - The replacement design is approved.
 - The pinned DS4 snapshot/manifest work remains reusable.
-- The new Qwen3.5 1P1D launcher, minimal adapter, and controlled runner are not
-  implemented yet.
+- The prompt-only adapter and fixed Qwen3.5 1P1D launcher are implemented with
+  network-free CPU contract tests.
+- Ticket 1 still needs an exact-revision Qwen3.5 tokenizer run, and Ticket 2
+  still needs the dual-RTX-3090 Gate A evidence. Neither remote gate is claimed
+  by local tests.
+- The controlled point runner for Ticket 3 is not implemented.
 - Existing Qwen2.5, normalization, workload, container, and profile-spine code
   is legacy implementation retained temporarily for traceability.
 - Legacy code must not be extended or treated as the new experiment path.
@@ -84,6 +88,10 @@ These files are current:
 - [`AUTHORITATIVE_SPEC.md`](AUTHORITATIVE_SPEC.md): normative design and
   acceptance contract;
 - [`WORKFLOW.md`](WORKFLOW.md): execution and handoff sequence;
+- [`TICKET_01_SERVER_HANDOFF.md`](TICKET_01_SERVER_HANDOFF.md): pinned-tokenizer
+  Gate B completion;
+- [`TICKET_02_SERVER_HANDOFF.md`](TICKET_02_SERVER_HANDOFF.md): dual-3090 Gate A
+  completion;
 - this README: project entry and current status.
 
 `HANDOFF.md`, `TICKET_04_HANDOFF.md`, `container/README.md`, and the existing

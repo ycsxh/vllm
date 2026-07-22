@@ -80,6 +80,10 @@ TPOT uses the official request-level definition:
 TPOT is undefined for one-token outputs. TTFT experiments therefore use
 `output_tokens=1`, while decode experiments use multi-token outputs.
 
+`output_tokens` is an explicit experiment-point control. It is not inferred
+from the historical DS4 assistant response. The default decode point uses 128
+output tokens; other values must be written explicitly in the point file.
+
 ### 3.4 Chunked prefill
 
 `max_num_batched_tokens` is the total scheduler token budget per iteration. It
@@ -151,39 +155,42 @@ substitute for the target-machine hardware smoke.
 
 ## 5. DS4 dataset contract
 
-DS4 is an input dataset, not an object of deep workload research.
+DS4 is an input-prompt dataset, not an object of deep workload research.
 
 The adapter consumes the existing pinned manifest and immutable trajectory
-files. One output row represents one selected assistant turn. Rendering and
-length calculation follow this exact contract:
+files. One output row represents the prompt immediately before one selected
+assistant turn. Rendering and input-length calculation follow this exact
+contract:
 
 - the prompt contains all messages before that assistant turn;
 - `prompt_text` is produced with the pinned Qwen3.5 tokenizer's
   `apply_chat_template(messages_before, add_generation_prompt=True,
   tokenize=False)`;
 - `prompt_ids` are the token IDs of `prompt_text` using that same tokenizer;
-- `full_ids` are produced by applying the same chat template to
-  `messages_before + [source_assistant_message]` with
-  `add_generation_prompt=False` and tokenizing the result;
-- `output_tokens` is `len(full_ids) - lcp(prompt_ids, full_ids)`, where `lcp`
-  is the longest common token prefix; the adapter rejects non-positive values;
+- the historical assistant response is not tokenized or used to determine
+  generation length;
+- `output_tokens` comes from the explicit experiment point: TTFT points use 1,
+  while decode points use a positive multi-token value, 128 by default;
 - selection order and any sampling are deterministic;
 - raw DS4 files are never modified.
 
-This rule lets the model's chat template serialize reasoning content and tool
-calls without inventing a second message format. The adapter pins the tokenizer
-revision and records it in provenance.
+This rule lets the model's chat template serialize the prompt messages without
+inventing a second message format. The adapter pins the tokenizer revision and
+records it in provenance. The selected assistant turn is only the deterministic
+cut point that identifies which preceding messages form the prompt.
 
-The profile-ready JSONL uses the official CustomDataset minimum contract:
+The prepared JSONL uses the prompt-only CustomDataset contract:
 
 ```json
-{"prompt":"<rendered completion prompt>","output_tokens":128}
+{"prompt":"<rendered completion prompt>"}
 ```
 
-A sidecar row map may carry `request_id`, source path, task, mode, turn index,
-input token count, output token count, and prompt token IDs. These fields are
-for provenance and controlled-prefix preparation; they do not create a new
-benchmark dataset framework.
+The runner passes the point's output length through
+`--custom-output-len <point.output_tokens>`; the dataset does not carry a
+DS4-derived output length. A sidecar row map may carry `request_id`, source
+path, task, mode, turn index, input token count, and prompt token IDs. These
+fields are for provenance and controlled-prefix preparation; they do not
+create a new benchmark dataset framework.
 
 The adapter does not produce:
 
@@ -192,6 +199,8 @@ The adapter does not produce:
 - LRU or capacity analysis;
 - tool-ready timing;
 - teacher-forced tokens;
+- historical assistant-response token lengths or longest-common-prefix
+  extraction;
 - DS4-to-Qwen vocabulary mappings;
 - Parquet artifacts;
 - semantic or SWE-bench correctness claims.
@@ -204,7 +213,8 @@ design knowledge. It does not require copying test code unchanged.
 ### 6.1 Directly use stable vLLM interfaces
 
 - `vllm bench serve` for request scheduling and metric calculation;
-- CustomDataset JSONL for per-request prompts and output lengths;
+- CustomDataset JSONL for per-request prompts, with output length supplied by
+  each explicit experiment point;
 - OpenAI-compatible completion requests;
 - `NixlConnector` for P-to-D state transfer;
 - `/metrics` for P, D, scheduler, and NIXL counters;
@@ -268,7 +278,7 @@ The intended command shape is deliberately small:
   --model Qwen/Qwen3.5-4B \
   --output-dir <prepared-dir>
 
-benchmarks/ds4_profile/run_pd.sh \
+.venv/bin/python -m benchmarks.ds4_profile.run_pd \
   --config <server-config> \
   --results-dir <run-dir>
 
@@ -338,9 +348,12 @@ because either would alter the prepared cache state:
 
 Prepared prompts already contain the Qwen chat template, so CustomDataset uses
 `--skip-chat-template`. Runs also use `--disable-shuffle`, `--no-oversample`,
-`--custom-output-len -1`, `--ignore-eos`, `--save-result`, and
-`--save-detailed`. The fixed arrival mode is `--request-rate inf`; the runner
-sets `--num-prompts` to the exact prepared-row count.
+`--custom-output-len <point.output_tokens>`, `--ignore-eos`, `--save-result`,
+and `--save-detailed`. The runner requests
+`--percentile-metrics ttft,tpot,itl` and
+`--metric-percentiles 50,90,95,99`. The fixed arrival mode is
+`--request-rate inf`; the runner sets `--num-prompts` to the exact prepared-row
+count.
 
 ## 9. Experiment plan
 
@@ -395,8 +408,9 @@ After the minimum matrix passes:
 - selected chunk-by-hit interaction: hit 0%, 75%, and 90% only;
 - concurrency main effect: 1, 2, 4, and 8 at hit 75% and chunk budget 4096;
 - selected concurrency-by-hit interaction: hit 0%, 75%, and 90% only;
-- input/output lengths: a small deterministic selection from the prepared DS4
-  rows, not a deep DS4 distribution analysis.
+- input lengths: a small deterministic selection from the prepared DS4 rows;
+- output lengths: a small explicit set in the point plan, not values derived
+  from historical DS4 assistant responses.
 
 Unsupported or out-of-memory points remain recorded as such. Parameters are not
 silently reduced to obtain a passing result.
@@ -405,8 +419,8 @@ silently reduced to obtain a passing result.
 
 ### 10.1 Primary reported metrics
 
-- 1P1D TTFT: p50 and p90;
-- request-level TPOT: p50 and p90 for outputs longer than one token;
+- 1P1D TTFT: p50, p90, and p95;
+- request-level TPOT: p50, p90, and p95 for outputs longer than one token;
 - output-token throughput;
 - actual P local cache-hit ratio.
 
@@ -433,6 +447,18 @@ statistics are not required for the main result.
 - CV above 5% is marked noisy; only noisy or failed points are selectively rerun;
 - profiler-enabled runs are stored separately and excluded from the statistics.
 
+### 10.4 Raw request samples
+
+Every measured run preserves the unmodified official JSON produced by
+`vllm bench serve --save-result --save-detailed`. Its aligned per-request arrays
+include input lengths, actual output lengths, TTFT samples, ITL samples, start
+times, generated text, and errors. These arrays are the authoritative raw
+latency samples and must not be replaced by summary-only output.
+
+Request-level TPOT samples and p50/p90/p95 summaries are derived from these raw
+values using the official definition. Derived files remain separate from the
+official detailed JSON so that every aggregate can be audited or recomputed.
+
 ## 11. Four implementation tickets
 
 ### Ticket 1 — Minimal DS4 dataset adapter
@@ -440,10 +466,10 @@ statistics are not required for the main result.
 Build:
 
 - consume the existing pinned manifest and verify file hashes;
-- select assistant turns deterministically;
+- select assistant-turn prompt cut points deterministically;
 - render Qwen3.5 completion prompts;
-- compute input/output token counts;
-- emit CustomDataset JSONL and a small provenance sidecar;
+- compute input token counts;
+- emit prompt-only CustomDataset JSONL and a small provenance sidecar;
 - reuse existing network-free DS4 fixtures.
 
 Do not build trajectory analytics, Parquet schemas, workload planners, or token
@@ -453,7 +479,7 @@ Acceptance:
 
 - the same input/config produces byte-identical outputs;
 - fixture prompt token IDs match recorded input lengths;
-- every row has a positive output length and traceable source identity;
+- every row has a traceable source identity;
 - invalid revision, hash, source format, or tokenizer configuration fails
   closed.
 
@@ -483,7 +509,7 @@ Acceptance:
 
 Build:
 
-- explicit point JSON;
+- explicit point JSON with a positive `output_tokens` value;
 - isolation-block and block-aligned warm-prefix preparation;
 - reset-P/reset-D, warm-P, reset-D, measure protocol;
 - metrics before/after collection and validation;
@@ -501,6 +527,7 @@ Acceptance:
 - measured P hit ratios agree with aligned planned ratios within one cache block;
 - 0% points do not show unintended local prefix reuse;
 - TPOT is omitted rather than reported as zero for one-token TTFT points;
+- non-positive point output lengths are rejected before benchmark execution;
 - every point is reproducible from its frozen inputs and command.
 
 ### Ticket 4 — Selected measurements, report, and replacement acceptance
@@ -509,8 +536,8 @@ Build:
 
 - the selected pilot matrix from section 9.3;
 - three-run aggregation, CV, and noisy-point labeling;
-- `summary.csv`, a concise Markdown report, and only the plots needed to answer
-  the profile questions;
+- `summary.csv` with TTFT/TPOT p50, p90, and p95, a concise Markdown report, and
+  only the plots needed to answer the profile questions;
 - a comparison of default optimized mode with one eager diagnostic point only
   if needed to explain a result;
 - replacement acceptance and the old-path retirement checklist.
@@ -538,11 +565,13 @@ Test observable contracts only:
 - Qwen prompt rendering and token lengths on pinned fixtures;
 - isolation-block encode/decode stability;
 - block alignment and duplicate-point rejection;
-- explicit point parsing without hidden Cartesian expansion;
+- explicit point parsing, including output-length validation, without hidden
+  Cartesian expansion;
 - controlled protocol ordering using fake HTTP endpoints;
 - reset failure, metrics absence, benchmark failure, and partial-artifact
   retention;
-- official result parsing and summary calculations.
+- official result parsing and summary calculations;
+- p50/p90/p95 calculation from preserved detailed request samples.
 
 Do not mock `GPUModelRunner`, construct `SchedulerOutput`, or test private vLLM
 cache-manager behavior.
@@ -567,6 +596,7 @@ The six-point minimum matrix must produce:
 - three measured runs per point or a retained explicit failure;
 - request counts sufficient for the requested percentiles;
 - official detailed benchmark results;
+- raw aligned per-request lengths, TTFT, ITL, generated text, and errors;
 - P/D metrics before and after;
 - actual hit calculation;
 - effective server/client configuration;
@@ -596,7 +626,7 @@ Use a simple filesystem contract:
     <point-id>/
       point.json
       run-01/
-        bench-result.json
+        bench-result.json        # unmodified official detailed result
         p-metrics-before.txt
         p-metrics-after.txt
         d-metrics-before.txt

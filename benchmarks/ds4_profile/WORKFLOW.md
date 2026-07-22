@@ -70,6 +70,12 @@ Build only a fixed-topology launcher based on official NIXL patterns:
 Run one cold deterministic request and one repeated-prefix request. The smoke
 proves functional transfer; it is not a transfer-performance experiment.
 
+The local launcher entry point is
+`.venv/bin/python -m benchmarks.ds4_profile.run_pd`. Its dry-run freezes and
+prints the exact process plan without starting children. Follow
+[`TICKET_02_SERVER_HANDOFF.md`](TICKET_02_SERVER_HANDOFF.md) for the target
+machine run; a local test or dry-run cannot satisfy Gate A.
+
 ### Gate A — continue or stop
 
 Continue only when:
@@ -91,11 +97,15 @@ After or alongside stabilization of Gate A, implement only the dataset contract
 required by the profile:
 
 1. verify the pinned manifest and raw file hashes;
-2. select assistant turns deterministically;
+2. select assistant-turn prompt cut points deterministically;
 3. render prompts with the pinned Qwen3.5 chat template;
-4. calculate input and source-output token lengths using the authoritative
-   longest-common-prefix rule;
-5. write CustomDataset JSONL plus a small provenance/row sidecar.
+4. calculate input token lengths;
+5. write prompt-only CustomDataset JSONL plus a small provenance/row sidecar.
+
+The adapter entry point is
+`.venv/bin/python -m benchmarks.ds4_profile.prepare_dataset`. Follow
+[`TICKET_01_SERVER_HANDOFF.md`](TICKET_01_SERVER_HANDOFF.md) to bind its output
+to the cached, immutable Qwen3.5 tokenizer revision.
 
 Do not generate normalized Parquet, trajectory analytics, natural hit-rate
 estimates, teacher-forced tokens, or DS4-to-Qwen vocabulary mappings.
@@ -104,7 +114,7 @@ estimates, teacher-forced tokens, or DS4-to-Qwen vocabulary mappings.
 
 - repeated runs with the same inputs are byte-identical;
 - recorded input lengths match prompt token IDs;
-- every row has positive output length and source identity;
+- every row has source identity;
 - source, revision, hash, tokenizer, and rendering failures fail closed;
 - focused CPU tests use the existing network-free fixtures.
 
@@ -169,7 +179,7 @@ Only after Gate C:
 - run the chunk-budget main effect;
 - run concurrency and input/output-length main effects;
 - add only the selected two-factor interactions in the authoritative plan;
-- aggregate three runs, report p50/p90, mean/CV, and label noisy points;
+- aggregate three runs, report p50/p90/p95, mean/CV, and label noisy points;
 - generate `summary.csv`, a concise `report.md`, and only necessary plots.
 
 Profiler-enabled runs, if a representative point needs diagnosis, are stored
