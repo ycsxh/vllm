@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import os
+import signal
 import subprocess
 import sys
+import time
 from dataclasses import replace
 
 from benchmarks.ds4_profile import run_pd
@@ -151,6 +154,33 @@ class FakeRuntime:
         self.events.append(("stop", tuple(handles), timeout))
 
 
+def _start_sleeping_process(tmp_path, *, ignore_sigterm=False):
+    signal_setup = (
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN);" if ignore_sigterm else ""
+    )
+    script = (
+        f"import signal,time;{signal_setup}print('ready', flush=True);time.sleep(60)"
+    )
+    runtime = run_pd.SubprocessRuntime()
+    child = runtime.start(
+        run_pd.ProcessSpec(
+            "sleeper",
+            (sys.executable, "-c", script),
+            {},
+            tmp_path / "sleeper.log",
+        )
+    )
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if (tmp_path / "sleeper.log").read_text() == "ready\n":
+            return runtime, child
+        time.sleep(0.01)
+    os.killpg(child.process.pid, signal.SIGKILL)
+    child.process.wait()
+    child.log_file.close()
+    raise AssertionError("sleeper did not become ready")
+
+
 def test_execute_plan_runs_cold_repeat_and_cleans_up(tmp_path):
     runtime = FakeRuntime()
 
@@ -224,3 +254,43 @@ def test_execute_plan_rejects_stale_launcher_artifacts_before_start(tmp_path):
         raise AssertionError("expected stale launcher artifacts to be rejected")
 
     assert runtime.events == []
+
+
+def test_subprocess_runtime_terminates_real_process_group_and_closes_log(tmp_path):
+    runtime, child = _start_sleeping_process(tmp_path)
+
+    runtime.stop([child], timeout=1.0)
+
+    assert child.process.returncode == -signal.SIGTERM
+    assert child.log_file.closed
+
+
+def test_subprocess_runtime_kills_process_group_that_ignores_sigterm(tmp_path):
+    runtime, child = _start_sleeping_process(tmp_path, ignore_sigterm=True)
+
+    runtime.stop([child], timeout=0.4)
+
+    assert child.process.returncode == -signal.SIGKILL
+    assert child.log_file.closed
+
+
+def test_subprocess_runtime_reports_survivor_and_closes_log(tmp_path, monkeypatch):
+    runtime, child = _start_sleeping_process(tmp_path, ignore_sigterm=True)
+    real_killpg = os.killpg
+
+    def suppress_sigkill(process_group, sig):
+        if sig != signal.SIGKILL:
+            real_killpg(process_group, sig)
+
+    monkeypatch.setattr(os, "killpg", suppress_sigkill)
+    try:
+        try:
+            runtime.stop([child], timeout=0.2)
+        except TimeoutError as error:
+            assert "sleeper" in str(error)
+        else:
+            raise AssertionError("expected a surviving process group to be reported")
+        assert child.log_file.closed
+    finally:
+        real_killpg(child.process.pid, signal.SIGKILL)
+        child.process.wait()

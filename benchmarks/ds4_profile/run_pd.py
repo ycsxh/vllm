@@ -220,19 +220,21 @@ class SubprocessRuntime:
 
     def stop(self, handles: list[_Child], timeout: float) -> None:
         """Terminate process groups, then kill groups that miss the deadline."""
-        deadline = time.monotonic() + timeout
+        started_at = time.monotonic()
+        graceful_deadline = started_at + timeout / 2
+        deadline = started_at + timeout
         for handle in reversed(handles):
             if handle.process.poll() is None:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(handle.process.pid, signal.SIGTERM)
         for handle in reversed(handles):
-            remaining = max(0.0, deadline - time.monotonic())
-            try:
+            remaining = max(0.0, graceful_deadline - time.monotonic())
+            with contextlib.suppress(subprocess.TimeoutExpired):
                 handle.process.wait(timeout=remaining)
-            except subprocess.TimeoutExpired:
-                if handle.process.poll() is None:
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(handle.process.pid, signal.SIGKILL)
+        for handle in reversed(handles):
+            if handle.process.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(handle.process.pid, signal.SIGKILL)
         survivors = []
         for handle in reversed(handles):
             if handle.process.poll() is None:

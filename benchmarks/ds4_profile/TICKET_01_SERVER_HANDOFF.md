@@ -5,6 +5,28 @@ tests validate the adapter contract with a deterministic tokenizer double. A
 run against the exact cached Qwen3.5 tokenizer revision is still required
 before Gate B is recorded as complete.
 
+## Local verification
+
+The delivery checkout passed the network-free public-seam tests:
+
+```text
+.venv/bin/python -m pytest \
+  --confcutdir=tests/benchmarks/ds4_profile \
+  tests/benchmarks/ds4_profile/test_prepare_dataset.py -q
+14 passed
+
+.venv/bin/ruff check benchmarks/ds4_profile/prepare_dataset.py \
+  tests/benchmarks/ds4_profile/test_prepare_dataset.py
+All checks passed!
+
+.venv/bin/ruff format --check benchmarks/ds4_profile/prepare_dataset.py \
+  tests/benchmarks/ds4_profile/test_prepare_dataset.py
+2 files already formatted
+```
+
+These results validate the adapter contract with network-free tokenizer
+doubles. They do not replace the immutable real-tokenizer run below.
+
 ## Frozen inputs
 
 Run from a clean checkout of the delivery commit. Replace every placeholder

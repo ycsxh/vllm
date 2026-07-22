@@ -4,6 +4,30 @@ Status: `remote_pending`. No GPU, NIXL, model download, or server process was
 run on the developer workstation. This handoff cannot become
 `remote_verified` until its evidence is bound to the clean delivery commit.
 
+## Local verification
+
+The delivery checkout passed the network-free plan, lifecycle, cleanup, and
+artifact-integrity tests, including real harmless process groups for TERM,
+KILL escalation, survivor reporting, and log closure:
+
+```text
+.venv/bin/python -m pytest \
+  --confcutdir=tests/benchmarks/ds4_profile \
+  tests/benchmarks/ds4_profile/test_run_pd.py -q
+9 passed
+
+.venv/bin/ruff check benchmarks/ds4_profile/run_pd.py \
+  tests/benchmarks/ds4_profile/test_run_pd.py
+All checks passed!
+
+.venv/bin/ruff format --check benchmarks/ds4_profile/run_pd.py \
+  tests/benchmarks/ds4_profile/test_run_pd.py
+2 files already formatted
+```
+
+No local test claims GPU exclusivity, model load, NUMA correctness, CUDA/NIXL
+transfer, metrics deltas, or Gate A.
+
 ## Frozen inputs
 
 Before any live action, replace the two unset values below with full immutable
@@ -49,11 +73,14 @@ test -z "$(git status --porcelain)"
 git remote get-url origin | \
   grep -Ex '(git@github.com:|https://github.com/)ycsxh/vllm(\.git)?'
 mkdir -p "$RUN_DIR/server"
-nvidia-smi --query-gpu=index,name,uuid,pci.bus_id,driver_version \
+nvidia-smi --query-gpu=index,name,uuid,pci.bus_id,driver_version,compute_mode \
   --format=csv,noheader | tee "$RUN_DIR/server/gpus.txt"
 test "$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)" -eq 2
 test "$(nvidia-smi --query-gpu=name --format=csv,noheader | \
   grep -c '^NVIDIA GeForce RTX 3090$')" -eq 2
+nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory \
+  --format=csv,noheader | tee "$RUN_DIR/server/compute-apps-before.txt"
+test ! -s "$RUN_DIR/server/compute-apps-before.txt"
 nvidia-smi topo -m | tee "$RUN_DIR/server/topology.txt"
 numactl --hardware | tee "$RUN_DIR/server/numa.txt"
 lscpu -p=CPU,NODE | tee "$RUN_DIR/server/cpu-node-map.txt"
@@ -66,10 +93,11 @@ done
 ```
 
 Human verification is required before launch: confirm `gpus.txt` lists exactly
-the two exclusive RTX 3090s, and confirm `P_CPUS`/`P_NUMA` and
-`D_CPUS`/`D_NUMA` match the PCI/NUMA locality shown above. The rollback target
-is only the three process groups started by this launcher. `Ctrl-C` and SIGTERM
-invoke bounded group cleanup. Before launch, record this recovery procedure:
+the two RTX 3090s and their compute modes, confirm `compute-apps-before.txt` is
+empty, and confirm `P_CPUS`/`P_NUMA` and `D_CPUS`/`D_NUMA` match the PCI/NUMA
+locality shown above. The rollback target is only the three process groups
+started by this launcher. `Ctrl-C` and SIGTERM invoke bounded group cleanup.
+Before launch, record this recovery procedure:
 
 1. Inspect listeners with `lsof -nP -iTCP:8000 -iTCP:8100 -iTCP:8200
    -sTCP:LISTEN`.
@@ -142,6 +170,9 @@ All checks below are `remote_pending`. A completed request alone is not Gate A.
 set -euo pipefail
 test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
 test -z "$(git status --porcelain)"
+nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory \
+  --format=csv,noheader | tee "$RUN_DIR/server/compute-apps-after.txt"
+test ! -s "$RUN_DIR/server/compute-apps-after.txt"
 jq -e '.outputs_identical == true' "$RUN_DIR/smoke-result.json"
 jq -e '.cold_response.choices[0].text == \
   .repeated_response.choices[0].text' "$RUN_DIR/smoke-result.json"
