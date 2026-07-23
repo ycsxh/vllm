@@ -1,9 +1,9 @@
 # Ticket 1 pinned-tokenizer handoff
 
-Status: `local_contract_verified`, `real_tokenizer_pending`. The network-free
-tests validate the adapter contract with a deterministic tokenizer double. A
-run against the exact cached Qwen3.5 tokenizer revision is still required
-before Gate B is recorded as complete.
+Status: `remote_verified`. Gate B passed against the cached immutable Qwen3.5
+tokenizer revision on delivery commit
+`faa5b9ef8f4a6f93f217f0d6a80035199734a8fa`. The original failed attempt from
+baseline `c27a4fdf8969e2927973197257510c1666f47b64` remains preserved.
 
 ## Local verification
 
@@ -13,7 +13,7 @@ The delivery checkout passed the network-free public-seam tests:
 .venv/bin/python -m pytest \
   --confcutdir=tests/benchmarks/ds4_profile \
   tests/benchmarks/ds4_profile/test_prepare_dataset.py -q
-14 passed
+18 passed
 
 .venv/bin/ruff check benchmarks/ds4_profile/prepare_dataset.py \
   tests/benchmarks/ds4_profile/test_prepare_dataset.py
@@ -26,6 +26,51 @@ All checks passed!
 
 These results validate the adapter contract with network-free tokenizer
 doubles. They do not replace the immutable real-tokenizer run below.
+
+## Completed Gate B evidence
+
+The verified run used:
+
+```text
+delivery commit:
+  faa5b9ef8f4a6f93f217f0d6a80035199734a8fa
+model and tokenizer:
+  Qwen/Qwen3.5-4B
+model/tokenizer revision:
+  851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
+dataset revision:
+  4da61f3d06b48b6817a62b99e9c47035c8e59787
+manifest:
+  /home/lyc/ds4-storage/snapshot/4da61f3d06b48b6817a62b99e9c47035c8e59787/manifest.json
+output A:
+  /home/lyc/ds4-storage/runs/ds4-ticket-01-faa5b9ef8-a
+output B:
+  /home/lyc/ds4-storage/runs/ds4-ticket-01-faa5b9ef8-b
+transcript and checksums:
+  /home/lyc/ds4-storage/runs/ds4-ticket-01-faa5b9ef8-evidence
+```
+
+Both preparations ran with `HF_HUB_OFFLINE=1` and
+`TRANSFORMERS_OFFLINE=1`. The three artifact pairs were byte-identical, all
+handoff `jq` assertions passed, all 667 dataset rows had matching
+`input_tokens` and `prompt_ids` lengths, and no row carried `output_tokens`.
+The retained checksums are:
+
+```text
+c228d3f670b20185a3bde4be08a67b73877179795f1b899ae4f6a23d64371c6a  manifest.json
+18be24424d424fddc7212b15cb6e855f12775f90e0babdfb2f5afaf5746a5df3  provenance.json
+60b716d8f58e8d31f1fba8652a983b16e592c2fdee5a7a8df18b3571a9db01d0  dataset.jsonl
+2fda86403091483296cf87981e675eeac0ee485fa9839fed81bc31dafb2a832d  rows.jsonl
+```
+
+The first real-tokenizer attempt at baseline `c27a4fdf...` failed closed
+because the installed Transformers version did not expose `_commit_hash` on
+the loaded tokenizer. Its transcript remains at
+`/home/lyc/ds4-storage/runs/ds4-ticket-01-c27a4fdf-evidence`. The accepted
+implementation separately resolves the cached `tokenizer_config.json` commit
+and rejects a missing or mismatched revision. A second diagnostic exposed DS4
+tool-call arguments as JSON strings; the adapter now parses only JSON objects
+for Qwen's chat template and rejects malformed or non-object arguments.
 
 ## Frozen inputs
 
