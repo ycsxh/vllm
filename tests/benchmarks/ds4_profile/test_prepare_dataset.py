@@ -267,13 +267,20 @@ def test_default_loader_does_not_rewrite_tokenizer_revision(
 
     class AutoTokenizer:
         @staticmethod
-        def from_pretrained(model: str, *, revision: str) -> UnpinnedTokenizer:
+        def from_pretrained(
+            model: str, *, revision: str, local_files_only: bool
+        ) -> UnpinnedTokenizer:
+            assert local_files_only is True
             return UnpinnedTokenizer()
 
+    utils = types.SimpleNamespace(
+        cached_file=lambda *args, **kwargs: "/cache/snapshots/" + TOKENIZER_REVISION,
+        extract_commit_hash=lambda path, default: TOKENIZER_REVISION,
+    )
     monkeypatch.setitem(
         sys.modules,
         "transformers",
-        types.SimpleNamespace(AutoTokenizer=AutoTokenizer),
+        types.SimpleNamespace(AutoTokenizer=AutoTokenizer, utils=utils),
     )
 
     with pytest.raises(ValueError, match="loaded tokenizer revision"):
@@ -283,6 +290,53 @@ def test_default_loader_does_not_rewrite_tokenizer_revision(
             model="Qwen/Qwen3.5-4B",
             tokenizer_revision=TOKENIZER_REVISION,
         )
+
+
+def test_default_loader_accepts_verified_revision_without_tokenizer_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class TokenizerWithoutCommit(FakeTokenizer):
+        init_kwargs = {}
+
+    class AutoTokenizer:
+        @staticmethod
+        def from_pretrained(
+            model: str, *, revision: str, local_files_only: bool
+        ) -> TokenizerWithoutCommit:
+            assert model == "Qwen/Qwen3.5-4B"
+            assert revision == TOKENIZER_REVISION
+            assert local_files_only is True
+            return TokenizerWithoutCommit()
+
+    def cached_file(
+        model: str,
+        filename: str,
+        *,
+        revision: str,
+        local_files_only: bool,
+    ) -> str:
+        assert model == "Qwen/Qwen3.5-4B"
+        assert filename == "tokenizer_config.json"
+        assert revision == TOKENIZER_REVISION
+        assert local_files_only is True
+        return f"/cache/snapshots/{TOKENIZER_REVISION}/{filename}"
+
+    utils = types.SimpleNamespace(
+        cached_file=cached_file,
+        extract_commit_hash=lambda path, default: TOKENIZER_REVISION,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        types.SimpleNamespace(AutoTokenizer=AutoTokenizer, utils=utils),
+    )
+
+    prepare_dataset(
+        FIXTURE_DIR / "manifest.json",
+        tmp_path / "prepared",
+        model="Qwen/Qwen3.5-4B",
+        tokenizer_revision=TOKENIZER_REVISION,
+    )
 
 
 @pytest.mark.parametrize(
@@ -323,6 +377,57 @@ def test_prepare_dataset_rejects_invalid_rendering(tmp_path: Path) -> None:
             model="Qwen/Qwen3.5-4B",
             tokenizer_revision=TOKENIZER_REVISION,
             tokenizer_loader=lambda model, *, revision: EmptyPromptTokenizer(),
+        )
+    assert not (tmp_path / "prepared").exists()
+
+
+def test_prepare_dataset_normalizes_tool_arguments_for_chat_template(
+    tmp_path: Path,
+) -> None:
+    class QwenCompatibleTokenizer(FakeTokenizer):
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            add_generation_prompt: bool,
+            tokenize: bool,
+        ) -> str:
+            for message in messages:
+                for tool_call in message.get("tool_calls", []):
+                    assert isinstance(tool_call["function"]["arguments"], dict)
+            return super().apply_chat_template(
+                messages,
+                add_generation_prompt=add_generation_prompt,
+                tokenize=tokenize,
+            )
+
+    prepare_dataset(
+        FIXTURE_DIR / "manifest.json",
+        tmp_path / "prepared",
+        model="Qwen/Qwen3.5-4B",
+        tokenizer_revision=TOKENIZER_REVISION,
+        tokenizer_loader=lambda model, *, revision: QwenCompatibleTokenizer(),
+    )
+
+
+@pytest.mark.parametrize("arguments", ["not-json", "[]"])
+def test_prepare_dataset_rejects_invalid_tool_arguments(
+    tmp_path: Path, arguments: str
+) -> None:
+    manifest_path = _copy_snapshot(tmp_path)
+    manifest = json.loads(manifest_path.read_text())
+    source_path = manifest_path.parent / manifest["files"][0]["path"]
+    source = json.loads(source_path.read_text())
+    source["messages"][2]["tool_calls"][0]["function"]["arguments"] = arguments
+    _write_source_and_hash(manifest_path, manifest, source)
+
+    with pytest.raises(ValueError, match="tool arguments"):
+        prepare_dataset(
+            manifest_path,
+            tmp_path / "prepared",
+            model="Qwen/Qwen3.5-4B",
+            tokenizer_revision=TOKENIZER_REVISION,
+            tokenizer_loader=fake_tokenizer_loader,
         )
     assert not (tmp_path / "prepared").exists()
 

@@ -120,9 +120,22 @@ def _validate_source(trajectory: dict[str, Any], source_path: str) -> None:
 
 
 def _load_tokenizer(model: str, *, revision: str) -> Tokenizer:
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer, utils
 
-    return AutoTokenizer.from_pretrained(model, revision=revision)
+    tokenizer_config = utils.cached_file(
+        model,
+        "tokenizer_config.json",
+        revision=revision,
+        local_files_only=True,
+    )
+    resolved_revision = utils.extract_commit_hash(tokenizer_config, None)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model,
+        revision=revision,
+        local_files_only=True,
+    )
+    tokenizer.init_kwargs["_ds4_resolved_revision"] = resolved_revision
+    return tokenizer
 
 
 def _validate_tokenizer(
@@ -130,15 +143,66 @@ def _validate_tokenizer(
 ) -> None:
     if tokenizer.name_or_path != model:
         raise ValueError("loaded tokenizer does not match the requested model")
-    if tokenizer.init_kwargs.get("_commit_hash") != tokenizer_revision:
+    metadata_revision = tokenizer.init_kwargs.get("_commit_hash")
+    resolved_revision = tokenizer.init_kwargs.get(
+        "_ds4_resolved_revision", metadata_revision
+    )
+    if (
+        metadata_revision is not None and metadata_revision != tokenizer_revision
+    ) or resolved_revision != tokenizer_revision:
         raise ValueError(
             "loaded tokenizer revision does not match the requested revision"
         )
 
 
+def _normalize_messages_for_chat_template(
+    messages: list[dict[str, Any]], source_identity: str
+) -> list[dict[str, Any]]:
+    normalized_messages = []
+    for message in messages:
+        normalized_message = dict(message)
+        tool_calls = message.get("tool_calls")
+        if tool_calls is None:
+            normalized_messages.append(normalized_message)
+            continue
+        if not isinstance(tool_calls, list):
+            raise ValueError(f"{source_identity} contains invalid tool calls")
+
+        normalized_tool_calls = []
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                raise ValueError(f"{source_identity} contains an invalid tool call")
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                raise ValueError(f"{source_identity} contains an invalid tool function")
+
+            normalized_function = dict(function)
+            arguments = function.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError as error:
+                    raise ValueError(
+                        f"{source_identity} contains invalid tool arguments"
+                    ) from error
+            if not isinstance(arguments, dict):
+                raise ValueError(
+                    f"{source_identity} tool arguments must be a JSON object"
+                )
+            normalized_function["arguments"] = arguments
+            normalized_tool_call = dict(tool_call)
+            normalized_tool_call["function"] = normalized_function
+            normalized_tool_calls.append(normalized_tool_call)
+
+        normalized_message["tool_calls"] = normalized_tool_calls
+        normalized_messages.append(normalized_message)
+    return normalized_messages
+
+
 def _render_prompt(
     tokenizer: Tokenizer, messages: list[dict[str, Any]], source_identity: str
 ) -> tuple[str, list[int]]:
+    messages = _normalize_messages_for_chat_template(messages, source_identity)
     prompt = tokenizer.apply_chat_template(
         messages, add_generation_prompt=True, tokenize=False
     )
