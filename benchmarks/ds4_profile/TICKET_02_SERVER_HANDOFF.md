@@ -1,8 +1,61 @@
 # Ticket 2 dual-RTX-3090 server handoff
 
-Status: `remote_pending`. No GPU, NIXL, model download, or server process was
-run on the developer workstation. This handoff cannot become
-`remote_verified` until its evidence is bound to the clean delivery commit.
+Status: `remote_failed`. Gate A was executed against clean delivery commit
+`faa5b9ef8f4a6f93f217f0d6a80035199734a8fa` with model and tokenizer revision
+`851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`. The completed smoke could not
+exercise a transferable prefix, so this handoff must not be promoted to
+`remote_verified`.
+
+## Recorded server execution
+
+The accepted live attempt is preserved at:
+
+```text
+/home/lyc/ds4-storage/runs/ds4-ticket-02-faa5b9ef8-attempt-06-live
+```
+
+It used two exclusive RTX 3090s with P on GPU 0/NUMA 0 and D on GPU 1/NUMA 1,
+offline model resolution, BF16, HND, Mamba `align`, block size 128, prefix
+caching, chunked prefill, and fail-closed NIXL loading. The runtime-required
+`VLLM_SSM_CONV_STATE_LAYOUT=DS` and localhost proxy bypass are recorded in
+`server/operator-environment.txt`. Both greedy requests completed with
+identical output, all failed-transfer, failed-notification, and expired-request
+deltas stayed zero, and bounded cleanup left no GPU compute process or fixed
+port listener.
+
+Gate A nevertheless failed. Each request contained 258 prompt tokens, while
+the Qwen3.5 HMA runtime raised the effective attention page to 640 tokens to
+match the Mamba page. The exact runtime lines and counter values are retained
+in `server/gate-a-concise-source-lines.txt`:
+
+```text
+P local_compute:          0 -> 258 -> 516
+P local_cache_hit:        0 ->   0 ->   0
+D local_compute:          0 -> 258 -> 516
+D external_kv_transfer:  0 ->   0 ->   0
+NIXL successful transfer: 0 ->  0 ->   0
+```
+
+The machine-readable verdict is `gate-a-verdict.json`, and
+`evidence-checksums.txt` binds the plan, provenance, responses, verdict, and
+concise source lines. A completed request alone is not Gate A; the positive
+cache-hit and transfer deltas are mandatory.
+
+Earlier failed attempts were retained rather than overwritten:
+
+- `ds4-ticket-02-faa5b9ef8`: source-checkout extension mismatch;
+- `ds4-ticket-02-faa5b9ef8-attempt-02`: missing compatible CUDA compiler
+  visibility for FlashInfer JIT;
+- `ds4-ticket-02-faa5b9ef8-attempt-03-live`: incorrect offline cache binding;
+- `ds4-ticket-02-faa5b9ef8-attempt-04-live`: missing DS SSM conv-state layout;
+- `ds4-ticket-02-faa5b9ef8-attempt-05-live`: localhost readiness probes routed
+  through the host HTTP proxy.
+
+Every failed attempt stopped before sending a smoke request and has its own
+failure and bounded-cleanup evidence. Do not rerun Gate A from
+`faa5b9ef8`: the fixed smoke prompt is shorter than one runtime HMA page. A new
+Ticket 2 delivery commit must make the smoke prompt exceed the effective page
+size and pass the same evidence checks. Do not proceed to Ticket 3.
 
 ## Local verification
 
