@@ -76,12 +76,32 @@ def test_build_plan_freezes_fixed_fail_closed_topology(tmp_path):
 
     assert proxy["command"][:3] == [
         str(tmp_path / ".venv/bin/python"),
-        str(
-            tmp_path
-            / "examples/disaggregated/disaggregated_serving/disagg_proxy_demo.py"
-        ),
-        "--model",
+        "-m",
+        "benchmarks.ds4_profile.pd_proxy",
     ]
+    assert proxy["command"][proxy["command"].index("--prefill-url") + 1] == (
+        "http://127.0.0.1:8100"
+    )
+    assert proxy["command"][proxy["command"].index("--decode-url") + 1] == (
+        "http://127.0.0.1:8200"
+    )
+    assert proxy["command"][proxy["command"].index("--request-timeout") + 1] == (
+        "300.0"
+    )
+    assert plan["smoke_contract"] == {
+        "expected_prompt_tokens": 642,
+        "effective_hma_page_tokens": 640,
+        "expected_remote_tokens": 641,
+    }
+    assert plan["smoke_request"] == {
+        "model": "Qwen/Qwen3.5-4B",
+        "prompt": "Explain deterministic cache transfer in one sentence. " * 80,
+        "max_tokens": 16,
+        "temperature": 0,
+        "seed": 0,
+        "ignore_eos": True,
+        "stream": False,
+    }
 
 
 def test_build_plan_rejects_unpinned_revision_before_execution(tmp_path):
@@ -128,9 +148,10 @@ def test_dry_run_cli_prints_plan_without_starting_processes(tmp_path):
 
 
 class FakeRuntime:
-    def __init__(self, fail_request=False):
+    def __init__(self, fail_request=False, token_count=642):
         self.events = []
         self.fail_request = fail_request
+        self.token_count = token_count
 
     def start(self, process):
         handle = f"handle:{process.name}"
@@ -145,6 +166,9 @@ class FakeRuntime:
         return "# deterministic fake metrics\n"
 
     def post_json(self, url, payload, timeout):
+        if url.endswith("/tokenize"):
+            self.events.append(("tokenize", url, payload))
+            return {"count": self.token_count}
         self.events.append(("post", url, payload["seed"]))
         if self.fail_request:
             raise TimeoutError("injected request timeout")
@@ -187,7 +211,7 @@ def test_execute_plan_runs_cold_repeat_and_cleans_up(tmp_path):
     result = run_pd.execute_plan(run_pd.build_plan(_config(tmp_path)), runtime)
 
     assert result["outputs_identical"] is True
-    assert runtime.events[:5] == [
+    assert runtime.events[:6] == [
         ("start", "prefill"),
         ("start", "decode"),
         (
@@ -201,6 +225,14 @@ def test_execute_plan_runs_cold_repeat_and_cleans_up(tmp_path):
             "decode",
             "http://127.0.0.1:8200/v1/models",
             ("handle:prefill", "handle:decode"),
+        ),
+        (
+            "tokenize",
+            "http://127.0.0.1:8100/tokenize",
+            {
+                "model": "Qwen/Qwen3.5-4B",
+                "prompt": "Explain deterministic cache transfer in one sentence. " * 80,
+            },
         ),
         ("start", "proxy"),
     ]
@@ -217,6 +249,24 @@ def test_execute_plan_runs_cold_repeat_and_cleans_up(tmp_path):
     assert (
         json.loads((tmp_path / "run/smoke-result.json").read_text())["gate_a"]
         == "pending_metric_review"
+    )
+
+
+def test_execute_plan_rejects_unexpected_smoke_prompt_token_count(tmp_path):
+    runtime = FakeRuntime(token_count=641)
+
+    try:
+        run_pd.execute_plan(run_pd.build_plan(_config(tmp_path)), runtime)
+    except RuntimeError as error:
+        assert str(error) == "smoke prompt produced 641 tokens, expected 642"
+    else:
+        raise AssertionError("expected the unsafe smoke prompt to be rejected")
+
+    assert [event for event in runtime.events if event[0] == "post"] == []
+    assert runtime.events[-1] == (
+        "stop",
+        ("handle:prefill", "handle:decode"),
+        30.0,
     )
 
 

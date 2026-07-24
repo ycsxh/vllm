@@ -29,6 +29,10 @@ PORTS = {
 }
 FULL_REVISION = re.compile(r"[0-9a-f]{40}")
 CPU_LIST = re.compile(r"\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*")
+SMOKE_PROMPT = "Explain deterministic cache transfer in one sentence. " * 80
+EXPECTED_SMOKE_PROMPT_TOKENS = 642
+EFFECTIVE_HMA_PAGE_TOKENS = 640
+EXPECTED_REMOTE_TOKENS = 641
 
 
 @dataclass(frozen=True)
@@ -123,6 +127,11 @@ class LaunchPlan:
                 "shutdown": self.config.shutdown_timeout,
             },
             "launcher_invocation": list(self.config.launcher_invocation),
+            "smoke_contract": {
+                "expected_prompt_tokens": EXPECTED_SMOKE_PROMPT_TOKENS,
+                "effective_hma_page_tokens": EFFECTIVE_HMA_PAGE_TOKENS,
+                "expected_remote_tokens": EXPECTED_REMOTE_TOKENS,
+            },
             "smoke_request": self.smoke_request,
             "processes": [process.as_dict() for process in self.processes],
         }
@@ -369,27 +378,23 @@ def build_plan(config: LaunchConfig) -> LaunchPlan:
             ProcessSpec(name, command, environment, server_dir / f"{name[0]}.log")
         )
 
-    proxy_script = (
-        config.repo_root
-        / "examples/disaggregated/disaggregated_serving/disagg_proxy_demo.py"
-    )
     proxy_command = (
         str(config.repo_root / ".venv/bin/python"),
-        str(proxy_script),
-        "--model",
-        MODEL,
-        "--prefill",
-        f"127.0.0.1:{PORTS['prefill']}",
-        "--decode",
-        f"127.0.0.1:{PORTS['decode']}",
+        "-m",
+        "benchmarks.ds4_profile.pd_proxy",
+        "--prefill-url",
+        f"http://127.0.0.1:{PORTS['prefill']}",
+        "--decode-url",
+        f"http://127.0.0.1:{PORTS['decode']}",
         "--port",
         str(PORTS["proxy"]),
+        "--request-timeout",
+        str(config.request_timeout),
     )
     processes.append(ProcessSpec("proxy", proxy_command, {}, server_dir / "proxy.log"))
-    prompt = "Explain deterministic cache transfer in one sentence. " * 32
     smoke_request = {
         "model": MODEL,
-        "prompt": prompt,
+        "prompt": SMOKE_PROMPT,
         "max_tokens": 16,
         "temperature": 0,
         "seed": 0,
@@ -416,12 +421,24 @@ def _generated_text(response: Any) -> str:
         raise RuntimeError("smoke response lacks choices[0].text") from error
 
 
+def _validate_smoke_tokenization(response: Any) -> None:
+    if not isinstance(response, dict) or type(response.get("count")) is not int:
+        raise RuntimeError("smoke tokenization response lacks an integer count")
+    count = response["count"]
+    if count != EXPECTED_SMOKE_PROMPT_TOKENS:
+        raise RuntimeError(
+            f"smoke prompt produced {count} tokens, "
+            f"expected {EXPECTED_SMOKE_PROMPT_TOKENS}"
+        )
+
+
 def _existing_launcher_artifacts(run_dir: Path) -> list[Path]:
     artifacts = [
         run_dir / name
         for name in (
             "launch-plan.json",
             "provenance.json",
+            "smoke-tokenization.json",
             "cold-response.json",
             "repeated-response.json",
             "smoke-result.json",
@@ -491,6 +508,14 @@ def execute_plan(plan: LaunchPlan, runtime: Runtime | None = None) -> dict[str, 
                 plan.config.readiness_timeout,
                 handles,
             )
+
+        tokenization = runtime.post_json(
+            f"http://127.0.0.1:{PORTS['prefill']}/tokenize",
+            {"model": MODEL, "prompt": plan.smoke_request["prompt"]},
+            plan.config.request_timeout,
+        )
+        _write_json(run_dir / "smoke-tokenization.json", tokenization)
+        _validate_smoke_tokenization(tokenization)
 
         handles.append(runtime.start(plan.processes[2]))
         runtime.wait_ready(

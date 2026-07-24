@@ -80,6 +80,23 @@ The session:
 - verified candidate prompt lengths offline with the pinned tokenizer;
 - updated the Ticket 2 server handoff with the corrected diagnosis.
 
+## Implementation Continuation
+
+The corrected Ticket 2 implementation is now locally verified. It did not run
+a live smoke, change Gate A acceptance, start Ticket 3, perform a formal code
+review, push a branch, or mutate the upstream repository.
+
+The launcher now uses a DS4-owned fixed pull proxy. Local loopback fake P/D
+tests prove that P receives the remote-decode control request, valid P metadata
+reaches D unchanged, and missing or malformed metadata stops before D. The
+launcher also uses the 80-repetition prompt, records the 642/640/641 token
+contract, and verifies the pinned server tokenizer reports exactly 642 prompt
+tokens before starting the proxy or sending a smoke request.
+
+Focused launcher/proxy tests passed with `23 passed`; Ruff check and format
+checks passed for the four changed Python files. Exact commands and results are
+recorded in [`TICKET_02_SERVER_HANDOFF.md`](TICKET_02_SERVER_HANDOFF.md).
+
 ## Completed State
 
 Ticket 1 is complete at `e2a2488e6`. Do not reopen it unless new evidence
@@ -207,49 +224,22 @@ a different request. These checks do not replace or change Gate A acceptance.
 
 ## What Is Still Open
 
-No external prerequisite is currently known to be missing. The blocker is that
-the corrected Ticket 2 implementation has not been written or locally tested.
-Specifically:
+No external prerequisite is currently known to be missing. The only remaining
+Ticket 2 action is a new Gate A execution from the clean corrected delivery
+commit. It requires separate operator approval and the unchanged topology,
+identity, evidence, and verdict checks in
+[`TICKET_02_SERVER_HANDOFF.md`](TICKET_02_SERVER_HANDOFF.md).
 
-- the launcher still points at a proxy that discards P transfer metadata;
-- the launcher still constructs the 258-token prompt;
-- there is no regression test proving the P request flags, P response
-  validation, P-to-D metadata propagation, or fail-closed rejection;
-- there is no new clean Ticket 2 delivery commit;
-- Gate A cannot be rerun until that commit exists and receives separate
-  operator approval.
-
-Do not rerun `faa5b9ef8`, and do not start Ticket 3 while Gate A is
-`remote_failed`.
+Do not rerun `faa5b9ef8`, do not run Gate A without that approval, and do not
+start Ticket 3 while the corrected delivery remains `remote_pending`.
 
 ## Recommended Next Session
 
-Start a fresh session and invoke `/implement` for Ticket 2, using this handoff
-as its context. Preserve the user's instruction to skip a formal code review.
-
-Recommended implementation order:
-
-1. Confirm the branch and clean worktree, then re-read the four files listed
-   above.
-2. Add a red local test that exercises a harmless fake P/D pair and proves:
-   - P receives `max_tokens=1` and `do_remote_decode=true`;
-   - the proxy parses P's non-streaming response;
-   - D receives the validated P `kv_transfer_params`;
-   - missing or malformed metadata fails closed without calling D.
-3. Add a red plan/request test for the fixed 642-token prompt contract.
-4. Implement the smallest fixed-topology pull-proxy seam owned by
-   `benchmarks/ds4_profile`, based on the official NIXL pull pattern. Prefer
-   this over altering the shared example proxy.
-5. Point `run_pd.py` at that seam and retain all current bounded readiness,
-   timeout, evidence capture, and cleanup behavior.
-6. Run only focused local tests and linters through the worktree `.venv`.
-7. Create a new clean Ticket 2 delivery commit and update the server handoff
-   with its exact verification results.
-8. Stop and request separate approval before any live Gate A execution.
-
-Do not perform a live smoke merely to discover whether the proxy works. The
-local fake-server test must first make the missing metadata flow reproducible
-and red, then green.
+Wait for explicit Gate A operator approval. After approval, bind
+`EXPECTED_COMMIT` to the clean corrected delivery, re-run the read-only server
+preflight, review the dry-run plan, and execute only the Ticket 2 live procedure
+in the server handoff. Preserve all raw evidence and stop again at the Gate A
+verdict; do not begin Ticket 3 in the same flow.
 
 ## Commands for Resumption
 
@@ -266,17 +256,19 @@ Python:
 ```bash
 .venv/bin/python -m pytest \
   --confcutdir=tests/benchmarks/ds4_profile \
-  tests/benchmarks/ds4_profile/test_run_pd.py -q
+  tests/benchmarks/ds4_profile/test_run_pd.py \
+  tests/benchmarks/ds4_profile/test_pd_proxy.py -q
 
 .venv/bin/ruff check benchmarks/ds4_profile/run_pd.py \
-  tests/benchmarks/ds4_profile/test_run_pd.py
+  benchmarks/ds4_profile/pd_proxy.py \
+  tests/benchmarks/ds4_profile/test_run_pd.py \
+  tests/benchmarks/ds4_profile/test_pd_proxy.py
 
 .venv/bin/ruff format --check benchmarks/ds4_profile/run_pd.py \
-  tests/benchmarks/ds4_profile/test_run_pd.py
+  benchmarks/ds4_profile/pd_proxy.py \
+  tests/benchmarks/ds4_profile/test_run_pd.py \
+  tests/benchmarks/ds4_profile/test_pd_proxy.py
 ```
-
-Extend these commands with the new proxy test file if the implementation uses
-one.
 
 ## Pitfalls Already Encountered
 

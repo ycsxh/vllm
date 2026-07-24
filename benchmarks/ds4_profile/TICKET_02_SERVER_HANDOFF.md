@@ -1,10 +1,56 @@
 # Ticket 2 dual-RTX-3090 server handoff
 
-Status: `remote_failed`. Gate A was executed against clean delivery commit
-`faa5b9ef8f4a6f93f217f0d6a80035199734a8fa` with model and tokenizer revision
-`851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`. The completed smoke could not
-exercise the required cache hit or transfer, so this handoff must not be
-promoted to `remote_verified`.
+Status: corrected delivery `local_verified`, Gate A `remote_pending`. The
+previous Gate A execution against clean delivery commit
+`faa5b9ef8f4a6f93f217f0d6a80035199734a8fa` remains `remote_failed`. It used
+model and tokenizer revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`;
+the completed smoke could not exercise the required cache hit or transfer.
+No corrected live smoke has been run, so this handoff must not be promoted to
+`remote_verified`.
+
+## Corrected local delivery
+
+The corrected Ticket 2 delivery:
+
+- runs the DS4-owned fixed pull proxy instead of the shared example proxy;
+- sends P a non-streaming, one-token request with
+  `do_remote_decode=true`;
+- parses P's response and requires valid pull flags, nonempty remote block
+  IDs, engine and request identity, the fixed P side-channel address, TP=1,
+  and exactly 641 remote tokens;
+- propagates the validated `kv_transfer_params` unchanged to D and never calls
+  D when metadata is missing or malformed;
+- uses the 80-repetition prompt and records the fixed 642-token prompt,
+  640-token effective HMA page, and 641-token remote-prefill contract;
+- asks P's pinned tokenizer endpoint to confirm exactly 642 tokens before the
+  proxy or either smoke request starts, retaining the response as
+  `smoke-tokenization.json`.
+
+The network-free launcher tests and harmless loopback fake P/D tests passed:
+
+```text
+.venv/bin/python -m pytest \
+  --confcutdir=tests/benchmarks/ds4_profile \
+  tests/benchmarks/ds4_profile/test_run_pd.py \
+  tests/benchmarks/ds4_profile/test_pd_proxy.py -q
+23 passed in 19.62s
+
+.venv/bin/ruff check benchmarks/ds4_profile/run_pd.py \
+  benchmarks/ds4_profile/pd_proxy.py \
+  tests/benchmarks/ds4_profile/test_run_pd.py \
+  tests/benchmarks/ds4_profile/test_pd_proxy.py
+All checks passed!
+
+.venv/bin/ruff format --check benchmarks/ds4_profile/run_pd.py \
+  benchmarks/ds4_profile/pd_proxy.py \
+  tests/benchmarks/ds4_profile/test_run_pd.py \
+  tests/benchmarks/ds4_profile/test_pd_proxy.py
+4 files already formatted
+```
+
+These checks do not claim GPU exclusivity, model load, NUMA correctness,
+CUDA/NIXL transfer, metric deltas, or Gate A. A separate operator approval is
+still required before executing the corrected delivery on the target server.
 
 ## Recorded server execution
 
@@ -71,16 +117,16 @@ Earlier failed attempts were retained rather than overwritten:
 Every failed attempt stopped before sending a smoke request and has its own
 failure and bounded-cleanup evidence. Do not rerun Gate A from
 `faa5b9ef8`: its proxy does not pass the P transfer metadata to D, and its fixed
-smoke prompt is shorter than one runtime HMA page. A new Ticket 2 delivery
-commit must:
+smoke prompt is shorter than one runtime HMA page. The corrected Ticket 2
+delivery now:
 
-- send P a non-streaming request with `do_remote_decode=true`;
-- fail closed unless P returns valid, nonempty transfer metadata;
-- pass that metadata to D as its remote-prefill request;
-- use an original prompt of at least 642 tokens for the observed 640-token HMA
+- sends P a non-streaming request with `do_remote_decode=true`;
+- fails closed unless P returns valid, nonempty transfer metadata;
+- passes that metadata to D as its remote-prefill request;
+- uses an original prompt of at least 642 tokens for the observed 640-token HMA
   page, accounting for the Mamba N-1 truncation and the final token that prefix
   caching must recompute for logits;
-- run the unchanged Gate A evidence checks.
+- retains the unchanged Gate A evidence checks.
 
 With the pinned tokenizer revision, repeating
 `Explain deterministic cache transfer in one sentence. ` exactly 80 times
@@ -88,7 +134,7 @@ produces 642 tokens. This is the minimum page-safe form established by offline
 tokenization; it has not been exercised in a live smoke. Do not proceed to
 Ticket 3.
 
-## Local verification
+## Previous delivery local verification
 
 The delivery checkout passed the network-free plan, lifecycle, cleanup, and
 artifact-integrity tests, including real harmless process groups for TERM,
