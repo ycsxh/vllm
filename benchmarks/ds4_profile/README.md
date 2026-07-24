@@ -28,9 +28,9 @@ autoscaling.
 
 | Ticket | Scope | Current gate |
 | --- | --- | --- |
-| 1 | Minimal DS4-to-CustomDataset adapter | Local contract verified; pinned real-tokenizer run pending |
-| 2 | Qwen3.5 NIXL 1P1D feasibility and fixed launcher | Local launcher verified; target-machine Gate A pending |
-| 3 | Controlled serving-metric MVP | Blocked by Tickets 1 and 2 |
+| 1 | Minimal DS4-to-CustomDataset adapter | Gate B `remote_verified` |
+| 2 | Qwen3.5 NIXL 1P1D feasibility and fixed launcher | Gate A `remote_verified` |
+| 3 | Controlled serving-metric MVP | Not started; Gates A and B complete |
 | 4 | Selected measurements and report | Blocked by Ticket 3 Gate C |
 
 Execution is risk-first: Ticket 2 smoke precedes the remaining implementation.
@@ -43,9 +43,9 @@ The detailed gates are in
 - The pinned DS4 snapshot/manifest work remains reusable.
 - The prompt-only adapter and fixed Qwen3.5 1P1D launcher are implemented with
   network-free CPU contract tests.
-- Ticket 1 still needs an exact-revision Qwen3.5 tokenizer run, and Ticket 2
-  still needs the dual-RTX-3090 Gate A evidence. Neither remote gate is claimed
-  by local tests.
+- Ticket 1 passed the exact-revision Qwen3.5 tokenizer Gate B.
+- Ticket 2 passed the dual-RTX-3090 Gate A with positive P cache-hit,
+  D external-transfer, and NIXL-success evidence.
 - The controlled point runner for Ticket 3 is not implemented.
 - Existing Qwen2.5, normalization, workload, container, and profile-spine code
   is legacy implementation retained temporarily for traceability.

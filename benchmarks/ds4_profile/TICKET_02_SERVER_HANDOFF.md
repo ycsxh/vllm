@@ -1,12 +1,51 @@
 # Ticket 2 dual-RTX-3090 server handoff
 
-Status: corrected delivery `local_verified`, Gate A `remote_pending`. The
-previous Gate A execution against clean delivery commit
-`faa5b9ef8f4a6f93f217f0d6a80035199734a8fa` remains `remote_failed`. It used
-model and tokenizer revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`;
-the completed smoke could not exercise the required cache hit or transfer.
-No corrected live smoke has been run, so this handoff must not be promoted to
-`remote_verified`.
+Status: `remote_verified`. Gate A passed against clean corrected delivery
+commit `966efc40d87479ce09079e7dd75ae832f51c79bb` with model and tokenizer
+revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`.
+
+## Completed Gate A evidence
+
+The accepted direct-host run is preserved at:
+
+```text
+/home/lyc/ds4-storage/runs/ds4-ticket-02-966efc40-attempt-07
+```
+
+Its sealed evidence manifest is `evidence-checksums.txt`, with SHA-256:
+
+```text
+85be22b0211f374627baa5862ffa62e4164c65a0bd5ffa032c87af5648bba55d
+```
+
+The preflight and dry-run review passed, the launcher exited zero, and the
+checkout remained clean at the exact delivery commit. The target contained
+exactly two exclusive RTX 3090 GPUs, with P on GPU 0/NUMA 0 and D on
+GPU 1/NUMA 1. No container was used.
+
+The runtime confirmed the fixed 642/640/641 contract:
+
+```text
+tokenized prompt:                    642
+effective HMA page:                  640
+cold remote-transfer tokens:         641
+P local_cache_hit:           0 -> 0 -> 640
+D external_kv_transfer:      0 -> 641 -> 642
+D NIXL transfer count:       0 -> 1 -> 2
+D NIXL bytes count:          0 -> 1 -> 2
+```
+
+Both 16-token greedy responses were identical. Failed-transfer,
+failed-notification, and expired-request deltas remained zero. The forbidden
+failure-pattern scan was empty, and bounded cleanup left no GPU compute
+process, relevant survivor, or listener on ports 8000, 8100, 8200, 5600, or
+5601.
+
+The host's pip-provided CUDA 13 runtime contained `libcudart.so.13` but not the
+unversioned linker name required by FlashInfer's `-lcudart` JIT link. The
+accepted run used a run-local `libcudart.so` compatibility symlink under its
+`server/` evidence directory and added that directory to `LIBRARY_PATH`. No
+source, acceptance criterion, or `.venv` file was changed.
 
 ## Corrected local delivery
 
@@ -48,13 +87,13 @@ All checks passed!
 4 files already formatted
 ```
 
-These checks do not claim GPU exclusivity, model load, NUMA correctness,
-CUDA/NIXL transfer, metric deltas, or Gate A. A separate operator approval is
-still required before executing the corrected delivery on the target server.
+These local checks did not themselves claim GPU exclusivity, model load, NUMA
+correctness, CUDA/NIXL transfer, metric deltas, or Gate A. The completed
+attempt-07 evidence above supplies those hardware-only results.
 
-## Recorded server execution
+## Historical failed server execution
 
-The accepted live attempt is preserved at:
+The pre-correction live attempt is preserved at:
 
 ```text
 /home/lyc/ds4-storage/runs/ds4-ticket-02-faa5b9ef8-attempt-06-live
@@ -128,11 +167,15 @@ delivery now:
   caching must recompute for logits;
 - retains the unchanged Gate A evidence checks.
 
-With the pinned tokenizer revision, repeating
-`Explain deterministic cache transfer in one sentence. ` exactly 80 times
-produces 642 tokens. This is the minimum page-safe form established by offline
-tokenization; it has not been exercised in a live smoke. Do not proceed to
-Ticket 3.
+With the pinned tokenizer revision, repeating the following string exactly
+80 times, including its trailing space, produces 642 tokens:
+
+```text
+"Explain deterministic cache transfer in one sentence. "
+```
+
+This is the minimum page-safe form established by offline tokenization and
+confirmed by the accepted attempt-07 live smoke.
 
 ## Previous delivery local verification
 
@@ -238,7 +281,10 @@ Before launch, record this recovery procedure:
    `kill -KILL -- -<PGID>` only for a group that remains.
 4. Re-run the listener check and preserve all logs. Never use a broad `pkill`.
 
-## Plan and live run
+## Historical plan and live-run procedure
+
+The accepted attempt-07 already completed this procedure. Do not rerun Gate A
+only to reproduce the documentation closeout.
 
 First generate and review the deterministic plan. Dry-run creates no run
 directory and launches nothing.
@@ -294,7 +340,8 @@ cleanup.
 
 ## Gate A evidence and verdict
 
-All checks below are `remote_pending`. A completed request alone is not Gate A.
+The accepted attempt-07 applied the semantic checks below and is
+`remote_verified`. A completed request alone is not Gate A.
 
 ```bash
 set -euo pipefail
@@ -308,7 +355,7 @@ jq -e '.cold_response.choices[0].text == \
   .repeated_response.choices[0].text' "$RUN_DIR/smoke-result.json"
 jq -e '.compatibility.nixl_load_failure_policy == "fail"' \
   "$RUN_DIR/launch-plan.json"
-! grep -Eai 'out of memory|compatib.*mismatch|failed transfer|recomput' \
+! grep -Eai 'out of memory|compatib.*mismatch|failed transfer|recompute|recomputing' \
   "$RUN_DIR/server/p.log" "$RUN_DIR/server/d.log" \
   "$RUN_DIR/server/proxy.log"
 grep -F 'Num successful transfers=' "$RUN_DIR/server/p.log" \
