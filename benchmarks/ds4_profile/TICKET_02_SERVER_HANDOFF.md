@@ -3,8 +3,8 @@
 Status: `remote_failed`. Gate A was executed against clean delivery commit
 `faa5b9ef8f4a6f93f217f0d6a80035199734a8fa` with model and tokenizer revision
 `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`. The completed smoke could not
-exercise a transferable prefix, so this handoff must not be promoted to
-`remote_verified`.
+exercise the required cache hit or transfer, so this handoff must not be
+promoted to `remote_verified`.
 
 ## Recorded server execution
 
@@ -23,9 +23,26 @@ identical output, all failed-transfer, failed-notification, and expired-request
 deltas stayed zero, and bounded cleanup left no GPU compute process or fixed
 port listener.
 
-Gate A nevertheless failed. Each request contained 258 prompt tokens, while
-the Qwen3.5 HMA runtime raised the effective attention page to 640 tokens to
-match the Mamba page. The exact runtime lines and counter values are retained
+Gate A nevertheless failed for two independent reasons.
+
+First, each request contained 258 prompt tokens, while the Qwen3.5 HMA runtime
+raised the effective attention page to 640 tokens to match the Mamba page. No
+complete page could be prefix-cached, so the repeated P request could not
+produce the required local cache hit.
+
+Second, the fixed pull proxy did not initiate the NIXL control flow. It changed
+the P request only by setting `max_tokens=1`, discarded the P response body,
+and forwarded the original request to D. It therefore neither marked P with
+`do_remote_decode=true` nor passed P's returned `kv_transfer_params` and remote
+block coordinates to D. The NIXL scheduler requires those parameters before it
+enters the remote-prefill path. This explains why both roles computed all 258
+tokens locally while successful and failed transfer counters all remained
+zero: no transfer was attempted.
+
+The short prompt alone does not explain D's zero transfer count. The remote
+decode lifecycle supports a partial-block transfer, while the NIXL HMA path
+uses N-1 tokens on both sides. The missing proxy control flow prevented even
+that partial transfer. The exact runtime lines and counter values are retained
 in `server/gate-a-concise-source-lines.txt`:
 
 ```text
@@ -53,9 +70,23 @@ Earlier failed attempts were retained rather than overwritten:
 
 Every failed attempt stopped before sending a smoke request and has its own
 failure and bounded-cleanup evidence. Do not rerun Gate A from
-`faa5b9ef8`: the fixed smoke prompt is shorter than one runtime HMA page. A new
-Ticket 2 delivery commit must make the smoke prompt exceed the effective page
-size and pass the same evidence checks. Do not proceed to Ticket 3.
+`faa5b9ef8`: its proxy does not pass the P transfer metadata to D, and its fixed
+smoke prompt is shorter than one runtime HMA page. A new Ticket 2 delivery
+commit must:
+
+- send P a non-streaming request with `do_remote_decode=true`;
+- fail closed unless P returns valid, nonempty transfer metadata;
+- pass that metadata to D as its remote-prefill request;
+- use an original prompt of at least 642 tokens for the observed 640-token HMA
+  page, accounting for the Mamba N-1 truncation and the final token that prefix
+  caching must recompute for logits;
+- run the unchanged Gate A evidence checks.
+
+With the pinned tokenizer revision, repeating
+`Explain deterministic cache transfer in one sentence. ` exactly 80 times
+produces 642 tokens. This is the minimum page-safe form established by offline
+tokenization; it has not been exercised in a live smoke. Do not proceed to
+Ticket 3.
 
 ## Local verification
 

@@ -1,83 +1,309 @@
-# Ticket 03 Handoff
+# Replacement Tickets 1–2 Session Handoff
 
-> [!CAUTION]
-> Historical pre-refactor evidence only. Do not use this handoff to start new
-> profile work. See [`AUTHORITATIVE_SPEC.md`](AUTHORITATIVE_SPEC.md) and
-> [`WORKFLOW.md`](WORKFLOW.md) for the replacement Qwen3.5 1P1D path.
+> [!IMPORTANT]
+> Continue only Ticket 2. Do not use the discarded Ticket 04 or the earlier
+> 12-ticket design, do not start Ticket 3, and do not mutate
+> `vllm-project/vllm`. All repository mutations belong only in the personal
+> fork `ycsxh/vllm`.
 
-## Purpose
+## Read First
 
-Use this handoff when reviewing the Ticket 03 acceptance archive or starting
-follow-up DS4 profiling work. Ticket 03 itself is complete; no required work is
-left open.
+Read these files in order before making changes:
 
-## Current State
+1. [`AUTHORITATIVE_SPEC.md`](AUTHORITATIVE_SPEC.md)
+2. [`WORKFLOW.md`](WORKFLOW.md)
+3. [`TICKET_02_SERVER_HANDOFF.md`](TICKET_02_SERVER_HANDOFF.md)
+4. this handoff
 
-- Personal-fork PR: <https://github.com/ycsxh/vllm/pull/1> (`MERGED`)
-- Validated feature head: `c855e2bd31ff31f0d6b6123f550b000f24b7386e`
-- Personal-fork merge commit: `64f86cd0f51d69289753bbad8da0bfda6929d2f1`
-- The remote feature branch was deleted after merge.
-- The submitting human reviewed the Ticket 03 change before merge.
+The active worktree is:
 
-The implementation, test commands, acceptance summary, AI-assistance
-disclosure, and duplicate-work result are already captured in PR #1. Do not
-duplicate them here.
-
-## Authoritative References
-
-- Runtime contract and operations:
-  [`container/README.md`](container/README.md)
-- DS4 workflow overview: [`README.md`](README.md)
-- Cross-machine development and acceptance stages: [`WORKFLOW.md`](WORKFLOW.md)
-- Container implementation: [`container/`](container/)
-- Focused tests: [`../../tests/benchmarks/ds4_profile/`](../../tests/benchmarks/ds4_profile/)
-- Target-server evidence: `$HOME/ds4-storage/results/`
-- Downloadable review archive:
-  `$HOME/ds4-storage/ticket-03-review-20260717.tar.gz`
-
-Review the archive in this order:
-
-1. `results/gpu-smoke.json`
-2. `results/cpu-dry-run/provenance.json`
-3. `results/cache-model.json`
-4. `results/image-inspect.json`
-5. `results/pull-request.md`
-
-The remaining JSON, Parquet, and build-log files provide supporting detail.
-
-## Decisions and Constraints
-
-- Python setup, tests, linting, and runtime validation were isolated in
-  containers; the host/base Python environment was not modified.
-- The existing compiled base image was reused. Only the thin Ticket 03 overlay
-  was rebuilt after runtime fixes.
-- Model and runtime caches remain outside the repository under
-  `$HOME/ds4-storage`.
-- Do not write to `vllm-project/vllm` or to Hugging Face data sources. PR #1
-  and its merge exist only in `ycsxh/vllm`.
-- The PR's red `pre-run-check` was an inherited contributor-governance gate:
-  it required a maintainer label or four prior merged PRs. It was not a code or
-  test failure. Satisfying it in the fork would have queued an unavailable
-  upstream self-hosted runner, so the verified container and dual-GPU evidence
-  was used instead.
-
-## Next Session
-
-For evidence review:
-
-```bash
-sha256sum "$HOME/ds4-storage/ticket-03-review-20260717.tar.gz"
-tar -tzf "$HOME/ds4-storage/ticket-03-review-20260717.tar.gz"
+```text
+/home/lyc/vllm/.worktrees/ticket-01-02
 ```
 
-Extract the archive outside the repository. If follow-up implementation is
-requested, start a new branch from the personal fork's current `main`, preserve
-the fixed revisions and provenance contract, and rerun only the acceptance
-level affected by the change.
+The active branch is:
 
-## Suggested Skills
+```text
+codex/ds4-replacement-tickets-1-2-continued
+```
 
-- `superpowers:brainstorming`: invoke before designing new behavior or changing
-  the DS4 profiling contract.
-- `handoff`: invoke at the end of a future session to compact only new context
-  and reference this document instead of repeating it.
+The original replacement-ticket base is:
+
+```text
+c27a4fdf8969e2927973197257510c1666f47b64
+```
+
+The branch state immediately before this diagnostic checkpoint was:
+
+```text
+f0bc15f09  [Benchmarks] Record Ticket 2 Gate A failure
+e2a2488e6  [Benchmarks] Record Ticket 1 tokenizer acceptance
+faa5b9ef8  [Benchmarks] Validate real Qwen tokenizer inputs
+c27a4fdf8  [Benchmarks] Harden DS4 server handoffs
+```
+
+Use `git rev-parse HEAD` to identify the diagnostic checkpoint containing this
+document. The worktree was clean before its documentation changes.
+
+## What This Session Did
+
+This session performed a read-only diagnosis of the accepted Ticket 2 Gate A
+attempt and then recorded the result. It did not run another live smoke, change
+the acceptance criteria, modify runtime code, perform a formal code review,
+push a branch, or operate on the upstream repository.
+
+The accepted live attempt remains at:
+
+```text
+/home/lyc/ds4-storage/runs/ds4-ticket-02-faa5b9ef8-attempt-06-live
+```
+
+It used:
+
+- delivery commit
+  `faa5b9ef8f4a6f93f217f0d6a80035199734a8fa`;
+- model and tokenizer revision
+  `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`;
+- Qwen/Qwen3.5-4B BF16;
+- P on GPU 0/NUMA 0 and D on GPU 1/NUMA 1;
+- HND BF16 cache, Mamba/GDN `align`, configured block size 128, prefix
+  caching, chunked prefill, and fail-closed NIXL loading.
+
+The session:
+
+- re-read the authoritative spec, workflow, Ticket 2 handoff, launcher, proxy,
+  NIXL scheduler, HMA block-size logic, prefix-cache logic, and focused unit
+  tests;
+- checked the preserved responses, logs, metric snapshots, and concise source
+  lines;
+- separated the cache-page failure from the P-to-D control-plane failure;
+- verified candidate prompt lengths offline with the pinned tokenizer;
+- updated the Ticket 2 server handoff with the corrected diagnosis.
+
+## Completed State
+
+Ticket 1 is complete at `e2a2488e6`. Do not reopen it unless new evidence
+invalidates its recorded tokenizer acceptance.
+
+Ticket 2 has a valid retained failed Gate A result:
+
+```text
+P local_compute:           0 -> 258 -> 516
+P local_cache_hit:         0 ->   0 ->   0
+D local_compute:           0 -> 258 -> 516
+D external_kv_transfer:   0 ->   0 ->   0
+NIXL successful transfer: 0 ->   0 ->   0
+```
+
+Both client-visible responses completed and were identical. Failed-transfer,
+failed-notification, and expired-request deltas remained zero. Bounded cleanup
+left no GPU compute process or fixed-port listener. Gate A remains
+`remote_failed`; a completed deterministic request is not sufficient.
+
+The handoff does **not** normatively require a 258-token prompt. That length was
+an implementation detail in `faa5b9ef8`, indirectly frozen for that approved
+run by the exact delivery commit and dry-run plan. The specification requires a
+cold request, an identical repeated-prefix request, positive P local-hit
+evidence, positive D external-transfer and NIXL-success evidence, and zero
+failure/fallback evidence.
+
+## Corrected Root Cause
+
+Gate A failed for two independent reasons.
+
+### 1. No complete HMA-aligned cache page
+
+The launcher used:
+
+```python
+prompt = "Explain deterministic cache transfer in one sentence. " * 32
+```
+
+The pinned tokenizer produced 258 tokens. Both server logs reported that the
+runtime raised the effective attention block/page size from the configured 128
+tokens to 640 tokens to match the Mamba page. Prefix-cache hashes are produced
+only at complete boundaries, so 258 tokens cannot create a 640-token cached
+page. This fully explains why repeated P local-cache hits stayed zero.
+
+### 2. The proxy never initiated pull transfer
+
+`examples/disaggregated/disaggregated_serving/disagg_proxy_demo.py`:
+
+- copied the client request for P and changed only `max_tokens` to 1;
+- did not add `kv_transfer_params` with `do_remote_decode=true`;
+- drained and discarded the P response body;
+- sent the original request to D without P's returned
+  `kv_transfer_params`, `remote_block_ids`, or NIXL coordinates.
+
+The NIXL scheduler enters its remote-prefill path only when the request carries
+the required flags and metadata. The observed full local compute on both roles,
+combined with zero successful **and** zero failed transfers, is the expected
+result when no transfer is scheduled.
+
+Do not attribute D's zero transfer count solely to the short prompt. The
+remote-decode lifecycle supports partial-block transfer, and NIXL's HMA path
+uses N-1 prompt tokens. The missing control-plane handoff prevented even that
+partial attempt.
+
+## Minimum Safe Request Design
+
+For the fixed revision and the observed 640-token HMA page, the smallest
+original prompt that can both form one complete P page and expose that page as
+a repeated P cache hit is 642 tokens:
+
+```text
+P HMA prefill truncation:       N - 1
+last token reserved for logits: N - 2
+required complete page:         N - 2 >= 640
+minimum original prompt:        N >= 642
+```
+
+Offline checks with the pinned tokenizer produced:
+
+```text
+32 repetitions -> 258 tokens
+79 repetitions -> 634 tokens
+80 repetitions -> 642 tokens
+95 repetitions -> 762 tokens
+96 repetitions -> 770 tokens
+```
+
+The minimum request therefore uses:
+
+```python
+prompt = "Explain deterministic cache transfer in one sentence. " * 80
+```
+
+Keep the client request deterministic:
+
+```json
+{
+  "max_tokens": 16,
+  "temperature": 0,
+  "seed": 0,
+  "ignore_eos": true,
+  "stream": false
+}
+```
+
+The fixed pull flow must:
+
+1. send P the same prompt with `max_tokens=1` and
+   `do_remote_decode=true`;
+2. parse P's non-streaming response;
+3. fail closed if P's transfer metadata, remote block IDs, engine identity,
+   host, or port is absent or invalid;
+4. attach the validated P transfer metadata to D's request;
+5. send D the original prompt and original deterministic generation settings.
+
+For 642 original tokens, P prefill sees 641 after the HMA N-1 truncation, one
+complete 640-token page plus one tail token. On the repeated P request, exactly
+one 640-token page is eligible for a local cache hit. D's cold request has 641
+external-token candidates in the HMA N-1 remote-prefill path.
+
+Treat the pinned offline token count and the observed effective runtime page as
+fail-closed preconditions. If either changes, stop rather than silently choosing
+a different request. These checks do not replace or change Gate A acceptance.
+
+## What Is Still Open
+
+No external prerequisite is currently known to be missing. The blocker is that
+the corrected Ticket 2 implementation has not been written or locally tested.
+Specifically:
+
+- the launcher still points at a proxy that discards P transfer metadata;
+- the launcher still constructs the 258-token prompt;
+- there is no regression test proving the P request flags, P response
+  validation, P-to-D metadata propagation, or fail-closed rejection;
+- there is no new clean Ticket 2 delivery commit;
+- Gate A cannot be rerun until that commit exists and receives separate
+  operator approval.
+
+Do not rerun `faa5b9ef8`, and do not start Ticket 3 while Gate A is
+`remote_failed`.
+
+## Recommended Next Session
+
+Start a fresh session and invoke `/implement` for Ticket 2, using this handoff
+as its context. Preserve the user's instruction to skip a formal code review.
+
+Recommended implementation order:
+
+1. Confirm the branch and clean worktree, then re-read the four files listed
+   above.
+2. Add a red local test that exercises a harmless fake P/D pair and proves:
+   - P receives `max_tokens=1` and `do_remote_decode=true`;
+   - the proxy parses P's non-streaming response;
+   - D receives the validated P `kv_transfer_params`;
+   - missing or malformed metadata fails closed without calling D.
+3. Add a red plan/request test for the fixed 642-token prompt contract.
+4. Implement the smallest fixed-topology pull-proxy seam owned by
+   `benchmarks/ds4_profile`, based on the official NIXL pull pattern. Prefer
+   this over altering the shared example proxy.
+5. Point `run_pd.py` at that seam and retain all current bounded readiness,
+   timeout, evidence capture, and cleanup behavior.
+6. Run only focused local tests and linters through the worktree `.venv`.
+7. Create a new clean Ticket 2 delivery commit and update the server handoff
+   with its exact verification results.
+8. Stop and request separate approval before any live Gate A execution.
+
+Do not perform a live smoke merely to discover whether the proxy works. The
+local fake-server test must first make the missing metadata flow reproducible
+and red, then green.
+
+## Commands for Resumption
+
+```bash
+cd /home/lyc/vllm/.worktrees/ticket-01-02
+git status --short --branch
+git log -5 --oneline --decorate
+git rev-parse HEAD
+```
+
+After implementation, run focused validation through `.venv`, never system
+Python:
+
+```bash
+.venv/bin/python -m pytest \
+  --confcutdir=tests/benchmarks/ds4_profile \
+  tests/benchmarks/ds4_profile/test_run_pd.py -q
+
+.venv/bin/ruff check benchmarks/ds4_profile/run_pd.py \
+  tests/benchmarks/ds4_profile/test_run_pd.py
+
+.venv/bin/ruff format --check benchmarks/ds4_profile/run_pd.py \
+  tests/benchmarks/ds4_profile/test_run_pd.py
+```
+
+Extend these commands with the new proxy test file if the implementation uses
+one.
+
+## Pitfalls Already Encountered
+
+- Source-checkout extension mismatch can fail before any smoke request.
+- FlashInfer JIT requires compatible CUDA compiler visibility.
+- Offline model resolution must bind the exact cached snapshot, not merely set
+  offline environment flags.
+- Qwen3.5 requires `VLLM_SSM_CONV_STATE_LAYOUT=DS` for this path.
+- Local readiness and request traffic must bypass the host HTTP proxy.
+- The configured 128-token block is not the effective HMA page; the observed
+  runtime page is 640 tokens.
+- A successful HTTP response and identical output do not prove P-to-D
+  transfer.
+- Zero failed-transfer counters do not prove success when the transfer was
+  never scheduled.
+- Generic partial-block transfer support means `prompt < page` cannot by
+  itself explain D external-transfer staying zero.
+- The exact approved delivery commit is immutable for a live attempt. A prompt
+  or proxy change requires a new delivery commit and a new approval.
+- Preserve every failed attempt under its own run directory and retain bounded
+  cleanup evidence; never overwrite original evidence.
+
+## Hard Boundaries
+
+- Do not modify the authoritative acceptance criteria.
+- Do not make or claim a live verification without separate approval.
+- Do not begin Ticket 3.
+- Do not perform a formal code review in this flow.
+- Do not push or create GitHub state unless explicitly requested.
+- Never mutate `vllm-project/vllm`; the upstream repository is read-only.
