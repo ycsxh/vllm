@@ -92,8 +92,9 @@ These files are current:
   Gate B completion;
 - [`TICKET_02_SERVER_HANDOFF.md`](TICKET_02_SERVER_HANDOFF.md): dual-3090 Gate A
   completion;
+- [`HANDOFF.md`](HANDOFF.md): current Tickets 1–2 closeout state;
 - this README: project entry and current status.
 
-`HANDOFF.md`, `TICKET_04_HANDOFF.md`, `container/README.md`, and the existing
-Ticket 01-04 implementation document only the pre-refactor path. They are
-historical evidence, not instructions for the replacement.
+`TICKET_04_HANDOFF.md`, `container/README.md`, and the existing Ticket 01-04
+implementation document only the pre-refactor path. They are historical
+evidence, not instructions for the replacement.
