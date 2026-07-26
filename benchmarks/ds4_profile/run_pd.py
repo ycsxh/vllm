@@ -8,7 +8,6 @@ import argparse
 import contextlib
 import json
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -18,6 +17,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
+
+import regex as re
 
 MODEL = "Qwen/Qwen3.5-4B"
 PORTS = {
@@ -33,6 +34,28 @@ SMOKE_PROMPT = "Explain deterministic cache transfer in one sentence. " * 80
 EXPECTED_SMOKE_PROMPT_TOKENS = 642
 EFFECTIVE_HMA_PAGE_TOKENS = 640
 EXPECTED_REMOTE_TOKENS = 641
+RUNTIME_ENVIRONMENT_NAMES = (
+    "CUDA_HOME",
+    "FLASHINFER_JIT_VERBOSE",
+    "HF_HOME",
+    "HF_HUB_CACHE",
+    "HF_HUB_OFFLINE",
+    "LD_LIBRARY_PATH",
+    "LIBRARY_PATH",
+    "NO_PROXY",
+    "PATH",
+    "TRANSFORMERS_OFFLINE",
+    "VLLM_SSM_CONV_STATE_LAYOUT",
+    "no_proxy",
+)
+FIXED_RUNTIME_ENVIRONMENT = {
+    "FLASHINFER_JIT_VERBOSE": "0",
+    "HF_HUB_OFFLINE": "1",
+    "NO_PROXY": "127.0.0.1,localhost",
+    "TRANSFORMERS_OFFLINE": "1",
+    "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
+    "no_proxy": "127.0.0.1,localhost",
+}
 
 
 @dataclass(frozen=True)
@@ -50,6 +73,7 @@ class LaunchConfig:
     repo_root: Path
     vllm_commit: str
     vllm_dirty: bool
+    runtime_environment: dict[str, str]
     readiness_timeout: float = 900.0
     request_timeout: float = 300.0
     shutdown_timeout: float = 30.0
@@ -177,12 +201,10 @@ class SubprocessRuntime:
         """Start one child in a new process session with a dedicated log."""
         process.log_path.parent.mkdir(parents=True, exist_ok=True)
         log_file = process.log_path.open("ab", buffering=0)
-        environment = os.environ.copy()
-        environment.update(process.environment)
         try:
             child = subprocess.Popen(
                 process.command,
-                env=environment,
+                env=process.environment,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
@@ -308,6 +330,31 @@ def _server_command(config: LaunchConfig, port: int, role: str) -> tuple[str, ..
 
 def build_plan(config: LaunchConfig) -> LaunchPlan:
     """Build the one supported 1P1D plan and reject unfrozen inputs."""
+    required_environment = set(RUNTIME_ENVIRONMENT_NAMES)
+    missing_environment = sorted(
+        required_environment - config.runtime_environment.keys()
+    )
+    if missing_environment:
+        names = ", ".join(missing_environment)
+        raise ValueError(f"missing required runtime environment: {names}")
+    unexpected_environment = sorted(
+        config.runtime_environment.keys() - required_environment
+    )
+    if unexpected_environment:
+        names = ", ".join(unexpected_environment)
+        raise ValueError(f"unexpected runtime environment: {names}")
+    empty_environment = sorted(
+        name for name, value in config.runtime_environment.items() if not value
+    )
+    if empty_environment:
+        names = ", ".join(empty_environment)
+        raise ValueError(f"empty required runtime environment: {names}")
+    for name, expected in FIXED_RUNTIME_ENVIRONMENT.items():
+        actual = config.runtime_environment[name]
+        if actual != expected:
+            raise ValueError(
+                f"{name} must be {expected!r} for the fixed runtime, got {actual!r}"
+            )
     for name, value in (
         ("model revision", config.model_revision),
         ("tokenizer revision", config.tokenizer_revision),
@@ -337,6 +384,7 @@ def build_plan(config: LaunchConfig) -> LaunchPlan:
 
     server_dir = config.run_dir / "server"
     common_environment = {
+        **config.runtime_environment,
         "UCX_NET_DEVICES": "all",
         "VLLM_KV_CACHE_LAYOUT": "HND",
         "VLLM_SERVER_DEV_MODE": "1",
@@ -391,7 +439,14 @@ def build_plan(config: LaunchConfig) -> LaunchPlan:
         "--request-timeout",
         str(config.request_timeout),
     )
-    processes.append(ProcessSpec("proxy", proxy_command, {}, server_dir / "proxy.log"))
+    processes.append(
+        ProcessSpec(
+            "proxy",
+            proxy_command,
+            dict(config.runtime_environment),
+            server_dir / "proxy.log",
+        )
+    )
     smoke_request = {
         "model": MODEL,
         "prompt": SMOKE_PROMPT,
@@ -643,6 +698,11 @@ def main(argv: list[str] | None = None) -> int:
         repo_root=repo_root,
         vllm_commit=commit,
         vllm_dirty=dirty,
+        runtime_environment={
+            name: os.environ[name]
+            for name in RUNTIME_ENVIRONMENT_NAMES
+            if name in os.environ
+        },
         readiness_timeout=args.readiness_timeout,
         request_timeout=args.request_timeout,
         shutdown_timeout=args.shutdown_timeout,

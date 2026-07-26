@@ -4,10 +4,11 @@
 import argparse
 import hashlib
 import json
-import re
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Protocol
+
+import regex as re
 
 DATASET_REPO_ID = "Yi30/deepseek-v4-swebench-trajectories"
 DATASET_REPO_TYPE = "model"
