@@ -132,6 +132,11 @@ def test_explicit_plan_prepares_unique_block_aligned_requests(tmp_path: Path) ->
         for request in prepared.requests
     )
     assert all(
+        FakeTokenizer().encode(request.warm_prefix, add_special_tokens=False)
+        == request.prompt_ids[: request.planned_cached_tokens + 1]
+        for request in prepared.requests
+    )
+    assert all(
         FakeTokenizer().encode(request.prompt, add_special_tokens=False)
         == request.prompt_ids
         for request in prepared.requests
@@ -369,6 +374,33 @@ def test_derived_ttft_result_omits_tpot_for_one_token_outputs(
     assert derived["p90_ttft_ms"] == pytest.approx(117.1)
     assert derived["p95_ttft_ms"] == pytest.approx(118.05)
     assert not any("tpot" in key for key in derived)
+
+
+def test_nonzero_planned_hit_rejects_zero_observed_hits(tmp_path: Path) -> None:
+    prepared_dir = tmp_path / "prepared"
+    _write_prepared(prepared_dir)
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(
+        json.dumps({"schema_version": 1, "points": [_point()]}), encoding="utf-8"
+    )
+    prepared = prepare_point(
+        load_experiment_plan(plan_path)[0],
+        prepared_dir,
+        block_size=8,
+        cache_alignment_tokens=16,
+        tokenizer=FakeTokenizer(),
+    )
+
+    with pytest.raises(ValueError, match="nonzero planned P cache hit"):
+        derive_run_result(
+            prepared,
+            _official_result(output_tokens=1),
+            p_metrics_before=_metrics(),
+            p_metrics_after=_metrics(local_compute=460),
+            d_metrics_before=_metrics(),
+            d_metrics_after=_metrics(external_kv_transfer=460),
+            block_size=16,
+        )
 
 
 def test_derived_decode_result_uses_official_request_level_tpot_definition(

@@ -382,9 +382,11 @@ def prepare_point(
         )
         warm_prefix = None
         if planned_cached_tokens:
+            # Disaggregated P computes prompt_len - 1 tokens. Include the next
+            # measured token so the planned prefix fills its final cache page.
             warm_prefix = _decode_exact(
                 tokenizer,
-                combined_ids[:planned_cached_tokens],
+                combined_ids[: planned_cached_tokens + 1],
                 "warm prefix",
             )
         requests.append(
@@ -609,6 +611,8 @@ def derive_run_result(
     if expected_cached == 0:
         if p_local_hit != 0:
             raise ValueError("0% point observed an unintended local cache hit")
+    elif p_local_hit == 0:
+        raise ValueError("nonzero planned P cache hit was not observed")
     elif abs(p_local_hit - expected_cached) > block_size * len(point.requests):
         raise ValueError(
             "actual P cache hit differs by more than one block per request"
