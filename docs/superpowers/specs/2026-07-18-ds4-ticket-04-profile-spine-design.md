@@ -1,5 +1,10 @@
 # DS4 Ticket 04 Profile Spine Design
 
+> [!CAUTION]
+> Superseded pre-refactor design retained for historical traceability only.
+> It must not guide new profile work. See
+> [`../../../benchmarks/ds4_profile/AUTHORITATIVE_SPEC.md`](../../../benchmarks/ds4_profile/AUTHORITATIVE_SPEC.md).
+
 ## Scope
 
 Ticket 04 establishes one thin, complete path from a prepared Ticket 02
