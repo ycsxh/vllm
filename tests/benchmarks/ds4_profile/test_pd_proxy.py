@@ -15,16 +15,20 @@ import pytest
 
 
 @contextlib.contextmanager
-def _fake_completion_server(response_payload):
+def _fake_completion_server(response_payload, content_type="application/json"):
     requests = []
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             content_length = int(self.headers["Content-Length"])
             requests.append(json.loads(self.rfile.read(content_length)))
-            body = json.dumps(response_payload).encode()
+            body = (
+                response_payload
+                if isinstance(response_payload, bytes)
+                else json.dumps(response_payload).encode()
+            )
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -56,6 +60,21 @@ def _post_json(url, payload):
             return response.status, json.loads(response.read())
     except urllib.error.HTTPError as error:
         return error.code, json.loads(error.read())
+
+
+def _post_raw(url, payload):
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=5) as response:
+            return response.status, response.headers.get_content_type(), response.read()
+    except urllib.error.HTTPError as error:
+        return error.code, error.headers.get_content_type(), error.read()
 
 
 @contextlib.contextmanager
@@ -211,6 +230,81 @@ def test_proxy_accepts_variable_positive_remote_tokens_when_not_pinned(
 
     assert status == 200
     assert response == decode_response
+    assert decode_requests == [
+        {**request_payload, "kv_transfer_params": kv_transfer_params}
+    ]
+
+
+def test_proxy_streams_decode_response_and_omits_prefill_stream_options(
+    free_tcp_port,
+):
+    kv_transfer_params = {
+        "do_remote_prefill": True,
+        "do_remote_decode": False,
+        "remote_block_ids": [[11, 12], [21]],
+        "remote_engine_id": "prefill-engine",
+        "remote_request_id": "prefill-request",
+        "remote_host": "127.0.0.1",
+        "remote_port": 5600,
+        "tp_size": 1,
+        "remote_num_tokens": 4095,
+    }
+    prefill_response = {
+        "choices": [{"text": ""}],
+        "kv_transfer_params": kv_transfer_params,
+    }
+    decode_chunks = [
+        b'data: {"choices":[{"text":"deterministic output"}]}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    request_payload = {
+        "model": "Qwen/Qwen3.5-4B",
+        "prompt": "controlled serving point prompt",
+        "max_tokens": 1,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+
+    with (
+        _fake_completion_server(prefill_response) as (
+            prefill_port,
+            prefill_requests,
+        ),
+        _fake_completion_server(b"".join(decode_chunks), "text/event-stream") as (
+            decode_port,
+            decode_requests,
+        ),
+        _proxy_process(
+            prefill_port,
+            decode_port,
+            free_tcp_port,
+            expected_remote_tokens=None,
+        ),
+    ):
+        status, content_type, response = _post_raw(
+            f"http://127.0.0.1:{free_tcp_port}/v1/completions",
+            request_payload,
+        )
+
+    assert status == 200
+    assert content_type == "text/event-stream"
+    assert response == b"".join(decode_chunks)
+    assert prefill_requests == [
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "prompt": "controlled serving point prompt",
+            "max_tokens": 1,
+            "stream": False,
+            "kv_transfer_params": {
+                "do_remote_decode": True,
+                "do_remote_prefill": False,
+                "remote_engine_id": None,
+                "remote_block_ids": None,
+                "remote_host": None,
+                "remote_port": None,
+            },
+        }
+    ]
     assert decode_requests == [
         {**request_payload, "kv_transfer_params": kv_transfer_params}
     ]

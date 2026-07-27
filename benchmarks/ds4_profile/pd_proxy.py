@@ -5,12 +5,13 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import AsyncIterator
 from typing import Any
 
 import aiohttp
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 PREFILL_KV_TRANSFER_PARAMS = {
     "do_remote_decode": True,
@@ -84,6 +85,29 @@ async def _post_json(
         return await response.json(content_type=None)
 
 
+async def _post_stream(
+    url: str, payload: dict[str, Any], request_timeout: float
+) -> StreamingResponse:
+    timeout = aiohttp.ClientTimeout(total=request_timeout)
+    session = aiohttp.ClientSession(timeout=timeout)
+    try:
+        response = await session.post(url, json=payload)
+        response.raise_for_status()
+    except BaseException:
+        await session.close()
+        raise
+
+    async def generate() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in response.content.iter_any():
+                yield chunk
+        finally:
+            response.release()
+            await session.close()
+
+    return StreamingResponse(generate(), media_type=response.content_type)
+
+
 def create_app(
     prefill_url: str,
     decode_url: str,
@@ -100,7 +124,7 @@ def create_app(
         return {"prefill": prefill_url, "decode": decode_url}
 
     @app.post("/v1/completions")
-    async def create_completion(request: Request) -> JSONResponse:
+    async def create_completion(request: Request) -> Response:
         request_payload = await request.json()
         prefill_payload = {
             **request_payload,
@@ -108,6 +132,7 @@ def create_app(
             "stream": False,
             "kv_transfer_params": PREFILL_KV_TRANSFER_PARAMS,
         }
+        prefill_payload.pop("stream_options", None)
         prefill_response = await _post_json(
             prefill_endpoint, prefill_payload, request_timeout
         )
@@ -127,6 +152,8 @@ def create_app(
             **request_payload,
             "kv_transfer_params": kv_transfer_params,
         }
+        if decode_payload.get("stream") is True:
+            return await _post_stream(decode_endpoint, decode_payload, request_timeout)
         decode_response = await _post_json(
             decode_endpoint, decode_payload, request_timeout
         )
