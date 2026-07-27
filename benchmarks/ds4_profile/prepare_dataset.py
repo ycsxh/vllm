@@ -326,7 +326,6 @@ def main(
     *,
     tokenizer_loader: TokenizerLoader = _load_tokenizer,
 ) -> None:
-    """Run the minimal DS4 dataset adapter CLI."""
     parser = argparse.ArgumentParser(
         description="Prepare pinned DS4 prompts as a CustomDataset JSONL."
     )

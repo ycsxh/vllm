@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 from dataclasses import replace
+from pathlib import Path
 
 from benchmarks.ds4_profile import run_pd
 
@@ -307,26 +308,44 @@ def _start_sleeping_process(tmp_path, *, ignore_sigterm=False):
         "signal.signal(signal.SIGTERM, signal.SIG_IGN);" if ignore_sigterm else ""
     )
     script = (
-        f"import signal,time;{signal_setup}print('ready', flush=True);time.sleep(60)"
+        f"import os,signal,time;{signal_setup}"
+        "print(os.getpid(), flush=True);time.sleep(60)"
     )
+    log_path = tmp_path / "sleeper.log"
     runtime = run_pd.SubprocessRuntime()
     child = runtime.start(
         run_pd.ProcessSpec(
             "sleeper",
             (sys.executable, "-c", script),
             {},
-            tmp_path / "sleeper.log",
+            log_path,
         )
     )
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
-        if (tmp_path / "sleeper.log").read_text() == "ready\n":
-            return runtime, child
+        text = log_path.read_text().strip()
+        if text:
+            return runtime, child, int(text), log_path
         time.sleep(0.01)
-    os.killpg(child.process.pid, signal.SIGKILL)
-    child.process.wait()
-    child.log_file.close()
+    runtime.stop([child], timeout=1)
     raise AssertionError("sleeper did not become ready")
+
+
+def _assert_process_gone(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return
+    raise AssertionError(f"process {pid} is still running")
+
+
+def _assert_log_closed(log_path):
+    for fd_path in Path("/proc/self/fd").iterdir():
+        try:
+            if fd_path.resolve() == log_path.resolve():
+                raise AssertionError(f"{log_path} is still open as {fd_path}")
+        except FileNotFoundError:
+            continue
 
 
 def test_subprocess_runtime_uses_the_serialized_environment_only(tmp_path, monkeypatch):
@@ -451,25 +470,29 @@ def test_execute_plan_rejects_stale_launcher_artifacts_before_start(tmp_path):
 
 
 def test_subprocess_runtime_terminates_real_process_group_and_closes_log(tmp_path):
-    runtime, child = _start_sleeping_process(tmp_path)
+    runtime, child, pid, log_path = _start_sleeping_process(tmp_path)
 
     runtime.stop([child], timeout=1.0)
 
-    assert child.process.returncode == -signal.SIGTERM
-    assert child.log_file.closed
+    _assert_process_gone(pid)
+    _assert_log_closed(log_path)
 
 
 def test_subprocess_runtime_kills_process_group_that_ignores_sigterm(tmp_path):
-    runtime, child = _start_sleeping_process(tmp_path, ignore_sigterm=True)
+    runtime, child, pid, log_path = _start_sleeping_process(
+        tmp_path, ignore_sigterm=True
+    )
 
     runtime.stop([child], timeout=0.4)
 
-    assert child.process.returncode == -signal.SIGKILL
-    assert child.log_file.closed
+    _assert_process_gone(pid)
+    _assert_log_closed(log_path)
 
 
 def test_subprocess_runtime_reports_survivor_and_closes_log(tmp_path, monkeypatch):
-    runtime, child = _start_sleeping_process(tmp_path, ignore_sigterm=True)
+    runtime, child, pid, log_path = _start_sleeping_process(
+        tmp_path, ignore_sigterm=True
+    )
     real_killpg = os.killpg
 
     def suppress_sigkill(process_group, sig):
@@ -484,7 +507,7 @@ def test_subprocess_runtime_reports_survivor_and_closes_log(tmp_path, monkeypatc
             assert "sleeper" in str(error)
         else:
             raise AssertionError("expected a surviving process group to be reported")
-        assert child.log_file.closed
+        _assert_log_closed(log_path)
     finally:
-        real_killpg(child.process.pid, signal.SIGKILL)
-        child.process.wait()
+        real_killpg(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)

@@ -137,7 +137,6 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the proxy CLI."""
     args = _parser().parse_args(argv)
     uvicorn.run(
         create_app(args.prefill_url, args.decode_url, args.request_timeout),
