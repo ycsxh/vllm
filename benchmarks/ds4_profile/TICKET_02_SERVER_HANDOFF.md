@@ -1,7 +1,7 @@
 # Ticket 2 dual-RTX-3090 server handoff
 
 Status: `remote_verified`. Gate A passed against clean corrected delivery
-commit `966efc40d87479ce09079e7dd75ae832f51c79bb` with model and tokenizer
+commit `4415bbe8f04c11c5beab7057effe208659f1b91f` with model and tokenizer
 revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`.
 
 ## Completed Gate A evidence
@@ -9,13 +9,13 @@ revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`.
 The accepted direct-host run is preserved at:
 
 ```text
-/home/lyc/ds4-storage/runs/ds4-ticket-02-966efc40-attempt-07
+/home/lyc/ds4-storage/runs/ds4-ticket-02-4415bbe8f-attempt-08
 ```
 
 Its sealed evidence manifest is `evidence-checksums.txt`, with SHA-256:
 
 ```text
-85be22b0211f374627baa5862ffa62e4164c65a0bd5ffa032c87af5648bba55d
+7a1168096fcb8aeeef364dec5c20689aa92fa43d404c6ca5285cb3edbe6545e0
 ```
 
 The preflight and dry-run review passed, the launcher exited zero, and the
@@ -63,16 +63,20 @@ The corrected Ticket 2 delivery:
   640-token effective HMA page, and 641-token remote-prefill contract;
 - asks P's pinned tokenizer endpoint to confirm exactly 642 tokens before the
   proxy or either smoke request starts, retaining the response as
-  `smoke-tokenization.json`.
+  `smoke-tokenization.json`;
+- serializes the complete allowlisted child environment in the dry-run plan
+  and passes that exact environment to P, D, and the proxy without ambient
+  inheritance.
 
-The network-free launcher tests and harmless loopback fake P/D tests passed:
+The final combined focused suite passed:
 
 ```text
 .venv/bin/python -m pytest \
   --confcutdir=tests/benchmarks/ds4_profile \
+  tests/benchmarks/ds4_profile/test_prepare_dataset.py \
   tests/benchmarks/ds4_profile/test_run_pd.py \
   tests/benchmarks/ds4_profile/test_pd_proxy.py -q
-23 passed in 19.62s
+49 passed in 19.68s
 
 .venv/bin/ruff check benchmarks/ds4_profile/run_pd.py \
   benchmarks/ds4_profile/pd_proxy.py \
@@ -89,7 +93,7 @@ All checks passed!
 
 These local checks did not themselves claim GPU exclusivity, model load, NUMA
 correctness, CUDA/NIXL transfer, metric deltas, or Gate A. The completed
-attempt-07 evidence above supplies those hardware-only results.
+attempt-08 evidence above supplies those hardware-only results.
 
 ## Historical failed server execution
 
@@ -175,7 +179,7 @@ With the pinned tokenizer revision, repeating the following string exactly
 ```
 
 This is the minimum page-safe form established by offline tokenization and
-confirmed by the accepted attempt-07 live smoke.
+confirmed by the accepted attempt-08 live smoke.
 
 ## Previous delivery local verification
 
@@ -215,7 +219,18 @@ export MODEL_REVISION='<QWEN3_5_4B_COMMIT_40_HEX>'
 export TOKENIZER_REVISION="$MODEL_REVISION"
 export REPO_ROOT='/srv/vllm'
 export RUN_DIR='/srv/vllm-runs/ds4-ticket-02'
-export HF_HOME='/srv/model-cache/huggingface'
+export HF_HOME='/srv/model-cache'
+export HF_HUB_CACHE="$HF_HOME/huggingface"
+export CUDA_HOME='<CUDA_13_ROOT>'
+export PATH="$CUDA_HOME/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib"
+export LIBRARY_PATH="$RUN_DIR/server/cuda-link-compat:$CUDA_HOME/lib"
+export FLASHINFER_JIT_VERBOSE=0
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export VLLM_SSM_CONV_STATE_LAYOUT=DS
+export NO_PROXY='127.0.0.1,localhost'
+export no_proxy='127.0.0.1,localhost'
 export P_CPUS='<GPU0_LOCAL_CPU_LIST>'
 export P_NUMA='<GPU0_NUMA_NODE>'
 export D_CPUS='<GPU1_LOCAL_CPU_LIST>'
@@ -246,6 +261,9 @@ test -z "$(git status --porcelain)"
 git remote get-url origin | \
   grep -Ex '(git@github.com:|https://github.com/)ycsxh/vllm(\.git)?'
 mkdir -p "$RUN_DIR/server"
+mkdir -p "$RUN_DIR/server/cuda-link-compat"
+ln -s "$CUDA_HOME/lib/libcudart.so.13" \
+  "$RUN_DIR/server/cuda-link-compat/libcudart.so"
 nvidia-smi --query-gpu=index,name,uuid,pci.bus_id,driver_version,compute_mode \
   --format=csv,noheader | tee "$RUN_DIR/server/gpus.txt"
 test "$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)" -eq 2
@@ -281,9 +299,9 @@ Before launch, record this recovery procedure:
    `kill -KILL -- -<PGID>` only for a group that remains.
 4. Re-run the listener check and preserve all logs. Never use a broad `pkill`.
 
-## Historical plan and live-run procedure
+## Accepted plan and live-run procedure
 
-The accepted attempt-07 already completed this procedure. Do not rerun Gate A
+The accepted attempt-08 already completed this procedure. Do not rerun Gate A
 only to reproduce the documentation closeout.
 
 First generate and review the deterministic plan. Dry-run creates no run
@@ -315,8 +333,6 @@ the external cache, prevent implicit network access and run:
 
 ```bash
 set -euo pipefail
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
 .venv/bin/python -m benchmarks.ds4_profile.run_pd \
   --model-revision "$MODEL_REVISION" \
   --tokenizer-revision "$TOKENIZER_REVISION" \
@@ -340,7 +356,7 @@ cleanup.
 
 ## Gate A evidence and verdict
 
-The accepted attempt-07 applied the semantic checks below and is
+The accepted attempt-08 applied the semantic checks below and is
 `remote_verified`. A completed request alone is not Gate A.
 
 ```bash

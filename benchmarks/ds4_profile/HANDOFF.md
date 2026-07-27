@@ -11,7 +11,7 @@ Replacement Tickets 1 and 2 are complete:
 The accepted Ticket 2 runtime delivery is:
 
 ```text
-966efc40d87479ce09079e7dd75ae832f51c79bb
+4415bbe8f04c11c5beab7057effe208659f1b91f
 ```
 
 The active worktree and branch are:
@@ -28,7 +28,7 @@ starting the controlled serving-metric work in Ticket 3.
 ## Ticket 1 completion
 
 Ticket 1 passed Gate B against delivery commit
-`faa5b9ef8f4a6f93f217f0d6a80035199734a8fa`.
+`4415bbe8f04c11c5beab7057effe208659f1b91f`.
 
 Frozen inputs:
 
@@ -46,25 +46,30 @@ dataset revision:
 The two offline preparations were byte-identical. All 667 selected rows had
 matching `input_tokens` and `prompt_ids` lengths, no row carried
 `output_tokens`, and the provenance named the immutable tokenizer revision.
+The final outputs were also byte-identical to the earlier accepted output.
+The evidence directory is
+`/home/lyc/ds4-storage/runs/ds4-ticket-01-4415bbe8f-evidence`; its
+`evidence-checksums.txt` SHA-256 is
+`ede34a26e8e289569fa70db61534f6d8509ade1be608df2dc437d249b54ad9aa`.
 The complete paths, checksums, and validation commands remain in
 [`TICKET_01_SERVER_HANDOFF.md`](TICKET_01_SERVER_HANDOFF.md).
 
 ## Ticket 2 completion
 
 Ticket 2 passed Gate A against the clean corrected delivery commit
-`966efc40d87479ce09079e7dd75ae832f51c79bb` with model and tokenizer revision
+`4415bbe8f04c11c5beab7057effe208659f1b91f` with model and tokenizer revision
 `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`.
 
 The accepted evidence directory is:
 
 ```text
-/home/lyc/ds4-storage/runs/ds4-ticket-02-966efc40-attempt-07
+/home/lyc/ds4-storage/runs/ds4-ticket-02-4415bbe8f-attempt-08
 ```
 
 The sealed evidence manifest is `evidence-checksums.txt`, with SHA-256:
 
 ```text
-85be22b0211f374627baa5862ffa62e4164c65a0bd5ffa032c87af5648bba55d
+7a1168096fcb8aeeef364dec5c20689aa92fa43d404c6ca5285cb3edbe6545e0
 ```
 
 The run used:
@@ -140,8 +145,9 @@ They record:
 - missing unversioned CUDA runtime linker name;
 - a dry-run artifact collision before live execution.
 
-These failures are historical evidence. Attempt-07 supersedes their Gate A
-status without erasing their diagnostic value.
+These failures and the earlier accepted attempt-07 are historical evidence.
+Attempt-08 validates the final runtime delivery without erasing their
+diagnostic value.
 
 ## Local verification
 
@@ -154,7 +160,7 @@ The combined focused suite passes:
   tests/benchmarks/ds4_profile/test_run_pd.py \
   tests/benchmarks/ds4_profile/test_pd_proxy.py -q
 
-41 passed
+49 passed
 ```
 
 Ruff check and format validation pass for the adapter, launcher, proxy, and

@@ -2,18 +2,21 @@
 
 Status: `remote_verified`. Gate B passed against the cached immutable Qwen3.5
 tokenizer revision on delivery commit
-`faa5b9ef8f4a6f93f217f0d6a80035199734a8fa`. The original failed attempt from
-baseline `c27a4fdf8969e2927973197257510c1666f47b64` remains preserved.
+`4415bbe8f04c11c5beab7057effe208659f1b91f`. The original failed attempt from
+baseline `c27a4fdf8969e2927973197257510c1666f47b64` and the earlier accepted
+`faa5b9ef8` evidence remain preserved.
 
 ## Local verification
 
-The delivery checkout passed the network-free public-seam tests:
+The final delivery checkout passed the combined focused suite:
 
 ```text
 .venv/bin/python -m pytest \
   --confcutdir=tests/benchmarks/ds4_profile \
-  tests/benchmarks/ds4_profile/test_prepare_dataset.py -q
-18 passed
+  tests/benchmarks/ds4_profile/test_prepare_dataset.py \
+  tests/benchmarks/ds4_profile/test_run_pd.py \
+  tests/benchmarks/ds4_profile/test_pd_proxy.py -q
+49 passed
 
 .venv/bin/ruff check benchmarks/ds4_profile/prepare_dataset.py \
   tests/benchmarks/ds4_profile/test_prepare_dataset.py
@@ -33,7 +36,7 @@ The verified run used:
 
 ```text
 delivery commit:
-  faa5b9ef8f4a6f93f217f0d6a80035199734a8fa
+  4415bbe8f04c11c5beab7057effe208659f1b91f
 model and tokenizer:
   Qwen/Qwen3.5-4B
 model/tokenizer revision:
@@ -43,17 +46,25 @@ dataset revision:
 manifest:
   /home/lyc/ds4-storage/snapshot/4da61f3d06b48b6817a62b99e9c47035c8e59787/manifest.json
 output A:
-  /home/lyc/ds4-storage/runs/ds4-ticket-01-faa5b9ef8-a
+  /home/lyc/ds4-storage/runs/ds4-ticket-01-4415bbe8f-a
 output B:
-  /home/lyc/ds4-storage/runs/ds4-ticket-01-faa5b9ef8-b
+  /home/lyc/ds4-storage/runs/ds4-ticket-01-4415bbe8f-b
 transcript and checksums:
-  /home/lyc/ds4-storage/runs/ds4-ticket-01-faa5b9ef8-evidence
+  /home/lyc/ds4-storage/runs/ds4-ticket-01-4415bbe8f-evidence
 ```
 
 Both preparations ran with `HF_HUB_OFFLINE=1` and
 `TRANSFORMERS_OFFLINE=1`. The three artifact pairs were byte-identical, all
 handoff `jq` assertions passed, all 667 dataset rows had matching
 `input_tokens` and `prompt_ids` lengths, and no row carried `output_tokens`.
+The final outputs were also byte-identical to the earlier accepted
+`faa5b9ef8` outputs. The evidence manifest `evidence-checksums.txt` has
+SHA-256:
+
+```text
+ede34a26e8e289569fa70db61534f6d8509ade1be608df2dc437d249b54ad9aa
+```
+
 The retained checksums are:
 
 ```text

@@ -46,6 +46,8 @@ The detailed gates are in
 - Ticket 1 passed the exact-revision Qwen3.5 tokenizer Gate B.
 - Ticket 2 passed the dual-RTX-3090 Gate A with positive P cache-hit,
   D external-transfer, and NIXL-success evidence.
+- Both gates validate final runtime delivery
+  `4415bbe8f04c11c5beab7057effe208659f1b91f`.
 - The controlled point runner for Ticket 3 is not implemented.
 - Existing Qwen2.5, normalization, workload, container, and profile-spine code
   is legacy implementation retained temporarily for traceability.
