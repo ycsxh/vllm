@@ -59,21 +59,30 @@ def _post_json(url, payload):
 
 
 @contextlib.contextmanager
-def _proxy_process(prefill_port, decode_port, proxy_port):
+def _proxy_process(
+    prefill_port,
+    decode_port,
+    proxy_port,
+    *,
+    expected_remote_tokens=641,
+):
+    command = [
+        sys.executable,
+        "-m",
+        "benchmarks.ds4_profile.pd_proxy",
+        "--prefill-url",
+        f"http://127.0.0.1:{prefill_port}",
+        "--decode-url",
+        f"http://127.0.0.1:{decode_port}",
+        "--port",
+        str(proxy_port),
+        "--request-timeout",
+        "5",
+    ]
+    if expected_remote_tokens is not None:
+        command.extend(["--expected-remote-tokens", str(expected_remote_tokens)])
     process = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "benchmarks.ds4_profile.pd_proxy",
-            "--prefill-url",
-            f"http://127.0.0.1:{prefill_port}",
-            "--decode-url",
-            f"http://127.0.0.1:{decode_port}",
-            "--port",
-            str(proxy_port),
-            "--request-timeout",
-            "5",
-        ],
+        command,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -154,6 +163,54 @@ def test_proxy_forwards_validated_prefill_metadata_to_decode(free_tcp_port):
             },
         }
     ]
+    assert decode_requests == [
+        {**request_payload, "kv_transfer_params": kv_transfer_params}
+    ]
+
+
+def test_proxy_accepts_variable_positive_remote_tokens_when_not_pinned(
+    free_tcp_port,
+):
+    kv_transfer_params = {
+        "do_remote_prefill": True,
+        "do_remote_decode": False,
+        "remote_block_ids": [[11, 12], [21]],
+        "remote_engine_id": "prefill-engine",
+        "remote_request_id": "prefill-request",
+        "remote_host": "127.0.0.1",
+        "remote_port": 5600,
+        "tp_size": 1,
+        "remote_num_tokens": 4095,
+    }
+    prefill_response = {
+        "choices": [{"text": ""}],
+        "kv_transfer_params": kv_transfer_params,
+    }
+    decode_response = {"choices": [{"text": "deterministic output"}]}
+    request_payload = {
+        "model": "Qwen/Qwen3.5-4B",
+        "prompt": "controlled serving point prompt",
+        "max_tokens": 1,
+        "stream": False,
+    }
+
+    with (
+        _fake_completion_server(prefill_response) as (prefill_port, _),
+        _fake_completion_server(decode_response) as (decode_port, decode_requests),
+        _proxy_process(
+            prefill_port,
+            decode_port,
+            free_tcp_port,
+            expected_remote_tokens=None,
+        ),
+    ):
+        status, response = _post_json(
+            f"http://127.0.0.1:{free_tcp_port}/v1/completions",
+            request_payload,
+        )
+
+    assert status == 200
+    assert response == decode_response
     assert decode_requests == [
         {**request_payload, "kv_transfer_params": kv_transfer_params}
     ]

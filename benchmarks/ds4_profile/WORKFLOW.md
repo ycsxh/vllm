@@ -120,10 +120,12 @@ estimates, teacher-forced tokens, or DS4-to-Qwen vocabulary mappings.
 
 ## Phase 3 — Ticket 3 controlled MVP
 
-Implement one narrow orchestrator around official interfaces. It accepts an
-explicit point file and prepared dataset, starts or validates the fixed 1P1D
-deployment, controls cache state, invokes `vllm bench serve`, and saves raw
-official results plus metrics deltas.
+The local orchestrator is implemented in `run_points.py`. It accepts the
+checked-in explicit six-point file and prepared dataset, restarts the fixed
+1P1D deployment for each point-specific P token budget, controls cache state,
+invokes `vllm bench serve`, and saves raw official results plus metrics deltas.
+The next action is the target-server dry run and Gate C execution in
+[`TICKET_03_SERVER_HANDOFF.md`](TICKET_03_SERVER_HANDOFF.md).
 
 The cache protocol for every measured repetition is:
 
@@ -162,7 +164,8 @@ After it succeeds, run the six-point minimum matrix defined in
   provenance artifacts;
 - every minimum-matrix point has three measured runs or an explicit retained
   failure;
-- actual P hit agrees with the aligned plan within one block;
+- actual P hit agrees with the aligned plan within one effective cache page per
+  request;
 - 0% points show no unintended local reuse;
 - D external-transfer evidence is present;
 - one-token TTFT points omit TPOT instead of reporting zero;

@@ -30,7 +30,7 @@ autoscaling.
 | --- | --- | --- |
 | 1 | Minimal DS4-to-CustomDataset adapter | Gate B `remote_verified` |
 | 2 | Qwen3.5 NIXL 1P1D feasibility and fixed launcher | Gate A `remote_verified` |
-| 3 | Controlled serving-metric MVP | Not started; Gates A and B complete |
+| 3 | Controlled serving-metric MVP | Local implementation complete; Gate C pending |
 | 4 | Selected measurements and report | Blocked by Ticket 3 Gate C |
 
 Execution is risk-first: Ticket 2 smoke precedes the remaining implementation.
@@ -48,7 +48,12 @@ The detailed gates are in
   D external-transfer, and NIXL-success evidence.
 - Both gates validate final runtime delivery
   `4415bbe8f04c11c5beab7057effe208659f1b91f`.
-- The controlled point runner for Ticket 3 is not implemented.
+- The controlled point runner, explicit six-point plan, CPU contract tests, and
+  point-specific P deployment restart are implemented.
+- Ticket 3 separates the configured 128-token isolation block from the
+  accepted runtime's 640-token effective HMA cache page.
+- Ticket 3 Gate C still requires the target dual-RTX-3090 first point and
+  six-point matrix.
 - Existing Qwen2.5, normalization, workload, container, and profile-spine code
   is legacy implementation retained temporarily for traceability.
 - Legacy code must not be extended or treated as the new experiment path.
@@ -94,7 +99,9 @@ These files are current:
   Gate B completion;
 - [`TICKET_02_SERVER_HANDOFF.md`](TICKET_02_SERVER_HANDOFF.md): dual-3090 Gate A
   completion;
-- [`HANDOFF.md`](HANDOFF.md): current Tickets 1–2 closeout state;
+- [`TICKET_03_SERVER_HANDOFF.md`](TICKET_03_SERVER_HANDOFF.md): controlled MVP
+  target-server execution and Gate C handoff;
+- [`HANDOFF.md`](HANDOFF.md): current Tickets 1–3 development state;
 - this README: project entry and current status.
 
 `TICKET_04_HANDOFF.md`, `container/README.md`, and the existing Ticket 01-04

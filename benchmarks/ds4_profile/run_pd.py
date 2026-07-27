@@ -14,6 +14,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -74,6 +75,8 @@ class LaunchConfig:
     vllm_commit: str
     vllm_dirty: bool
     runtime_environment: dict[str, str]
+    max_num_batched_tokens: int = 4096
+    expected_remote_tokens: int | None = EXPECTED_REMOTE_TOKENS
     readiness_timeout: float = 900.0
     request_timeout: float = 300.0
     shutdown_timeout: float = 30.0
@@ -139,7 +142,7 @@ class LaunchPlan:
                 "attention_backend": self.config.attention_backend,
                 "block_size": 128,
                 "mamba_cache_mode": "align",
-                "max_num_batched_tokens": 4096,
+                "max_num_batched_tokens": self.config.max_num_batched_tokens,
                 "prefix_caching": True,
                 "chunked_prefill": True,
                 "nixl_load_failure_policy": "fail",
@@ -155,6 +158,10 @@ class LaunchPlan:
                 "expected_prompt_tokens": EXPECTED_SMOKE_PROMPT_TOKENS,
                 "effective_hma_page_tokens": EFFECTIVE_HMA_PAGE_TOKENS,
                 "expected_remote_tokens": EXPECTED_REMOTE_TOKENS,
+            },
+            "proxy_contract": {
+                "expected_remote_tokens": self.config.expected_remote_tokens,
+                "requires_positive_remote_tokens": True,
             },
             "smoke_request": self.smoke_request,
             "processes": [process.as_dict() for process in self.processes],
@@ -310,7 +317,7 @@ def _server_command(config: LaunchConfig, port: int, role: str) -> tuple[str, ..
         "align",
         "--enable-chunked-prefill",
         "--max-num-batched-tokens",
-        "4096",
+        str(config.max_num_batched_tokens if role == "kv_producer" else 4096),
         "--port",
         str(port),
         "--kv-transfer-config",
@@ -364,13 +371,16 @@ def build_plan(config: LaunchConfig) -> LaunchPlan:
             raise ValueError(f"{role} CPUs must use numactl CPU-list syntax")
     if (
         min(
+            config.max_num_batched_tokens,
             config.readiness_timeout,
             config.request_timeout,
             config.shutdown_timeout,
         )
         <= 0
     ):
-        raise ValueError("all timeouts must be positive")
+        raise ValueError("token budget and all timeouts must be positive")
+    if config.expected_remote_tokens is not None and config.expected_remote_tokens <= 0:
+        raise ValueError("expected remote tokens must be positive when pinned")
 
     server_dir = config.run_dir / "server"
     common_environment = {
@@ -429,6 +439,11 @@ def build_plan(config: LaunchConfig) -> LaunchPlan:
         "--request-timeout",
         str(config.request_timeout),
     )
+    if config.expected_remote_tokens is not None:
+        proxy_command += (
+            "--expected-remote-tokens",
+            str(config.expected_remote_tokens),
+        )
     processes.append(
         ProcessSpec(
             "proxy",
@@ -494,6 +509,59 @@ def _existing_launcher_artifacts(run_dir: Path) -> list[Path]:
     for pattern in ("p.log", "d.log", "proxy.log", "*-metrics-*.txt"):
         artifacts.extend(server_dir.glob(pattern))
     return sorted(set(artifacts))
+
+
+@contextlib.contextmanager
+def running_plan(plan: LaunchPlan, runtime: Runtime | None = None) -> Iterator[Runtime]:
+    """Start the fixed deployment, yield it ready, and always clean it up."""
+    if plan.config.vllm_dirty:
+        raise ValueError("execution requires a clean vLLM working tree")
+    runtime = runtime or SubprocessRuntime()
+    handles: list[Any] = []
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    signal_handler_installed = False
+
+    def interrupt_for_cleanup(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt(f"received signal {signum}")
+
+    try:
+        signal.signal(signal.SIGTERM, interrupt_for_cleanup)
+        signal_handler_installed = True
+    except ValueError:
+        pass
+    try:
+        for process in plan.processes[:2]:
+            handles.append(runtime.start(process))
+        for name, port in (
+            ("prefill", PORTS["prefill"]),
+            ("decode", PORTS["decode"]),
+        ):
+            runtime.wait_ready(
+                name,
+                f"http://127.0.0.1:{port}/v1/models",
+                plan.config.readiness_timeout,
+                handles,
+            )
+        handles.append(runtime.start(plan.processes[2]))
+        runtime.wait_ready(
+            "proxy",
+            f"http://127.0.0.1:{PORTS['proxy']}/status",
+            plan.config.readiness_timeout,
+            handles,
+        )
+        yield runtime
+    finally:
+        active_error = sys.exception()
+        try:
+            try:
+                runtime.stop(handles, plan.config.shutdown_timeout)
+            except BaseException as cleanup_error:
+                if active_error is None:
+                    raise
+                active_error.add_note(f"cleanup also failed: {cleanup_error}")
+        finally:
+            if signal_handler_installed:
+                signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def execute_plan(plan: LaunchPlan, runtime: Runtime | None = None) -> dict[str, Any]:
@@ -659,6 +727,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--decode-cpus", required=True)
     parser.add_argument("--decode-numa-node", required=True, type=int)
     parser.add_argument("--run-dir", required=True, type=Path)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=4096)
     parser.add_argument("--readiness-timeout", type=float, default=900.0)
     parser.add_argument("--request-timeout", type=float, default=300.0)
     parser.add_argument("--shutdown-timeout", type=float, default=30.0)
@@ -693,6 +762,7 @@ def main(argv: list[str] | None = None) -> int:
             for name in RUNTIME_ENVIRONMENT_NAMES
             if name in os.environ
         },
+        max_num_batched_tokens=args.max_num_batched_tokens,
         readiness_timeout=args.readiness_timeout,
         request_timeout=args.request_timeout,
         shutdown_timeout=args.shutdown_timeout,

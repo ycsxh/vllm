@@ -103,12 +103,22 @@ The controlled nominal ratios are:
 0%, 25%, 50%, 75%, 85%, 90%
 ```
 
-The planned prefix length is aligned down to the configured cache block size:
+The planned prefix length is aligned down to the effective runtime cache
+granularity:
 
 ```text
-planned_cached_tokens = floor(input_tokens * ratio / block_size) * block_size
+planned_cached_tokens =
+  floor(input_tokens * ratio / cache_alignment_tokens)
+  * cache_alignment_tokens
 nominal_aligned_ratio = planned_cached_tokens / input_tokens
 ```
+
+For the accepted Qwen3.5 HMA runtime, `--block-size 128` remains the configured
+attention block size and the request-isolation block size, while
+`cache_alignment_tokens=640` is the observed effective HMA page established by
+Ticket 2 Gate A. These values are separate: a 128-token warm prefix is not a
+cacheable condition on this runtime. The point runner records both values and
+rejects a nonzero hit point that does not span one effective page.
 
 The authoritative observed value is:
 
@@ -118,9 +128,9 @@ actual_P_hit_ratio =
   / sum(delta(P prompt_tokens_by_source{source=each source}))
 ```
 
-The report always carries requested, block-aligned, and observed ratios. If two
-requested ratios collapse to the same aligned prefix length, the duplicate
-point is rejected before GPU execution.
+The report always carries requested, effective-page-aligned, and observed
+ratios. If two requested ratios collapse to the same aligned prefix length, the
+duplicate point is rejected before GPU execution.
 
 ## 4. Fixed runtime configuration
 
@@ -142,6 +152,7 @@ measurement into a fabricated pass.
 | Speculative decoding/MTP | Disabled |
 | P/D model, dtype, backend, cache dtype | Identical |
 | P/D block size | Identical; fixed for a comparison |
+| Effective HMA cache page | 640 tokens, from accepted Ticket 2 Gate A |
 | Compile/CUDA Graph | Default optimized mode for main results |
 | Eager mode | At most one explicitly labeled diagnostic point |
 | GPU assignment | P=GPU0, D=GPU1 unless a run explicitly overrides it |
@@ -510,7 +521,8 @@ Acceptance:
 Build:
 
 - explicit point JSON with a positive `output_tokens` value;
-- isolation-block and block-aligned warm-prefix preparation;
+- 128-token isolation-block and 640-token effective-page-aligned warm-prefix
+  preparation;
 - reset-P/reset-D, warm-P, reset-D, measure protocol;
 - metrics before/after collection and validation;
 - official `vllm bench serve` invocation;
@@ -524,7 +536,8 @@ Acceptance:
 
 - the first 75%/4096/concurrency-1 point produces complete artifacts;
 - all six minimum points finish or retain an explicit failure record;
-- measured P hit ratios agree with aligned planned ratios within one cache block;
+- measured P hit ratios agree with aligned planned ratios within one effective
+  cache page per request;
 - 0% points do not show unintended local prefix reuse;
 - TPOT is omitted rather than reported as zero for one-token TTFT points;
 - non-positive point output lengths are rejected before benchmark execution;
@@ -564,7 +577,8 @@ Test observable contracts only:
 - deterministic DS4 row selection;
 - Qwen prompt rendering and token lengths on pinned fixtures;
 - isolation-block encode/decode stability;
-- block alignment and duplicate-point rejection;
+- configured-block isolation, effective-page alignment, and duplicate-point
+  rejection;
 - explicit point parsing, including output-length validation, without hidden
   Cartesian expansion;
 - controlled protocol ordering using fake HTTP endpoints;
@@ -650,8 +664,8 @@ summaries.
 - NIXL failure or silent fallback: invalidate the point.
 - Model OOM: record unsupported; do not lower lengths or memory settings under
   the same point ID.
-- Actual hit mismatch greater than one block: invalidate and diagnose before
-  continuing the matrix.
+- Actual hit mismatch greater than one effective cache page per request:
+  invalidate and diagnose before continuing the matrix.
 - Noisy point: mark it and selectively rerun; do not rerun every clean point.
 - Qwen3.5-4B PD smoke cannot pass after environment and 0.8B diagnostics: stop
   and review the model choice rather than implementing the remaining tickets.
