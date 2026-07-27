@@ -49,6 +49,13 @@ source, acceptance criterion, or `.venv` file was changed.
 
 ## Corrected local delivery
 
+The closeout branch is
+`codex/ds4-replacement-tickets-1-2-continued`. Gate A ran from delivery commit
+`4415bbe8f04c11c5beab7057effe208659f1b91f` with an empty
+`git status --porcelain`. During documentation closeout, tracked files were
+clean and the local `.scratch/` handoff archive remained intentionally
+untracked and excluded from commits and evidence.
+
 The corrected Ticket 2 delivery:
 
 - runs the DS4-owned fixed pull proxy instead of the shared example proxy;
@@ -89,6 +96,9 @@ All checks passed!
   tests/benchmarks/ds4_profile/test_run_pd.py \
   tests/benchmarks/ds4_profile/test_pd_proxy.py
 4 files already formatted
+
+.venv/bin/pre-commit run --from-ref origin/main --to-ref HEAD
+All applicable hooks passed
 ```
 
 These local checks did not themselves claim GPU exclusivity, model load, NUMA

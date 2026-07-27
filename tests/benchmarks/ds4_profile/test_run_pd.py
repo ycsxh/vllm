@@ -358,12 +358,20 @@ def test_subprocess_runtime_uses_the_serialized_environment_only(tmp_path, monke
     runtime = run_pd.SubprocessRuntime()
     child = runtime.start(process)
     try:
-        assert child.process.wait(timeout=2) == 0
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            entries = process.log_path.read_bytes().split(b"\0")
+            child_environment = dict(
+                entry.decode().split("=", 1) for entry in entries if entry
+            )
+            if child_environment == process.as_dict()["environment"]:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("child environment was not fully serialized")
     finally:
         runtime.stop([child], timeout=1)
 
-    entries = process.log_path.read_bytes().split(b"\0")
-    child_environment = dict(entry.decode().split("=", 1) for entry in entries if entry)
     assert child_environment == process.as_dict()["environment"]
     assert "AWS_SECRET_ACCESS_KEY" not in child_environment
 

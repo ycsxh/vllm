@@ -8,6 +8,13 @@ baseline `c27a4fdf8969e2927973197257510c1666f47b64` and the earlier accepted
 
 ## Local verification
 
+The closeout branch is
+`codex/ds4-replacement-tickets-1-2-continued`. Gate B ran from delivery commit
+`4415bbe8f04c11c5beab7057effe208659f1b91f` with an empty
+`git status --porcelain`. During documentation closeout, tracked files were
+clean and the local `.scratch/` handoff archive remained intentionally
+untracked and excluded from commits and evidence.
+
 The final delivery checkout passed the combined focused suite:
 
 ```text
@@ -25,6 +32,9 @@ All checks passed!
 .venv/bin/ruff format --check benchmarks/ds4_profile/prepare_dataset.py \
   tests/benchmarks/ds4_profile/test_prepare_dataset.py
 2 files already formatted
+
+.venv/bin/pre-commit run --from-ref origin/main --to-ref HEAD
+All applicable hooks passed
 ```
 
 These results validate the adapter contract with network-free tokenizer
