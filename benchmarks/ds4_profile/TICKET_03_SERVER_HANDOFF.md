@@ -1,11 +1,69 @@
 # Ticket 3 controlled-metric server handoff
 
-Status: `local_ready`, Gate C `remote_pending`.
+Status: Gate C `remote_verified` for immutable delivery commit
+`163935c12db0545c12eba694bfd6316be1f4094a`.
 
-Ticket 1 Gate B and Ticket 2 Gate A are already `remote_verified`. Ticket 3
-must continue on the same target dual-RTX-3090 machine. This handoff covers the
-first controlled point and the six-point minimum matrix; it does not authorize
-Ticket 4.
+Ticket 1 Gate B and Ticket 2 Gate A are also `remote_verified`. Ticket 3
+completed the first controlled point and six-point minimum matrix on the target
+dual-RTX-3090 machine. Ticket 4 is ready and unblocked, but has not started.
+
+## Completed Gate C evidence
+
+The accepted full-matrix result is preserved at:
+
+```text
+/home/lyc/ds4-storage/runs/ds4-ticket-03-163935c12-attempt-10-full-matrix
+```
+
+The adjacent launcher log and independent review are preserved at:
+
+```text
+/home/lyc/ds4-storage/runs/ds4-ticket-03-163935c12-attempt-10-full-matrix.launcher.log
+/home/lyc/ds4-storage/runs/ds4-ticket-03-163935c12-attempt-10-full-matrix-review/audit.json
+/home/lyc/ds4-storage/runs/ds4-ticket-03-163935c12-attempt-10-full-matrix-review/final-cleanup.txt
+```
+
+The final manifest reports `status=valid`,
+`vllm_commit=163935c12db0545c12eba694bfd6316be1f4094a`, and
+`vllm_dirty=false`. The accepted evidence contains:
+
+- six valid points with three completed repetitions each;
+- 18 unmodified official benchmark results, 18 derived results, and six point
+  summaries;
+- 20 completed and zero failed requests per repetition, with empty official
+  error arrays;
+- 12,800 observed P local-cache-hit tokens per 75% nominal repetition and zero
+  observed P local-cache-hit tokens for every 0% repetition;
+- 30,320 D external-transfer tokens per repetition;
+- zero deltas for every NIXL failure counter; and
+- no summary metric above the 5% CV noisy threshold.
+
+The independent audit reports `status=valid`. Four server logs contain an
+`EngineDeadError` traceback only during bounded SIGTERM cleanup after all
+measurements completed. They are classified as
+`bounded_shutdown_after_all_measurements`, not as request-time failures, and
+remain disclosed in the audit. Final cleanup found no GPU compute process,
+relevant survivor, or listener on ports 8000, 8100, 8200, 5600, or 5601.
+
+The closeout review copies have these SHA-256 digests:
+
+```text
+manual-semantic-review.txt
+  19e828cba4c9c4b51d14f453b63dbf35f7d7b88fb3bfa7f81ae71a1709d71901
+final-cleanup.txt
+  0d8938fd1d0bea07ee62c2c3221a66bafccdc6f098897f15ce5a90d1bfa813e4
+audit.json
+  4c8e396515e1e9e58493baf0afc46c46df3265718a43db7456b02b1e0a004875
+run-manifest.json
+  0bf784aace29ff7076b689842d361fc58883b74db9af52ff98d1d6ed593ea3be
+```
+
+Gate C is therefore `remote_verified`. Hardware validation applies only to
+delivery commit `163935c12db0545c12eba694bfd6316be1f4094a`. The later
+documentation closeout commit records the accepted state and evidence index;
+it is not itself GPU-validated. No GPU rerun is required because the closeout
+does not change the implementation, point plan, runtime, metric semantics, or
+acceptance criteria.
 
 ## Local delivery
 
@@ -31,7 +89,12 @@ The first point in the checked-in file is the required
 75%/4096/concurrency-1/one-token point. The remaining five complete the minimum
 matrix.
 
-## Before target execution
+## Historical execution and reproduction procedure
+
+The sections below preserve the procedure used to produce and review the
+accepted evidence. They are reproduction instructions, not pending Gate C work.
+
+### Before target execution
 
 Start from a new target-server worktree at the exact Ticket 3 delivery commit.
 Do not reuse the accepted Ticket 2 results directory or a dirty checkout.
@@ -96,7 +159,7 @@ Repeat the Ticket 2 read-only GPU, topology, listener, package, and rollback
 preflight. Exactly two idle RTX 3090 GPUs and no listeners on ports 8000, 8100,
 8200, 5600, or 5601 are mandatory.
 
-## Local tests on the target checkout
+### Local tests on the target checkout
 
 ```bash
 set -euo pipefail
@@ -128,7 +191,7 @@ set -euo pipefail
 
 These tests do not claim Gate C. They validate only the CPU-visible contracts.
 
-## Required dry run
+### Required dry run
 
 The dry run loads the pinned tokenizer offline, verifies every prepared prompt,
 constructs the isolation and warm-prefix token IDs, rejects aligned duplicate
@@ -169,7 +232,7 @@ commands, child environments, revisions, CPU/NUMA bindings, token budgets,
 request counts, and planned cached-token totals. In particular, confirm the
 75% points align to at least one 640-token effective page.
 
-## Gate C live execution
+### Gate C live execution
 
 The runner owns one clean P/D/proxy lifecycle per point. It sends non-measured
 canaries, resets both caches, runs three measured repetitions, and performs
@@ -204,7 +267,7 @@ the runner continues past later retained point failures, returns nonzero if any
 point failed, and stops immediately with status 130 after an operator interrupt.
 Never delete or overwrite a failed point directory.
 
-## Gate C review
+### Gate C review
 
 Start with the machine-readable manifest:
 
@@ -241,7 +304,7 @@ evidence. Complete artifacts alone are not Gate C: the human reviewer must
 confirm that the metric sources and aligned ratios mean what the specification
 claims.
 
-## Server-side fixes
+### Server-side fixes
 
 If target hardware exposes a source bug, fix it on a new personal-fork branch,
 add the smallest regression test, and rerun the focused CPU suite. Use a new
@@ -249,5 +312,7 @@ results directory for every changed delivery commit. Rerun only the affected
 point after diagnosis, then rerun the complete six-point matrix only when its
 construction remains comparable. Preserve all earlier failure directories.
 
-Do not start Ticket 4 until all six points are valid or explicitly retained as
-unsupported and a human judges the minimum matrix interpretable.
+This gate historically blocked Ticket 4 until all six points were valid or
+explicitly retained as unsupported and a human judged the minimum matrix
+interpretable. The accepted run satisfies that prerequisite, so Ticket 4 is
+ready and unblocked.

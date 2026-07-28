@@ -124,8 +124,8 @@ The local orchestrator is implemented in `run_points.py`. It accepts the
 checked-in explicit six-point file and prepared dataset, restarts the fixed
 1P1D deployment for each point-specific P token budget, controls cache state,
 invokes `vllm bench serve`, and saves raw official results plus metrics deltas.
-The next action is the target-server dry run and Gate C execution in
-[`TICKET_03_SERVER_HANDOFF.md`](TICKET_03_SERVER_HANDOFF.md).
+The historical target-server procedure and accepted Gate C evidence are
+recorded in [`TICKET_03_SERVER_HANDOFF.md`](TICKET_03_SERVER_HANDOFF.md).
 
 The cache protocol for every measured repetition is:
 
@@ -184,6 +184,11 @@ Only after Gate C:
 - add only the selected two-factor interactions in the authoritative plan;
 - aggregate three runs, report p50/p90/p95, mean/CV, and label noisy points;
 - generate `summary.csv`, a concise `report.md`, and only necessary plots.
+
+Gate C is `remote_verified` for immutable delivery commit
+`163935c12db0545c12eba694bfd6316be1f4094a`, so Ticket 4 is ready and
+unblocked, but has not started. The documentation closeout commit records this
+state; it does not itself carry GPU validation.
 
 Profiler-enabled runs, if a representative point needs diagnosis, are stored
 separately and excluded from latency statistics.
