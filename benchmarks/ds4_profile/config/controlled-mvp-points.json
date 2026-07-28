@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "points": [
+    {
+      "hit_ratio": 0.75,
+      "id": "ttft-hit-75-chunk-4096-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-12907.traj.json#assistant-0"
+    },
+    {
+      "hit_ratio": 0.0,
+      "id": "ttft-hit-0-chunk-4096-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-12907.traj.json#assistant-0"
+    },
+    {
+      "hit_ratio": 0.75,
+      "id": "ttft-hit-75-chunk-2048-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 2048,
+      "num_prompts": 20,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-12907.traj.json#assistant-0"
+    },
+    {
+      "hit_ratio": 0.0,
+      "id": "ttft-hit-0-chunk-2048-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 2048,
+      "num_prompts": 20,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-12907.traj.json#assistant-0"
+    },
+    {
+      "hit_ratio": 0.75,
+      "id": "decode-hit-75-chunk-4096-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 128,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-12907.traj.json#assistant-0"
+    },
+    {
+      "hit_ratio": 0.75,
+      "id": "decode-hit-75-chunk-4096-concurrency-4",
+      "max_concurrency": 4,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 128,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-12907.traj.json#assistant-0"
+    }
+  ]
+}

@@ -1,12 +1,13 @@
-# Replacement Tickets 1–2 Closeout Handoff
+# Replacement Tickets 1–3 Development Handoff
 
 ## Status
 
-Replacement Tickets 1 and 2 are complete:
+Replacement Tickets 1 and 2 are complete, and Ticket 3 is ready for target
+execution:
 
 - Ticket 1 Gate B is `remote_verified`.
 - Ticket 2 Gate A is `remote_verified`.
-- Ticket 3 has not started.
+- Ticket 3 local implementation is complete; Gate C is `remote_pending`.
 
 The accepted Ticket 2 runtime delivery is:
 
@@ -14,7 +15,7 @@ The accepted Ticket 2 runtime delivery is:
 4415bbe8f04c11c5beab7057effe208659f1b91f
 ```
 
-The active worktree and branch are:
+The accepted Ticket 2 worktree and branch were:
 
 ```text
 /home/lyc/vllm/.worktrees/ticket-01-02
@@ -22,8 +23,8 @@ codex/ds4-replacement-tickets-1-2-continued
 ```
 
 [`AUTHORITATIVE_SPEC.md`](AUTHORITATIVE_SPEC.md) remains normative. This
-handoff records acceptance evidence without changing the specification or
-starting the controlled serving-metric work in Ticket 3.
+handoff records the accepted Ticket 1–2 evidence and routes Ticket 3 target
+execution to [`TICKET_03_SERVER_HANDOFF.md`](TICKET_03_SERVER_HANDOFF.md).
 
 ## Ticket 1 completion
 
@@ -158,17 +159,18 @@ The combined focused suite passes:
   --confcutdir=tests/benchmarks/ds4_profile \
   tests/benchmarks/ds4_profile/test_prepare_dataset.py \
   tests/benchmarks/ds4_profile/test_run_pd.py \
-  tests/benchmarks/ds4_profile/test_pd_proxy.py -q
+  tests/benchmarks/ds4_profile/test_pd_proxy.py \
+  tests/benchmarks/ds4_profile/test_run_points.py -q
 
-49 passed
+77 passed
 ```
 
-Ruff check and format validation pass for the adapter, launcher, proxy, and
-their three focused test files.
+Ruff check and format validation pass for the adapter, launcher, proxy, point
+runner, and their focused test files.
 
 ## Next scope
 
-There is no remaining Ticket 1 or Ticket 2 acceptance blocker. Any Ticket 3
-work must start as a separate scope and follow Gate C in
-[`WORKFLOW.md`](WORKFLOW.md). Do not reinterpret this feasibility smoke as a
-controlled performance result.
+There is no remaining Ticket 1 or Ticket 2 acceptance blocker. Continue Ticket
+3 on the target machine using [`TICKET_03_SERVER_HANDOFF.md`](TICKET_03_SERVER_HANDOFF.md)
+and Gate C in [`WORKFLOW.md`](WORKFLOW.md). The local implementation and dry
+run are not controlled performance results.

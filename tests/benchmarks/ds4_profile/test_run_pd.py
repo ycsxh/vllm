@@ -146,6 +146,20 @@ def test_build_plan_freezes_fail_closed_server_configuration(tmp_path):
         }
 
 
+def test_build_plan_uses_the_point_specific_prefill_token_budget(tmp_path):
+    config = replace(_config(tmp_path), max_num_batched_tokens=2048)
+    plan = run_pd.build_plan(config).as_dict()
+    prefill, decode, _ = plan["processes"]
+
+    assert plan["compatibility"]["max_num_batched_tokens"] == 2048
+    assert prefill["command"][
+        prefill["command"].index("--max-num-batched-tokens") + 1
+    ] == ("2048")
+    assert decode["command"][
+        decode["command"].index("--max-num-batched-tokens") + 1
+    ] == ("4096")
+
+
 def test_build_plan_freezes_proxy_routing(tmp_path):
     proxy = run_pd.build_plan(_config(tmp_path)).as_dict()["processes"][2]
 
@@ -163,6 +177,16 @@ def test_build_plan_freezes_proxy_routing(tmp_path):
     assert proxy["command"][proxy["command"].index("--request-timeout") + 1] == (
         "300.0"
     )
+    assert proxy["command"][proxy["command"].index("--expected-remote-tokens") + 1] == (
+        "641"
+    )
+
+
+def test_build_plan_allows_variable_remote_tokens_for_controlled_points(tmp_path):
+    config = replace(_config(tmp_path), expected_remote_tokens=None)
+    proxy = run_pd.build_plan(config).as_dict()["processes"][2]
+
+    assert "--expected-remote-tokens" not in proxy["command"]
 
 
 def test_build_plan_freezes_smoke_contract(tmp_path):
@@ -340,7 +364,10 @@ def _assert_process_gone(pid):
 
 
 def _assert_log_closed(log_path):
-    for fd_path in Path("/proc/self/fd").iterdir():
+    fd_dir = Path("/proc/self/fd")
+    if not fd_dir.is_dir():
+        fd_dir = Path("/dev/fd")
+    for fd_path in fd_dir.iterdir():
         try:
             if fd_path.resolve() == log_path.resolve():
                 raise AssertionError(f"{log_path} is still open as {fd_path}")
@@ -420,6 +447,37 @@ def test_execute_plan_runs_cold_repeat_and_cleans_up(tmp_path):
     assert (
         json.loads((tmp_path / "run/smoke-result.json").read_text())["gate_a"]
         == "pending_metric_review"
+    )
+
+
+def test_running_plan_exposes_a_ready_deployment_and_always_cleans_up(tmp_path):
+    runtime = FakeRuntime()
+    plan = run_pd.build_plan(_config(tmp_path))
+
+    with run_pd.running_plan(plan, runtime):
+        assert runtime.events[-1][:2] == ("ready", "proxy")
+
+    assert runtime.events[:5] == [
+        ("start", "prefill"),
+        ("start", "decode"),
+        (
+            "ready",
+            "prefill",
+            "http://127.0.0.1:8100/v1/models",
+            ("handle:prefill", "handle:decode"),
+        ),
+        (
+            "ready",
+            "decode",
+            "http://127.0.0.1:8200/v1/models",
+            ("handle:prefill", "handle:decode"),
+        ),
+        ("start", "proxy"),
+    ]
+    assert runtime.events[-1] == (
+        "stop",
+        ("handle:prefill", "handle:decode", "handle:proxy"),
+        30.0,
     )
 
 

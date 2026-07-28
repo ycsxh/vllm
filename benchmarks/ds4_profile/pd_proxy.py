@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Fixed 1P1D pull proxy for the DS4 Qwen3.5 feasibility smoke."""
+"""Validated 1P1D pull proxy for the DS4 Qwen3.5 experiments."""
 
 from __future__ import annotations
 
 import argparse
+from collections.abc import AsyncIterator
 from typing import Any
 
 import aiohttp
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 PREFILL_KV_TRANSFER_PARAMS = {
     "do_remote_decode": True,
@@ -20,7 +21,6 @@ PREFILL_KV_TRANSFER_PARAMS = {
     "remote_host": None,
     "remote_port": None,
 }
-EXPECTED_REMOTE_TOKENS = 641
 
 
 def _invalid_metadata(detail: str) -> None:
@@ -30,7 +30,9 @@ def _invalid_metadata(detail: str) -> None:
     )
 
 
-def _validate_kv_transfer_params(params: dict[str, Any]) -> None:
+def _validate_kv_transfer_params(
+    params: dict[str, Any], expected_remote_tokens: int | None
+) -> None:
     if params.get("do_remote_prefill") is not True:
         _invalid_metadata("do_remote_prefill must be true")
     if params.get("do_remote_decode") is not False:
@@ -61,11 +63,14 @@ def _validate_kv_transfer_params(params: dict[str, Any]) -> None:
         _invalid_metadata("remote_port must be 5600")
     if type(params.get("tp_size")) is not int or params["tp_size"] != 1:
         _invalid_metadata("tp_size must be 1")
+    remote_num_tokens = params.get("remote_num_tokens")
+    if type(remote_num_tokens) is not int or remote_num_tokens <= 0:
+        _invalid_metadata("remote_num_tokens must be a positive integer")
     if (
-        type(params.get("remote_num_tokens")) is not int
-        or params["remote_num_tokens"] != EXPECTED_REMOTE_TOKENS
+        expected_remote_tokens is not None
+        and remote_num_tokens != expected_remote_tokens
     ):
-        _invalid_metadata(f"remote_num_tokens must be {EXPECTED_REMOTE_TOKENS}")
+        _invalid_metadata(f"remote_num_tokens must be {expected_remote_tokens}")
 
 
 async def _post_json(
@@ -80,8 +85,36 @@ async def _post_json(
         return await response.json(content_type=None)
 
 
-def create_app(prefill_url: str, decode_url: str, request_timeout: float) -> FastAPI:
-    """Create the fixed proxy application."""
+async def _post_stream(
+    url: str, payload: dict[str, Any], request_timeout: float
+) -> StreamingResponse:
+    timeout = aiohttp.ClientTimeout(total=request_timeout)
+    session = aiohttp.ClientSession(timeout=timeout)
+    try:
+        response = await session.post(url, json=payload)
+        response.raise_for_status()
+    except BaseException:
+        await session.close()
+        raise
+
+    async def generate() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in response.content.iter_any():
+                yield chunk
+        finally:
+            response.release()
+            await session.close()
+
+    return StreamingResponse(generate(), media_type=response.content_type)
+
+
+def create_app(
+    prefill_url: str,
+    decode_url: str,
+    request_timeout: float,
+    expected_remote_tokens: int | None,
+) -> FastAPI:
+    """Create the validated proxy application."""
     app = FastAPI()
     prefill_endpoint = f"{prefill_url.rstrip('/')}/v1/completions"
     decode_endpoint = f"{decode_url.rstrip('/')}/v1/completions"
@@ -91,7 +124,7 @@ def create_app(prefill_url: str, decode_url: str, request_timeout: float) -> Fas
         return {"prefill": prefill_url, "decode": decode_url}
 
     @app.post("/v1/completions")
-    async def create_completion(request: Request) -> JSONResponse:
+    async def create_completion(request: Request) -> Response:
         request_payload = await request.json()
         prefill_payload = {
             **request_payload,
@@ -99,6 +132,7 @@ def create_app(prefill_url: str, decode_url: str, request_timeout: float) -> Fas
             "stream": False,
             "kv_transfer_params": PREFILL_KV_TRANSFER_PARAMS,
         }
+        prefill_payload.pop("stream_options", None)
         prefill_response = await _post_json(
             prefill_endpoint, prefill_payload, request_timeout
         )
@@ -113,11 +147,13 @@ def create_app(prefill_url: str, decode_url: str, request_timeout: float) -> Fas
                 status_code=502,
                 detail="prefill kv_transfer_params must be an object",
             )
-        _validate_kv_transfer_params(kv_transfer_params)
+        _validate_kv_transfer_params(kv_transfer_params, expected_remote_tokens)
         decode_payload = {
             **request_payload,
             "kv_transfer_params": kv_transfer_params,
         }
+        if decode_payload.get("stream") is True:
+            return await _post_stream(decode_endpoint, decode_payload, request_timeout)
         decode_response = await _post_json(
             decode_endpoint, decode_payload, request_timeout
         )
@@ -133,13 +169,19 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--request-timeout", type=float, default=300.0)
+    parser.add_argument("--expected-remote-tokens", type=int)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     uvicorn.run(
-        create_app(args.prefill_url, args.decode_url, args.request_timeout),
+        create_app(
+            args.prefill_url,
+            args.decode_url,
+            args.request_timeout,
+            args.expected_remote_tokens,
+        ),
         host=args.host,
         port=args.port,
     )
