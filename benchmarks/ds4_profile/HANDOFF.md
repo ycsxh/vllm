@@ -1,13 +1,13 @@
-# Replacement Tickets 1–3 Development Handoff
+# Replacement Tickets 1–3 Closeout Handoff
 
 ## Status
 
-Replacement Tickets 1 and 2 are complete, and Ticket 3 is ready for target
-execution:
+Replacement Tickets 1–3 are complete:
 
 - Ticket 1 Gate B is `remote_verified`.
 - Ticket 2 Gate A is `remote_verified`.
-- Ticket 3 local implementation is complete; Gate C is `remote_pending`.
+- Ticket 3 Gate C is `remote_verified`.
+- Ticket 4 is ready and unblocked, but has not started.
 
 The accepted Ticket 2 runtime delivery is:
 
@@ -23,8 +23,7 @@ codex/ds4-replacement-tickets-1-2-continued
 ```
 
 [`AUTHORITATIVE_SPEC.md`](AUTHORITATIVE_SPEC.md) remains normative. This
-handoff records the accepted Ticket 1–2 evidence and routes Ticket 3 target
-execution to [`TICKET_03_SERVER_HANDOFF.md`](TICKET_03_SERVER_HANDOFF.md).
+handoff records the accepted Tickets 1–3 evidence without starting Ticket 4.
 
 ## Ticket 1 completion
 
@@ -162,15 +161,46 @@ The combined focused suite passes:
   tests/benchmarks/ds4_profile/test_pd_proxy.py \
   tests/benchmarks/ds4_profile/test_run_points.py -q
 
-77 passed
+79 passed
 ```
 
 Ruff check and format validation pass for the adapter, launcher, proxy, point
 runner, and their focused test files.
 
+## Ticket 3 completion
+
+Ticket 3 passed Gate C against immutable delivery commit
+`163935c12db0545c12eba694bfd6316be1f4094a`. The accepted result directory is:
+
+```text
+/home/lyc/ds4-storage/runs/ds4-ticket-03-163935c12-attempt-10-full-matrix
+```
+
+The final manifest is `valid`, records that exact clean vLLM commit, and
+contains six valid points with three completed repetitions each. The evidence
+contains 18 official benchmark results, 18 derived results, and six point
+summaries. Every repetition completed 20 requests with zero failures and an
+empty official error array.
+
+Each 75% nominal repetition observed 12,800 P local-cache-hit tokens; every 0%
+repetition observed zero. D external-transfer tokens were 30,320 per
+repetition, all NIXL failure-counter deltas were zero, and no summary metric
+exceeded 5% CV. The independent audit is `valid`.
+
+Four `EngineDeadError` tracebacks occurred only during bounded SIGTERM cleanup
+after all measurements. They remain recorded as shutdown lifecycle errors, not
+request-time failures. Final cleanup found no GPU compute process, related
+survivor, or fixed-port listener. Paths, closeout-copy checksums, and the
+complete verdict are recorded in
+[`TICKET_03_SERVER_HANDOFF.md`](TICKET_03_SERVER_HANDOFF.md).
+
+Hardware validation applies only to delivery commit
+`163935c12db0545c12eba694bfd6316be1f4094a`. The documentation closeout commit
+records that accepted state; it is not itself GPU-validated.
+
 ## Next scope
 
-There is no remaining Ticket 1 or Ticket 2 acceptance blocker. Continue Ticket
-3 on the target machine using [`TICKET_03_SERVER_HANDOFF.md`](TICKET_03_SERVER_HANDOFF.md)
-and Gate C in [`WORKFLOW.md`](WORKFLOW.md). The local implementation and dry
-run are not controlled performance results.
+There is no remaining Ticket 1, Ticket 2, or Ticket 3 acceptance blocker.
+Ticket 4 is ready and unblocked, but has not started. The next scope is the
+Ticket 4 selected pilot and report defined in [`WORKFLOW.md`](WORKFLOW.md);
+this closeout does not implement any Ticket 4 work.
