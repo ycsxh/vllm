@@ -211,7 +211,7 @@ The replacement Ticket 4 implementation adds:
 - fail-closed OOM classification as `unsupported`;
 - at most one optional `eager_diagnostic` point; and
 - `report_results.py`, which re-audits raw official benchmark JSON and P/D
-  metrics before writing `summary.csv`, `report.md`, and seven SVG plots.
+  metrics before writing `summary.csv`, `report.md`, and eight SVG plots.
 
 Local work does not claim Gate D, does not run the model, and does not retire
 the legacy path. Exact target commands, review gates, and the post-acceptance

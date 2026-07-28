@@ -175,11 +175,24 @@ def test_checked_in_mvp_plan_is_the_six_explicit_spec_points() -> None:
 
 def test_checked_in_pilot_plan_is_the_explicit_selected_matrix() -> None:
     points = load_experiment_plan(PILOT_PLAN)
+    plan = json.loads(PILOT_PLAN.read_text(encoding="utf-8"))
 
     assert len(points) == 30
     assert all(point.num_prompts == 20 for point in points)
     assert all(point.repetitions == 3 for point in points)
     assert all(point.execution_mode == "optimized" for point in points)
+    comparisons = plan["report"]["comparisons"]
+    assert len(comparisons) == 8
+    assert {
+        (comparison["id"], comparison["x"], comparison["metric"])
+        for comparison in comparisons
+    } >= {
+        (
+            "concurrency-hit-throughput",
+            "max_concurrency",
+            "output_throughput",
+        )
+    }
 
     ttft_points = [point for point in points if point.output_tokens == 1]
     decode_points = [point for point in points if point.output_tokens == 128]

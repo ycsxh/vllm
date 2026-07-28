@@ -310,6 +310,13 @@ def test_report_reaudits_raw_evidence_and_writes_csv_markdown_and_svg(
     assert rows[0]["status"] == "valid"
     assert rows[0]["ttft_p50_mean_ms"] == "119.5"
     assert rows[0]["tpot_p50_mean_ms"] == "10"
+    assert rows[0]["p_local_compute_tokens_mean"] == "140"
+    assert rows[0]["p_local_cache_hit_tokens_mean"] == "320"
+    assert rows[0]["p_external_kv_transfer_tokens_mean"] == "0"
+    assert rows[0]["d_external_kv_transfer_tokens_mean"] == "460"
+    assert rows[0]["nixl_failed_transfers_delta_mean"] == "0"
+    assert rows[0]["nixl_failed_notifications_delta_mean"] == "0"
+    assert rows[0]["nixl_expired_requests_delta_mean"] == "0"
     assert rows[0]["noisy"] == "true"
     assert rows[1]["status"] == "unsupported"
     assert rows[1]["status_reason"] == "CUDA out of memory"
@@ -320,6 +327,12 @@ def test_report_reaudits_raw_evidence_and_writes_csv_markdown_and_svg(
     assert "bfloat16" in report
     assert "DS4 supplies input prompts only" in report
     assert "decode-unsupported" in report
+    assert "P local compute" in report
+    assert "P local cache hit" in report
+    assert "P external KV" in report
+    assert "D external KV" in report
+    assert "NIXL failed transfers" in report
+    assert "| 140 | 320 | 0 | 460 | 0 | 0 | 0 |" in report
     assert "Gate D human acceptance" in report
     assert "Legacy retirement checklist" in report
     plot = artifacts.plot_paths[0].read_text(encoding="utf-8")

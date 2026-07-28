@@ -11,7 +11,7 @@ validity, report acceptance, or legacy retirement.
 The delivery adds:
 
 - `config/selected-pilot-points.json`, a version 2 plan with 30 explicit
-  optimized-mode points and seven report comparisons;
+  optimized-mode points and eight report comparisons;
 - the selected hit/chunk and concurrency/hit interactions, with overlapping
   main-effect points stored only once;
 - deterministic input cut points 0, 17, and 35 from
@@ -177,7 +177,7 @@ jq -e 'all(.points[];
   /tmp/ds4-ticket-04-plan.json
 jq -e 'all(.points[] | select(.id | contains("hit-0") | not);
   .planned_cached_tokens > 0)' /tmp/ds4-ticket-04-plan.json
-jq -e '.report.comparisons | length == 7' "$PLAN"
+jq -e '.report.comparisons | length == 8' "$PLAN"
 test ! -e "$RESULTS_DIR"
 test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
 test -z "$(git status --porcelain)"
@@ -244,7 +244,7 @@ set -euo pipefail
   --metadata "$REPORT_METADATA"
 test -f "$RESULTS_DIR/summary.csv"
 test -f "$RESULTS_DIR/report.md"
-test "$(find "$RESULTS_DIR/plots" -maxdepth 1 -name '*.svg' | wc -l)" -eq 7
+test "$(find "$RESULTS_DIR/plots" -maxdepth 1 -name '*.svg' | wc -l)" -eq 8
 test "$(wc -l < "$RESULTS_DIR/summary.csv")" -eq 31
 grep -F 'DS4 supplies input prompts only' "$RESULTS_DIR/report.md"
 grep -F 'Gate D human acceptance' "$RESULTS_DIR/report.md"

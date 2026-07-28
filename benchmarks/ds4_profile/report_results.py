@@ -55,9 +55,60 @@ CSV_FIELDS = (
     "itl_p99_cv",
     "output_throughput_mean",
     "output_throughput_cv",
+    "p_local_compute_tokens_mean",
+    "p_local_cache_hit_tokens_mean",
+    "p_external_kv_transfer_tokens_mean",
+    "d_external_kv_transfer_tokens_mean",
+    "nixl_failed_transfers_delta_mean",
+    "nixl_failed_notifications_delta_mean",
+    "nixl_expired_requests_delta_mean",
     "noisy",
     "noisy_metrics",
     "evidence",
+)
+DIAGNOSTICS = (
+    (
+        "p_local_compute_tokens_mean",
+        "P local compute",
+        "p_local_compute_tokens",
+        None,
+    ),
+    (
+        "p_local_cache_hit_tokens_mean",
+        "P local cache hit",
+        "p_local_cache_hit_tokens",
+        None,
+    ),
+    (
+        "p_external_kv_transfer_tokens_mean",
+        "P external KV",
+        "p_prompt_tokens_by_source",
+        "external_kv_transfer",
+    ),
+    (
+        "d_external_kv_transfer_tokens_mean",
+        "D external KV",
+        "d_external_kv_transfer_tokens",
+        None,
+    ),
+    (
+        "nixl_failed_transfers_delta_mean",
+        "NIXL failed transfers",
+        "nixl_failure_deltas",
+        "vllm:nixl_num_failed_transfers_total",
+    ),
+    (
+        "nixl_failed_notifications_delta_mean",
+        "NIXL failed notifications",
+        "nixl_failure_deltas",
+        "vllm:nixl_num_failed_notifications_total",
+    ),
+    (
+        "nixl_expired_requests_delta_mean",
+        "NIXL expired requests",
+        "nixl_failure_deltas",
+        "vllm:nixl_num_kv_expired_reqs_total",
+    ),
 )
 X_FIELDS = {
     "requested_hit_ratio",
@@ -387,6 +438,20 @@ def _format_number(value: Any) -> str:
     return str(value)
 
 
+def _run_mean(
+    point: _AuditedPoint,
+    name: str,
+    nested_name: str | None,
+) -> float | None:
+    if not point.runs:
+        return None
+    values = [
+        run[name] if nested_name is None else run[name][nested_name]
+        for run in point.runs
+    ]
+    return sum(float(value) for value in values) / len(values)
+
+
 def _csv_row(point: _AuditedPoint) -> dict[str, str]:
     first_run = point.runs[0] if point.runs else {}
     row: dict[str, Any] = {
@@ -433,6 +498,8 @@ def _csv_row(point: _AuditedPoint) -> dict[str, str]:
         ),
         "evidence": ";".join(point.evidence),
     }
+    for field, _, name, nested_name in DIAGNOSTICS:
+        row[field] = _run_mean(point, name, nested_name)
     return {name: _format_number(row[name]) for name in CSV_FIELDS}
 
 
@@ -793,6 +860,24 @@ def _write_report(
             f"{_mean_cell(point, 'output_throughput')} | "
             f"{_mean_cell(point, 'actual_p_hit_ratio')} |"
         )
+    lines.extend(
+        (
+            "",
+            "## Transport diagnostics",
+            "",
+            "Values are per-repetition means re-derived from the preserved P/D "
+            "metrics.",
+            "",
+            f"| Point | {' | '.join(label for _, label, _, _ in DIAGNOSTICS)} |",
+            f"| --- | {' | '.join('---:' for _ in DIAGNOSTICS)} |",
+        )
+    )
+    for point in points:
+        values = [
+            _format_number(_run_mean(point, name, nested_name))
+            for _, _, name, nested_name in DIAGNOSTICS
+        ]
+        lines.append(f"| `{point.point.id}` | {' | '.join(values)} |")
     lines.extend(("", "## Plots", ""))
     for plot_path in plot_paths:
         relative = plot_path.relative_to(results_dir)

@@ -203,7 +203,7 @@ After the target run, generate the report with:
 
 The report generator re-derives every valid run from the preserved official
 benchmark JSON and P/D metric snapshots. It fails if a stored `derived.json` or
-point summary differs, then writes `summary.csv`, `report.md`, and seven
+point summary differs, then writes `summary.csv`, `report.md`, and eight
 variable-separated SVG plots. Follow
 [`TICKET_04_SERVER_HANDOFF.md`](TICKET_04_SERVER_HANDOFF.md) for the exact
 target procedure and Gate D review.

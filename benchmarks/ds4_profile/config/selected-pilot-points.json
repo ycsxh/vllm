@@ -443,6 +443,41 @@
         "x": "max_concurrency"
       },
       {
+        "id": "concurrency-hit-throughput",
+        "metric": "output_throughput",
+        "series": [
+          {
+            "label": "hit=0%",
+            "point_ids": [
+              "decode-hit-0-chunk-4096-concurrency-1",
+              "decode-hit-0-chunk-4096-concurrency-2",
+              "decode-hit-0-chunk-4096-concurrency-4",
+              "decode-hit-0-chunk-4096-concurrency-8"
+            ]
+          },
+          {
+            "label": "hit=75%",
+            "point_ids": [
+              "decode-hit-75-chunk-4096-concurrency-1",
+              "decode-hit-75-chunk-4096-concurrency-2",
+              "decode-hit-75-chunk-4096-concurrency-4",
+              "decode-hit-75-chunk-4096-concurrency-8"
+            ]
+          },
+          {
+            "label": "hit=90%",
+            "point_ids": [
+              "decode-hit-90-chunk-4096-concurrency-1",
+              "decode-hit-90-chunk-4096-concurrency-2",
+              "decode-hit-90-chunk-4096-concurrency-4",
+              "decode-hit-90-chunk-4096-concurrency-8"
+            ]
+          }
+        ],
+        "title": "Concurrency and output-token throughput",
+        "x": "max_concurrency"
+      },
+      {
         "id": "input-length-ttft",
         "metric": "p50_ttft_ms",
         "series": [
