@@ -1,0 +1,494 @@
+{
+  "schema_version": 2,
+  "points": [
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.75,
+      "id": "ttft-input-short-hit-75-chunk-4096-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-0"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.0,
+      "id": "ttft-hit-0-chunk-4096-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-35"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.25,
+      "id": "ttft-hit-25-chunk-4096-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-35"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.5,
+      "id": "ttft-hit-50-chunk-4096-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-35"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.85,
+      "id": "ttft-hit-85-chunk-4096-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-35"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.9,
+      "id": "ttft-hit-90-chunk-4096-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-35"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.0,
+      "id": "ttft-hit-0-chunk-1024-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 1024,
+      "num_prompts": 20,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-35"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.75,
+      "id": "ttft-hit-75-chunk-1024-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 1024,
+      "num_prompts": 20,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-35"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.9,
+      "id": "ttft-hit-90-chunk-1024-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 1024,
+      "num_prompts": 20,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-35"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.0,
+      "id": "ttft-hit-0-chunk-2048-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 2048,
+      "num_prompts": 20,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-35"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.75,
+      "id": "ttft-hit-75-chunk-2048-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 2048,
+      "num_prompts": 20,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-35"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.9,
+      "id": "ttft-hit-90-chunk-2048-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 2048,
+      "num_prompts": 20,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-35"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.0,
+      "id": "ttft-hit-0-chunk-8192-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 8192,
+      "num_prompts": 20,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-35"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.75,
+      "id": "ttft-hit-75-chunk-8192-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 8192,
+      "num_prompts": 20,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-35"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.9,
+      "id": "ttft-hit-90-chunk-8192-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 8192,
+      "num_prompts": 20,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-35"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.0,
+      "id": "decode-hit-0-chunk-4096-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 128,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-17"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.75,
+      "id": "decode-hit-75-chunk-4096-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 128,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-17"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.9,
+      "id": "decode-hit-90-chunk-4096-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 128,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-17"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.0,
+      "id": "decode-hit-0-chunk-4096-concurrency-2",
+      "max_concurrency": 2,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 128,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-17"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.75,
+      "id": "decode-hit-75-chunk-4096-concurrency-2",
+      "max_concurrency": 2,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 128,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-17"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.9,
+      "id": "decode-hit-90-chunk-4096-concurrency-2",
+      "max_concurrency": 2,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 128,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-17"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.0,
+      "id": "decode-hit-0-chunk-4096-concurrency-4",
+      "max_concurrency": 4,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 128,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-17"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.75,
+      "id": "decode-hit-75-chunk-4096-concurrency-4",
+      "max_concurrency": 4,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 128,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-17"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.9,
+      "id": "decode-hit-90-chunk-4096-concurrency-4",
+      "max_concurrency": 4,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 128,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-17"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.0,
+      "id": "decode-hit-0-chunk-4096-concurrency-8",
+      "max_concurrency": 8,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 128,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-17"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.75,
+      "id": "decode-hit-75-chunk-4096-concurrency-8",
+      "max_concurrency": 8,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 128,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-17"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.9,
+      "id": "decode-hit-90-chunk-4096-concurrency-8",
+      "max_concurrency": 8,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 128,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-17"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.75,
+      "id": "ttft-hit-75-chunk-4096-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-35"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.75,
+      "id": "ttft-input-medium-hit-75-chunk-4096-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-17"
+    },
+    {
+      "execution_mode": "optimized",
+      "hit_ratio": 0.75,
+      "id": "decode-output-32-hit-75-chunk-4096-concurrency-1",
+      "max_concurrency": 1,
+      "max_num_batched_tokens": 4096,
+      "num_prompts": 20,
+      "output_tokens": 32,
+      "repetitions": 3,
+      "source_request_id": "data/no_think/astropy__astropy-13236.traj.json#assistant-17"
+    }
+  ],
+  "report": {
+    "comparisons": [
+      {
+        "id": "hit-main-ttft",
+        "metric": "p50_ttft_ms",
+        "series": [
+          {
+            "label": "chunk=4096, concurrency=1",
+            "point_ids": [
+              "ttft-hit-0-chunk-4096-concurrency-1",
+              "ttft-hit-25-chunk-4096-concurrency-1",
+              "ttft-hit-50-chunk-4096-concurrency-1",
+              "ttft-hit-75-chunk-4096-concurrency-1",
+              "ttft-hit-85-chunk-4096-concurrency-1",
+              "ttft-hit-90-chunk-4096-concurrency-1"
+            ]
+          }
+        ],
+        "title": "Controlled P hit ratio and 1P1D TTFT p50",
+        "x": "requested_hit_ratio"
+      },
+      {
+        "id": "hit-requested-observed",
+        "metric": "actual_p_hit_ratio",
+        "series": [
+          {
+            "label": "chunk=4096, concurrency=1",
+            "point_ids": [
+              "ttft-hit-0-chunk-4096-concurrency-1",
+              "ttft-hit-25-chunk-4096-concurrency-1",
+              "ttft-hit-50-chunk-4096-concurrency-1",
+              "ttft-hit-75-chunk-4096-concurrency-1",
+              "ttft-hit-85-chunk-4096-concurrency-1",
+              "ttft-hit-90-chunk-4096-concurrency-1"
+            ]
+          }
+        ],
+        "title": "Requested and observed P local-cache hit ratio",
+        "x": "requested_hit_ratio"
+      },
+      {
+        "id": "chunk-hit-ttft",
+        "metric": "p50_ttft_ms",
+        "series": [
+          {
+            "label": "hit=0%",
+            "point_ids": [
+              "ttft-hit-0-chunk-1024-concurrency-1",
+              "ttft-hit-0-chunk-2048-concurrency-1",
+              "ttft-hit-0-chunk-4096-concurrency-1",
+              "ttft-hit-0-chunk-8192-concurrency-1"
+            ]
+          },
+          {
+            "label": "hit=75%",
+            "point_ids": [
+              "ttft-hit-75-chunk-1024-concurrency-1",
+              "ttft-hit-75-chunk-2048-concurrency-1",
+              "ttft-hit-75-chunk-4096-concurrency-1",
+              "ttft-hit-75-chunk-8192-concurrency-1"
+            ]
+          },
+          {
+            "label": "hit=90%",
+            "point_ids": [
+              "ttft-hit-90-chunk-1024-concurrency-1",
+              "ttft-hit-90-chunk-2048-concurrency-1",
+              "ttft-hit-90-chunk-4096-concurrency-1",
+              "ttft-hit-90-chunk-8192-concurrency-1"
+            ]
+          }
+        ],
+        "title": "P token budget and 1P1D TTFT p50",
+        "x": "max_num_batched_tokens"
+      },
+      {
+        "id": "concurrency-hit-tpot",
+        "metric": "p50_tpot_ms",
+        "series": [
+          {
+            "label": "hit=0%",
+            "point_ids": [
+              "decode-hit-0-chunk-4096-concurrency-1",
+              "decode-hit-0-chunk-4096-concurrency-2",
+              "decode-hit-0-chunk-4096-concurrency-4",
+              "decode-hit-0-chunk-4096-concurrency-8"
+            ]
+          },
+          {
+            "label": "hit=75%",
+            "point_ids": [
+              "decode-hit-75-chunk-4096-concurrency-1",
+              "decode-hit-75-chunk-4096-concurrency-2",
+              "decode-hit-75-chunk-4096-concurrency-4",
+              "decode-hit-75-chunk-4096-concurrency-8"
+            ]
+          },
+          {
+            "label": "hit=90%",
+            "point_ids": [
+              "decode-hit-90-chunk-4096-concurrency-1",
+              "decode-hit-90-chunk-4096-concurrency-2",
+              "decode-hit-90-chunk-4096-concurrency-4",
+              "decode-hit-90-chunk-4096-concurrency-8"
+            ]
+          }
+        ],
+        "title": "Concurrency and request-level TPOT p50",
+        "x": "max_concurrency"
+      },
+      {
+        "id": "input-length-ttft",
+        "metric": "p50_ttft_ms",
+        "series": [
+          {
+            "label": "hit=75%, chunk=4096, concurrency=1",
+            "point_ids": [
+              "ttft-input-short-hit-75-chunk-4096-concurrency-1",
+              "ttft-input-medium-hit-75-chunk-4096-concurrency-1",
+              "ttft-hit-75-chunk-4096-concurrency-1"
+            ]
+          }
+        ],
+        "title": "Prepared DS4 input length and 1P1D TTFT p50",
+        "x": "input_tokens"
+      },
+      {
+        "id": "output-length-throughput",
+        "metric": "output_throughput",
+        "series": [
+          {
+            "label": "hit=75%, chunk=4096, concurrency=1",
+            "point_ids": [
+              "ttft-input-medium-hit-75-chunk-4096-concurrency-1",
+              "decode-output-32-hit-75-chunk-4096-concurrency-1",
+              "decode-hit-75-chunk-4096-concurrency-1"
+            ]
+          }
+        ],
+        "title": "Output length and output-token throughput",
+        "x": "output_tokens"
+      },
+      {
+        "id": "output-length-tpot",
+        "metric": "p50_tpot_ms",
+        "series": [
+          {
+            "label": "hit=75%, chunk=4096, concurrency=1",
+            "point_ids": [
+              "decode-output-32-hit-75-chunk-4096-concurrency-1",
+              "decode-hit-75-chunk-4096-concurrency-1"
+            ]
+          }
+        ],
+        "title": "Output length and request-level TPOT p50",
+        "x": "output_tokens"
+      }
+    ]
+  }
+}

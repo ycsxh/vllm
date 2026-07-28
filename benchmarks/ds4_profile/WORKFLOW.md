@@ -187,8 +187,26 @@ Only after Gate C:
 
 Gate C is `remote_verified` for immutable delivery commit
 `163935c12db0545c12eba694bfd6316be1f4094a`, so Ticket 4 is ready and
-unblocked, but has not started. The documentation closeout commit records this
-state; it does not itself carry GPU validation.
+unblocked. The local implementation uses
+`config/selected-pilot-points.json`: 30 explicit optimized-mode points with no
+runtime Cartesian expansion. It retains OOM points as `unsupported`, derives
+ITL p99, and supports at most one explicitly labeled eager diagnostic without
+putting one in the main plan.
+
+After the target run, generate the report with:
+
+```bash
+.venv/bin/python -m benchmarks.ds4_profile.report_results \
+  --results-dir "$RESULTS_DIR" \
+  --metadata benchmarks/ds4_profile/config/selected-pilot-report-metadata.json
+```
+
+The report generator re-derives every valid run from the preserved official
+benchmark JSON and P/D metric snapshots. It fails if a stored `derived.json` or
+point summary differs, then writes `summary.csv`, `report.md`, and seven
+variable-separated SVG plots. Follow
+[`TICKET_04_SERVER_HANDOFF.md`](TICKET_04_SERVER_HANDOFF.md) for the exact
+target procedure and Gate D review.
 
 Profiler-enabled runs, if a representative point needs diagnosis, are stored
 separately and excluded from latency statistics.

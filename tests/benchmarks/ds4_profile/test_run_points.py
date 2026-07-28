@@ -9,6 +9,7 @@ import pytest
 
 from benchmarks.ds4_profile import run_pd, run_points
 from benchmarks.ds4_profile.run_points import (
+    UnsupportedPointError,
     build_benchmark_command,
     derive_run_result,
     execute_point,
@@ -25,6 +26,10 @@ TOKENIZER_REVISION = "1" * 40
 MVP_PLAN = (
     Path(__file__).parents[3]
     / "benchmarks/ds4_profile/config/controlled-mvp-points.json"
+)
+PILOT_PLAN = (
+    Path(__file__).parents[3]
+    / "benchmarks/ds4_profile/config/selected-pilot-points.json"
 )
 
 
@@ -168,6 +173,149 @@ def test_checked_in_mvp_plan_is_the_six_explicit_spec_points() -> None:
     assert all(point.repetitions == 3 for point in points)
 
 
+def test_checked_in_pilot_plan_is_the_explicit_selected_matrix() -> None:
+    points = load_experiment_plan(PILOT_PLAN)
+
+    assert len(points) == 30
+    assert all(point.num_prompts == 20 for point in points)
+    assert all(point.repetitions == 3 for point in points)
+    assert all(point.execution_mode == "optimized" for point in points)
+
+    ttft_points = [point for point in points if point.output_tokens == 1]
+    decode_points = [point for point in points if point.output_tokens == 128]
+    long_source = "data/no_think/astropy__astropy-13236.traj.json#assistant-35"
+    medium_source = "data/no_think/astropy__astropy-13236.traj.json#assistant-17"
+    baseline_ttft = [
+        point
+        for point in ttft_points
+        if point.source_request_id == long_source and point.max_concurrency == 1
+    ]
+    assert {
+        point.hit_ratio
+        for point in baseline_ttft
+        if point.max_num_batched_tokens == 4096
+    } == {0.0, 0.25, 0.5, 0.75, 0.85, 0.9}
+    assert {
+        (point.max_num_batched_tokens, point.hit_ratio)
+        for point in baseline_ttft
+        if point.hit_ratio in {0.0, 0.75, 0.9}
+    } == {
+        (chunk, hit) for chunk in (1024, 2048, 4096, 8192) for hit in (0.0, 0.75, 0.9)
+    }
+    assert {
+        (point.max_concurrency, point.hit_ratio)
+        for point in decode_points
+        if point.source_request_id == medium_source
+        and point.max_num_batched_tokens == 4096
+    } == {
+        (concurrency, hit) for concurrency in (1, 2, 4, 8) for hit in (0.0, 0.75, 0.9)
+    }
+    assert {
+        point.source_request_id
+        for point in ttft_points
+        if point.hit_ratio == 0.75
+        and point.max_num_batched_tokens == 4096
+        and point.max_concurrency == 1
+    } == {
+        f"data/no_think/astropy__astropy-13236.traj.json#assistant-{index}"
+        for index in (0, 17, 35)
+    }
+    assert {
+        point.output_tokens
+        for point in points
+        if point.source_request_id == medium_source
+        and point.hit_ratio == 0.75
+        and point.max_num_batched_tokens == 4096
+        and point.max_concurrency == 1
+    } == {1, 32, 128}
+
+
+def test_selected_hit_main_prepares_distinct_aligned_prefixes(
+    tmp_path: Path,
+) -> None:
+    prepared_dir = tmp_path / "prepared"
+    prepared_dir.mkdir()
+    source_id = "data/no_think/astropy__astropy-13236.traj.json#assistant-35"
+    prompt = "x" * 140
+    (prepared_dir / "dataset.jsonl").write_text(
+        json.dumps({"prompt": prompt}) + "\n",
+        encoding="utf-8",
+    )
+    (prepared_dir / "rows.jsonl").write_text(
+        json.dumps(
+            {
+                "request_id": source_id,
+                "source_path": source_id.partition("#")[0],
+                "source_sha256": "a" * 64,
+                "input_tokens": len(prompt),
+                "prompt_ids": list(prompt.encode()),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (prepared_dir / "provenance.json").write_text(
+        json.dumps(
+            {
+                "row_count": 1,
+                "tokenizer": {
+                    "model": "Qwen/Qwen3.5-4B",
+                    "revision": TOKENIZER_REVISION,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    hit_main = tuple(
+        point
+        for point in load_experiment_plan(PILOT_PLAN)
+        if point.source_request_id == source_id
+        and point.max_num_batched_tokens == 4096
+        and point.max_concurrency == 1
+        and point.output_tokens == 1
+    )
+
+    prepared = prepare_experiment(
+        hit_main,
+        prepared_dir,
+        block_size=8,
+        cache_alignment_tokens=8,
+        tokenizer=FakeTokenizer(),
+    )
+
+    assert len(prepared) == 6
+    assert (
+        len(
+            {
+                tuple(request.planned_cached_tokens for request in point.requests)
+                for point in prepared
+            }
+        )
+        == 6
+    )
+
+
+def test_plan_allows_only_one_explicit_eager_diagnostic(tmp_path: Path) -> None:
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "points": [
+                    _point(id="eager-a", execution_mode="eager_diagnostic"),
+                    _point(id="eager-b", execution_mode="eager_diagnostic"),
+                ],
+                "report": {"comparisons": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="at most one eager diagnostic"):
+        load_experiment_plan(plan_path)
+
+
 def test_nonzero_hit_point_must_span_an_effective_cache_page(
     tmp_path: Path,
 ) -> None:
@@ -197,6 +345,7 @@ def test_nonzero_hit_point_must_span_an_effective_cache_page(
         ({"repetitions": 2}, "repetitions"),
         ({"max_concurrency": 0}, "max_concurrency"),
         ({"hit_ratio": 1.1}, "hit_ratio"),
+        ({"execution_mode": "unknown"}, "execution_mode"),
         ({"unknown": True}, "unexpected"),
     ],
 )
@@ -438,6 +587,7 @@ def test_derived_decode_result_uses_official_request_level_tpot_definition(
     assert derived["p50_tpot_ms"] == pytest.approx(10.0)
     assert derived["p90_tpot_ms"] == pytest.approx(10.0)
     assert derived["p95_tpot_ms"] == pytest.approx(10.0)
+    assert derived["p99_itl_ms"] == pytest.approx(10.0)
 
 
 def test_point_summary_reports_mean_cv_and_noisy_metrics() -> None:
@@ -897,6 +1047,78 @@ def test_point_owns_the_fixed_deployment_and_three_repetitions(
     assert summary["metrics"]["p50_ttft_ms"]["mean"] == pytest.approx(109.5)
 
 
+def test_eager_diagnostic_is_explicit_in_both_server_commands(
+    tmp_path: Path,
+) -> None:
+    prepared = _prepared_point(
+        tmp_path,
+        id="eager-diagnostic",
+        execution_mode="eager_diagnostic",
+    )
+    runtime = ManagedFakeRuntime(_official_result(output_tokens=1))
+
+    execute_point(
+        prepared,
+        _launch_config(tmp_path),
+        tmp_path / "results",
+        runtime=runtime,
+        block_size=8,
+        tokenizer_path=tmp_path / TOKENIZER_REVISION,
+    )
+
+    point_dir = tmp_path / "results/points/eager-diagnostic"
+    server_plan = json.loads((point_dir / "server-plan.json").read_text())
+    assert server_plan["compatibility"]["enforce_eager"] is True
+    assert all(
+        "--enforce-eager" in process["command"]
+        for process in server_plan["processes"][:2]
+    )
+    assert "--enforce-eager" not in server_plan["processes"][2]["command"]
+    assert (
+        json.loads((point_dir / "provenance.json").read_text())["execution_mode"]
+        == "eager_diagnostic"
+    )
+
+
+def test_oom_point_is_retained_as_unsupported(tmp_path: Path) -> None:
+    class OomRuntime(ManagedFakeRuntime):
+        def start(self, process: run_pd.ProcessSpec) -> str:
+            process.log_path.parent.mkdir(parents=True, exist_ok=True)
+            process.log_path.write_text("torch.OutOfMemoryError: CUDA out of memory\n")
+            return super().start(process)
+
+        def wait_ready(
+            self,
+            name: str,
+            url: str,
+            timeout: float,
+            handles: list[Any],
+        ) -> None:
+            raise RuntimeError(f"{name} exited before readiness")
+
+    prepared = _prepared_point(tmp_path, id="unsupported")
+    point_dir = tmp_path / "results/points/unsupported"
+
+    with pytest.raises(UnsupportedPointError, match="before readiness"):
+        execute_point(
+            prepared,
+            _launch_config(tmp_path),
+            tmp_path / "results",
+            runtime=OomRuntime(_official_result(output_tokens=1)),
+            block_size=8,
+            tokenizer_path=tmp_path / TOKENIZER_REVISION,
+        )
+
+    assert json.loads((point_dir / "point-failure.json").read_text()) == {
+        "error": "prefill exited before readiness",
+        "error_type": "RuntimeError",
+        "status": "unsupported",
+    }
+    assert json.loads((point_dir / "status.json").read_text())["status"] == (
+        "unsupported"
+    )
+
+
 def test_cli_dry_run_exposes_the_frozen_point_and_server_plans(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -988,3 +1210,53 @@ def test_first_point_failure_blocks_the_remaining_matrix(
             "error": "first point failed",
         }
     ]
+
+
+def test_later_unsupported_point_is_retained_and_matrix_continues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared_dir = tmp_path / "prepared"
+    _write_long_prepared(prepared_dir)
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "points": [
+                    _point(id="first"),
+                    _point(id="unsupported", max_num_batched_tokens=2048),
+                    _point(id="third", max_num_batched_tokens=8192),
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config, tokenizer_path = _configure_cli_environment(tmp_path, monkeypatch)
+    monkeypatch.setattr(run_points, "_git_state", lambda repo_root: ("3" * 40, False))
+    attempted = []
+
+    def execute(point, *args, **kwargs):
+        attempted.append(point.point.id)
+        if point.point.id == "unsupported":
+            raise UnsupportedPointError("CUDA out of memory")
+        return ({"status": "valid"},) * 3
+
+    monkeypatch.setattr(run_points, "execute_point", execute)
+    results_dir = tmp_path / "results"
+
+    status = main(
+        _point_cli_args(prepared_dir, plan_path, results_dir, config),
+        tokenizer_loader=lambda model, *, revision: FakeTokenizer(tokenizer_path),
+    )
+
+    assert status == 0
+    assert attempted == ["first", "unsupported", "third"]
+    manifest = json.loads((results_dir / "run-manifest.json").read_text())
+    assert manifest["status"] == "complete_with_unsupported"
+    assert manifest["points"][1] == {
+        "id": "unsupported",
+        "status": "unsupported",
+        "error_type": "UnsupportedPointError",
+        "error": "CUDA out of memory",
+    }

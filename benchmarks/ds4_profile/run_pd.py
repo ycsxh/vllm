@@ -77,6 +77,7 @@ class LaunchConfig:
     runtime_environment: dict[str, str]
     max_num_batched_tokens: int = 4096
     expected_remote_tokens: int | None = EXPECTED_REMOTE_TOKENS
+    enforce_eager: bool = False
     readiness_timeout: float = 900.0
     request_timeout: float = 300.0
     shutdown_timeout: float = 30.0
@@ -145,6 +146,7 @@ class LaunchPlan:
                 "max_num_batched_tokens": self.config.max_num_batched_tokens,
                 "prefix_caching": True,
                 "chunked_prefill": True,
+                "enforce_eager": self.config.enforce_eager,
                 "nixl_load_failure_policy": "fail",
                 "speculative_decoding": False,
             },
@@ -287,7 +289,7 @@ def _server_command(config: LaunchConfig, port: int, role: str) -> tuple[str, ..
         sort_keys=True,
     )
     python = str(config.repo_root / ".venv/bin/python")
-    return (
+    command = (
         python,
         "-m",
         "vllm.entrypoints.cli.main",
@@ -323,6 +325,9 @@ def _server_command(config: LaunchConfig, port: int, role: str) -> tuple[str, ..
         "--kv-transfer-config",
         transfer,
     )
+    if config.enforce_eager:
+        command += ("--enforce-eager",)
+    return command
 
 
 def build_plan(config: LaunchConfig) -> LaunchPlan:

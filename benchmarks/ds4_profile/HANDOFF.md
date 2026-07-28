@@ -1,4 +1,4 @@
-# Replacement Tickets 1–3 Closeout Handoff
+# Replacement Tickets 1–4 Handoff
 
 ## Status
 
@@ -7,7 +7,7 @@ Replacement Tickets 1–3 are complete:
 - Ticket 1 Gate B is `remote_verified`.
 - Ticket 2 Gate A is `remote_verified`.
 - Ticket 3 Gate C is `remote_verified`.
-- Ticket 4 is ready and unblocked, but has not started.
+- Ticket 4 is locally implemented; target execution and Gate D are pending.
 
 The accepted Ticket 2 runtime delivery is:
 
@@ -23,7 +23,8 @@ codex/ds4-replacement-tickets-1-2-continued
 ```
 
 [`AUTHORITATIVE_SPEC.md`](AUTHORITATIVE_SPEC.md) remains normative. This
-handoff records the accepted Tickets 1–3 evidence without starting Ticket 4.
+handoff preserves the accepted Tickets 1–3 evidence and routes the local
+Ticket 4 delivery to its target-server handoff.
 
 ## Ticket 1 completion
 
@@ -198,9 +199,27 @@ Hardware validation applies only to delivery commit
 `163935c12db0545c12eba694bfd6316be1f4094a`. The documentation closeout commit
 records that accepted state; it is not itself GPU-validated.
 
+## Ticket 4 local delivery
+
+The replacement Ticket 4 implementation adds:
+
+- `config/selected-pilot-points.json`, with 30 explicit optimized-mode points;
+- selected hit/chunk and concurrency/hit interactions without a generic
+  Cartesian planner;
+- three frozen DS4 prompt cut points and explicit 1/32/128 output lengths;
+- ITL p99 alongside three-run mean/CV and noisy labeling;
+- fail-closed OOM classification as `unsupported`;
+- at most one optional `eager_diagnostic` point; and
+- `report_results.py`, which re-audits raw official benchmark JSON and P/D
+  metrics before writing `summary.csv`, `report.md`, and seven SVG plots.
+
+Local work does not claim Gate D, does not run the model, and does not retire
+the legacy path. Exact target commands, review gates, and the post-acceptance
+retirement checklist are in
+[`TICKET_04_SERVER_HANDOFF.md`](TICKET_04_SERVER_HANDOFF.md).
+
 ## Next scope
 
-There is no remaining Ticket 1, Ticket 2, or Ticket 3 acceptance blocker.
-Ticket 4 is ready and unblocked, but has not started. The next scope is the
-Ticket 4 selected pilot and report defined in [`WORKFLOW.md`](WORKFLOW.md);
-this closeout does not implement any Ticket 4 work.
+There is no remaining Ticket 1, Ticket 2, or Ticket 3 acceptance blocker. The
+next scope is the target-server Ticket 4 dry run, live selected pilot, audited
+report generation, human Gate D review, and only then legacy retirement.

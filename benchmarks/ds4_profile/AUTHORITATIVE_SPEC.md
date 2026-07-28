@@ -423,6 +423,24 @@ After the minimum matrix passes:
 - output lengths: a small explicit set in the point plan, not values derived
   from historical DS4 assistant responses.
 
+The checked-in Ticket 4 plan freezes those remaining choices rather than
+selecting them at runtime:
+
+- the hit/chunk points use
+  `data/no_think/astropy__astropy-13236.traj.json#assistant-35`;
+- the concurrency/decode points use the same trajectory at `#assistant-17`;
+- the input-length points use assistant cut points 0, 17, and 35 from that
+  trajectory;
+- the output-length points use 1, 32, and 128 tokens; and
+- the overlapping main-effect and interaction points are stored once, yielding
+  30 explicit optimized-mode points rather than an expanded Cartesian product.
+
+The target dry run records the actual Qwen3.5 token lengths and rejects the
+plan if any nominal hit conditions collapse to the same 640-token-aligned
+prefix. The main plan contains no eager point. At most one separately labeled
+`eager_diagnostic` point may be run only after the optimized results show a
+specific behavior that requires it.
+
 Unsupported or out-of-memory points remain recorded as such. Parameters are not
 silently reduced to obtain a passing result.
 

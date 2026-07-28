@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "hardware": {
+    "gpu_count": 2,
+    "gpu_model": "NVIDIA GeForce RTX 3090",
+    "interconnect": "SYS"
+  },
+  "limitations": [
+    "Controlled request-rate-inf bursts are not a production arrival model.",
+    "DS4 supplies input prompts only; this is not a model-quality or SWE-bench evaluation.",
+    "1P1D TTFT includes proxy, P work, NIXL transfer, and D first-token time.",
+    "The pilot does not isolate P-to-D transfer latency or model queueing behavior.",
+    "Results apply only to the frozen hardware, revisions, topology, precision, and cache mode."
+  ]
+}
