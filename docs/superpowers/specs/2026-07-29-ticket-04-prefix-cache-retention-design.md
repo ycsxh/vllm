@@ -69,7 +69,9 @@ reuse evidence.
   before/after P/D metrics.
 - Do not weaken `derive_run_result`, cache-hit tolerances, or fail-closed NIXL
   checks.
-- Do not change core scheduler, cache-manager, proxy, or serving behavior.
+- Do not modify core scheduler, cache-manager, NIXL connector, or proxy code or
+  algorithms. The only allowed runtime-behavior change is the fixed Mamba
+  retention setting described below.
 - Do not expose prefix retention as a new experiment axis.
 - Keep `vllm-project/vllm` read-only and make any eventual repository changes
   only in `ycsxh/vllm`.
