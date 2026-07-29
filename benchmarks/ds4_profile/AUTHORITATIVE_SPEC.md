@@ -153,12 +153,18 @@ measurement into a fabricated pass.
 | P/D model, dtype, backend, cache dtype | Identical |
 | P/D block size | Identical; fixed for a comparison |
 | Effective HMA cache page | 640 tokens, from accepted Ticket 2 Gate A |
+| Mamba prefix-cache retention | `VLLM_PREFIX_CACHE_RETENTION_INTERVAL=0` on P and D |
 | Compile/CUDA Graph | Default optimized mode for main results |
 | Eager mode | At most one explicitly labeled diagnostic point |
 | GPU assignment | P=GPU0, D=GPU1 unless a run explicitly overrides it |
 | CPU/NUMA | Each role bound to the CPUs local to its assigned GPU |
 | NIXL failure policy | Fail closed; no silent local recompute fallback |
 | Development endpoints | `VLLM_SERVER_DEV_MODE=1` on P and D for cache reset |
+
+The zero Mamba retention interval keeps replay and detected shared-prefix
+boundaries instead of dense intermediate Mamba checkpoints; full-attention
+caching remains dense. It is a fixed Qwen3.5 DS4 runtime condition, not an
+experiment axis or host prerequisite.
 
 Qwen3.5 is a hybrid Attention/Gated-DeltaNet model. Basic NIXL PD support and
 hybrid cache layout tests in the pinned vLLM revision are prior evidence, not a

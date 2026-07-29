@@ -35,6 +35,7 @@ SMOKE_PROMPT = "Explain deterministic cache transfer in one sentence. " * 80
 EXPECTED_SMOKE_PROMPT_TOKENS = 642
 EFFECTIVE_HMA_PAGE_TOKENS = 640
 EXPECTED_REMOTE_TOKENS = 641
+PREFIX_CACHE_RETENTION_INTERVAL = 0
 RUNTIME_ENVIRONMENT_NAMES = (
     "CUDA_HOME",
     "FLASHINFER_JIT_VERBOSE",
@@ -145,6 +146,7 @@ class LaunchPlan:
                 "mamba_cache_mode": "align",
                 "max_num_batched_tokens": self.config.max_num_batched_tokens,
                 "prefix_caching": True,
+                "prefix_cache_retention_interval": (PREFIX_CACHE_RETENTION_INTERVAL),
                 "chunked_prefill": True,
                 "enforce_eager": self.config.enforce_eager,
                 "nixl_load_failure_policy": "fail",
@@ -392,6 +394,7 @@ def build_plan(config: LaunchConfig) -> LaunchPlan:
         **config.runtime_environment,
         "UCX_NET_DEVICES": "all",
         "VLLM_KV_CACHE_LAYOUT": "HND",
+        "VLLM_PREFIX_CACHE_RETENTION_INTERVAL": str(PREFIX_CACHE_RETENTION_INTERVAL),
         "VLLM_SERVER_DEV_MODE": "1",
     }
     processes = []

@@ -220,6 +220,7 @@ def test_build_plan_freezes_complete_child_environments(tmp_path):
         "VLLM_KV_CACHE_LAYOUT": "HND",
         "VLLM_NIXL_SIDE_CHANNEL_HOST": "127.0.0.1",
         "VLLM_NIXL_SIDE_CHANNEL_PORT": "5600",
+        "VLLM_PREFIX_CACHE_RETENTION_INTERVAL": "0",
         "VLLM_SERVER_DEV_MODE": "1",
     }
     assert decode["environment"] == {
@@ -229,9 +230,11 @@ def test_build_plan_freezes_complete_child_environments(tmp_path):
         "VLLM_KV_CACHE_LAYOUT": "HND",
         "VLLM_NIXL_SIDE_CHANNEL_HOST": "127.0.0.1",
         "VLLM_NIXL_SIDE_CHANNEL_PORT": "5601",
+        "VLLM_PREFIX_CACHE_RETENTION_INTERVAL": "0",
         "VLLM_SERVER_DEV_MODE": "1",
     }
     assert proxy["environment"] == runtime_environment
+    assert plan["compatibility"]["prefix_cache_retention_interval"] == 0
 
 
 def test_build_plan_rejects_unpinned_revision_before_execution(tmp_path):
