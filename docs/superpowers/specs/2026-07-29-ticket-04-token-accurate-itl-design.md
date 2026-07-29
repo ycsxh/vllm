@@ -51,7 +51,9 @@ SSE arrival into the corresponding number of token observations.
 
 This is the selected approach because it repairs the evidence at the boundary
 where the information is available, is backward compatible, and does not
-change model scheduling.
+change model scheduling. Token IDs are a mandatory DS4 profile request option:
+without them, a coalesced SSE delta does not expose enough information to
+produce one timing observation per output token.
 
 ### 2. Force one token per server SSE delta
 
@@ -96,10 +98,17 @@ proxy forwards the request body unchanged to D after adding
   TTFT, append ITL, or advance the most-recent-token timestamp.
 - Generated text is still accumulated from every choice.
 
-When `token_ids` is absent, the client retains its current one-token-per-choice
-behavior. This preserves compatibility with generic OpenAI endpoints and
-keeps the behavior change scoped to responses that provide explicit token
-cardinality.
+When `token_ids` is absent or `null`, the client retains its current
+one-token-per-choice behavior. This preserves compatibility with generic
+OpenAI endpoints, including vLLM responses that serialize an unrequested
+`token_ids` field as `null`, and keeps the behavior change scoped to responses
+that provide explicit token cardinality.
+
+The DS4 command always requests token IDs. Its existing validator, rather than
+a second client mode, enforces the observable measurement contract below. If
+an endpoint ignores the extension and then coalesces tokens, the incomplete
+ITL array is rejected. If it emits exactly one token per delta, the fallback
+observation is already token-accurate.
 
 The resulting observable contract is:
 
@@ -125,7 +134,7 @@ latencies.
 
 ## Error Handling
 
-- A present `token_ids` value that is not a list is treated as malformed
+- A non-null `token_ids` value that is not a list is treated as malformed
   response data and fails the request instead of silently reverting to message
   counting.
 - A token-bearing response still requires a successful HTTP response and a
@@ -149,7 +158,9 @@ fixtures:
    timestamp.
 3. A response without `token_ids` preserves the current one-token-per-choice
    fallback.
-4. A malformed non-list `token_ids` value fails the request.
+4. A response with `token_ids: null` preserves the same fallback used by
+   ordinary vLLM completion streams.
+5. A malformed non-null, non-list `token_ids` value fails the request.
 
 The tests patch the monotonic clock with literal timestamps and assert exact
 TTFT, ITL count, and latency values.
@@ -164,7 +175,8 @@ token IDs.
 
 The implementation is accepted only when:
 
-- each new regression test is observed failing before the implementation;
+- each changed-behavior regression test is observed failing before the
+  implementation, while compatibility characterization tests remain green;
 - the focused endpoint and DS4 suites pass after the implementation;
 - the complete DS4 profile suite and relevant lint checks pass;
 - independent Standards and Spec reviews approve the diff; and
