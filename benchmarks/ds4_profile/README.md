@@ -31,7 +31,7 @@ autoscaling.
 | 1 | Minimal DS4-to-CustomDataset adapter | Gate B `remote_verified` |
 | 2 | Qwen3.5 NIXL 1P1D feasibility and fixed launcher | Gate A `remote_verified` |
 | 3 | Controlled serving-metric MVP | Gate C `remote_verified` |
-| 4 | Selected measurements and report | Local implementation ready; Gate D remote pending |
+| 4 | Selected measurements and report | Target run retained; Gate D blocked on class A |
 
 Execution is risk-first: Ticket 2 smoke precedes the remaining implementation.
 The detailed gates are in
@@ -57,9 +57,9 @@ The detailed gates are in
 - Ticket 4 now has a checked-in 30-point selected pilot, explicit report
   comparisons, OOM/unsupported retention, optional one-point eager diagnostics,
   and an auditable `summary.csv`/Markdown/SVG report generator.
-- Local CPU contract tests cover the selected matrix and raw-evidence report
-  seam. The target-server dry run, live pilot, report review, and Gate D human
-  acceptance remain pending.
+- The frozen Ticket 4 target run retained 20 valid and 10 failed points. Class
+  B has a locally reviewed token-accurate ITL fix; class A remains reproduced
+  but undiagnosed. Gate D human acceptance remains blocked.
 - Existing Qwen2.5, normalization, workload, container, and profile-spine code
   is legacy implementation retained temporarily for traceability.
 - Legacy code must not be extended or treated as the new experiment path.
@@ -109,6 +109,8 @@ These files are current:
   Gate C acceptance and historical target-server procedure;
 - [`TICKET_04_SERVER_HANDOFF.md`](TICKET_04_SERVER_HANDOFF.md): replacement
   Ticket 4 target-server execution, report, and Gate D procedure;
+- [`TICKET_04_MEASUREMENT_FIX_HANDOFF.md`](TICKET_04_MEASUREMENT_FIX_HANDOFF.md):
+  current class-A/class-B diagnosis, fix, and next-session state;
 - [`HANDOFF.md`](HANDOFF.md): current replacement-project handoff state;
 - this README: project entry and current status.
 

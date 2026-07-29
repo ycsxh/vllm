@@ -7,7 +7,9 @@ Replacement Tickets 1–3 are complete:
 - Ticket 1 Gate B is `remote_verified`.
 - Ticket 2 Gate A is `remote_verified`.
 - Ticket 3 Gate C is `remote_verified`.
-- Ticket 4 is locally implemented; target execution and Gate D are pending.
+- Ticket 4 target execution completed against frozen commit `24e2ef4fc`, but
+  Gate D is blocked by two retained measurement-failure classes. Class B now
+  has a locally reviewed fix; class A remains reproduced but undiagnosed.
 
 The accepted Ticket 2 runtime delivery is:
 
@@ -23,8 +25,10 @@ codex/ds4-replacement-tickets-1-2-continued
 ```
 
 [`AUTHORITATIVE_SPEC.md`](AUTHORITATIVE_SPEC.md) remains normative. This
-handoff preserves the accepted Tickets 1–3 evidence and routes the local
-Ticket 4 delivery to its target-server handoff.
+handoff preserves the accepted Tickets 1–3 evidence. Current Ticket 4 work
+resumes from
+[`TICKET_04_MEASUREMENT_FIX_HANDOFF.md`](TICKET_04_MEASUREMENT_FIX_HANDOFF.md);
+the earlier target procedure remains in the server handoff.
 
 ## Ticket 1 completion
 
@@ -213,13 +217,19 @@ The replacement Ticket 4 implementation adds:
 - `report_results.py`, which re-audits raw official benchmark JSON and P/D
   metrics before writing `summary.csv`, `report.md`, and eight SVG plots.
 
-Local work does not claim Gate D, does not run the model, and does not retire
-the legacy path. Exact target commands, review gates, and the post-acceptance
-retirement checklist are in
-[`TICKET_04_SERVER_HANDOFF.md`](TICKET_04_SERVER_HANDOFF.md).
+The later target run exercised the model against frozen commit `24e2ef4fc` and
+retained its failed measurement evidence. It does not claim Gate D, and the
+legacy path remains in place. The current failure-fix state is in
+[`TICKET_04_MEASUREMENT_FIX_HANDOFF.md`](TICKET_04_MEASUREMENT_FIX_HANDOFF.md);
+the target commands, review gates, and post-acceptance retirement checklist
+remain in [`TICKET_04_SERVER_HANDOFF.md`](TICKET_04_SERVER_HANDOFF.md).
 
 ## Next scope
 
 There is no remaining Ticket 1, Ticket 2, or Ticket 3 acceptance blocker. The
-next scope is the target-server Ticket 4 dry run, live selected pilot, audited
-report generation, human Gate D review, and only then legacy retirement.
+next scope is to diagnose and fix Ticket 4 failure class A without modifying
+the frozen selected-pilot evidence. After separate class-A and class-B target
+probes pass, rerun the selected pilot in a new directory, audit the report,
+request human Gate D review, and only then retire the legacy path. See
+[`TICKET_04_MEASUREMENT_FIX_HANDOFF.md`](TICKET_04_MEASUREMENT_FIX_HANDOFF.md)
+for the exact state and ordering.
