@@ -201,7 +201,7 @@ def test_completion_ignores_zero_token_terminal_choice_for_timing(
             },
             {"usage": {"prompt_tokens": 1, "completion_tokens": 1}},
         ],
-        timestamps=[20.0, 21.0, 30.0],
+        timestamps=[20.0, 21.0, 21.0, 30.0],
     )
 
     assert output.success is True
@@ -250,7 +250,7 @@ def test_completion_rejects_non_list_token_ids(
             {"choices": [{"text": "a", "token_ids": 101}]},
             {"usage": {"prompt_tokens": 1, "completion_tokens": 1}},
         ],
-        timestamps=[40.0],
+        timestamps=[40.0, 41.0],
     )
 
     assert output.success is False

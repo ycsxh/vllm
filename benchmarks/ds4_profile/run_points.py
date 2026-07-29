@@ -812,6 +812,8 @@ def build_benchmark_command(
         f"http://127.0.0.1:{PORTS['proxy']}",
         "--endpoint",
         "/v1/completions",
+        "--extra-body",
+        '{"return_token_ids":true}',
         "--model",
         MODEL,
         "--tokenizer",

@@ -227,19 +227,37 @@ async def async_request_openai_completions(
                             if choices := data.get("choices"):
                                 # Note that text could be empty here
                                 # e.g. for special tokens
-                                text = choices[0].get("text")
-                                timestamp = time.perf_counter()
-                                # First token
-                                if not first_chunk_received:
-                                    first_chunk_received = True
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
-
-                                # Decoding phase
+                                choice = choices[0]
+                                text = choice.get("text")
+                                token_ids = choice.get("token_ids")
+                                if token_ids is None:
+                                    num_delta_tokens = 1
+                                elif isinstance(token_ids, list):
+                                    num_delta_tokens = len(token_ids)
                                 else:
-                                    output.itl.append(timestamp - most_recent_timestamp)
+                                    raise TypeError(
+                                        "choices[0].token_ids must be a list or null"
+                                    )
+                                if num_delta_tokens:
+                                    timestamp = time.perf_counter()
+                                    # First token
+                                    if not first_chunk_received:
+                                        first_chunk_received = True
+                                        output.ttft = timestamp - st
+                                        output.itl.extend(
+                                            [0.0] * (num_delta_tokens - 1)
+                                        )
 
-                                most_recent_timestamp = timestamp
+                                    # Decoding phase
+                                    else:
+                                        output.itl.append(
+                                            timestamp - most_recent_timestamp
+                                        )
+                                        output.itl.extend(
+                                            [0.0] * (num_delta_tokens - 1)
+                                        )
+
+                                    most_recent_timestamp = timestamp
                                 generated_text += text or ""
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")

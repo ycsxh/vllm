@@ -836,6 +836,7 @@ def test_benchmark_command_uses_only_the_official_controlled_options(
         ("--tokenizer", str(tmp_path / TOKENIZER_REVISION)),
     ):
         assert command[command.index(option) + 1] == value
+    assert command[command.index("--extra-body") + 1] == ('{"return_token_ids":true}')
     for flag in (
         "--disable-shuffle",
         "--ignore-eos",
