@@ -100,7 +100,7 @@ def test_completion_ignores_zero_token_terminal_choice_for_timing(
             },
             {"usage": {"prompt_tokens": 1, "completion_tokens": 1}},
         ],
-        timestamps=[20.0, 21.0, 21.0, 30.0],
+        timestamps=[20.0, 21.0, 30.0, 30.0],
     )
 
     assert output.success is True
