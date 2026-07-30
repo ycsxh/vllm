@@ -15,6 +15,7 @@ from typing import Any
 from benchmarks.ds4_profile.fixed_batch import (
     BLOCK_TOKENS,
     CACHE_PAGE_TOKENS,
+    FIXED_BATCH_RUNTIME_ENVIRONMENT,
     MODEL,
     FixedBatchPoint,
     batch_observation_from_dict,
@@ -192,10 +193,7 @@ def _audit_frozen_context(
             "cuda_visible_devices": role_gpus[point.role],
             "cpu_affinity": None if role_cpus is None else role_cpus[point.role],
             "numa_node": None if role_numa is None else role_numa[point.role],
-            "runtime_environment": {
-                "VLLM_PREFIX_CACHE_RETENTION_INTERVAL": "0",
-                "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
-            },
+            "runtime_environment": FIXED_BATCH_RUNTIME_ENVIRONMENT,
         }
         if any(engine.get(name) != value for name, value in expected_engine.items()):
             raise ValueError(f"{point.id} engine config differs from provenance")
@@ -210,15 +208,20 @@ def _audit_frozen_context(
         visible_gpu_count = runtime.get("visible_gpu_count")
         if visible_gpu_count is not None and visible_gpu_count != 1:
             raise ValueError(f"{point.id} did not isolate one visible GPU")
-        if runtime.get("runner_boundary") == "vllm.LLM.generate":
-            invocation = _load_json_object(point_dir / "runtime-invocation.json")
-            environment = invocation.get("environment")
-            if (
-                not isinstance(invocation.get("command"), list)
-                or not isinstance(environment, dict)
-                or environment.get("CUDA_VISIBLE_DEVICES") != role_gpus[point.role]
-            ):
-                raise ValueError(f"{point.id} runtime invocation is inconsistent")
+        if runtime.get("runner_boundary") != "vllm.LLM.generate":
+            raise ValueError(f"{point.id} runner boundary is not public LLM.generate")
+        invocation = _load_json_object(point_dir / "runtime-invocation.json")
+        environment = invocation.get("environment")
+        if (
+            not isinstance(invocation.get("command"), list)
+            or not isinstance(environment, dict)
+            or environment.get("CUDA_VISIBLE_DEVICES") != role_gpus[point.role]
+            or any(
+                environment.get(name) != value
+                for name, value in FIXED_BATCH_RUNTIME_ENVIRONMENT.items()
+            )
+        ):
+            raise ValueError(f"{point.id} runtime invocation is inconsistent")
         if runtime not in runtime_provenance:
             runtime_provenance.append(runtime)
         visible_gpu_model = runtime.get("visible_gpu_model")
@@ -234,6 +237,7 @@ def _audit_frozen_context(
         raise ValueError("runtime provenance differs across executed points")
     return {
         "execution": execution,
+        "runtime_environment": FIXED_BATCH_RUNTIME_ENVIRONMENT,
         "runtime_provenance": runtime_provenance,
     }
 
@@ -467,6 +471,8 @@ def _write_report(
         f"- Attention backend: `{execution['attention_backend']}`",
         "- Cache/runtime: BF16 KV, 128-token blocks, 640-token HMA pages, "
         "prefix caching on, chunked prefill off",
+        "- Fixed-batch runtime environment: "
+        f"`{json.dumps(frozen_context['runtime_environment'], sort_keys=True)}`",
         f"- Role GPUs: `{json.dumps(execution['role_gpus'])}`",
         f"- CPU affinity: `{json.dumps(execution['role_cpu_affinity'])}`",
         f"- NUMA nodes: `{json.dumps(execution['role_numa_nodes'])}`",

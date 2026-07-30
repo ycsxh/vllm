@@ -3,6 +3,7 @@
 
 import csv
 import json
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -23,7 +24,10 @@ from benchmarks.ds4_profile.fixed_batch import (
     main as fixed_batch_main,
 )
 from benchmarks.ds4_profile.fixed_batch_report import build_fixed_batch_report
-from benchmarks.ds4_profile.fixed_batch_runtime import OfflineLLMRuntime
+from benchmarks.ds4_profile.fixed_batch_runtime import (
+    OfflineLLMRuntime,
+    SubprocessOfflineRuntime,
+)
 
 CONFIG_DIR = Path(__file__).parents[3] / "benchmarks/ds4_profile/config"
 
@@ -40,11 +44,24 @@ class FakeRuntime:
         self.point_dir = point_dir
         self.operations: list[tuple[str, int]] = []
         self.profile_calls: list[str] = []
+        (point_dir / "runtime-invocation.json").write_text(
+            json.dumps(
+                {
+                    "command": ["fake-public-llm"],
+                    "environment": {
+                        "CUDA_VISIBLE_DEVICES": engine_config["cuda_visible_devices"],
+                        **engine_config["runtime_environment"],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
 
     def provenance(self) -> dict[str, Any]:
         return {
             "runtime": "fake",
             "hardware": "cpu-contract",
+            "runner_boundary": "vllm.LLM.generate",
             "runtime_versions": {"vllm": "test"},
             "visible_gpu_count": 1,
             "visible_gpu_model": "NVIDIA GeForce RTX 3090",
@@ -283,6 +300,10 @@ def test_runner_profiles_one_exact_p_batch_and_retains_auditable_artifacts(
     assert runtime.engine_config["enable_chunked_prefill"] is False
     assert runtime.engine_config["max_num_seqs"] == 2
     assert runtime.engine_config["max_num_batched_tokens"] == 12_801
+    assert (
+        runtime.engine_config["runtime_environment"]["VLLM_ENABLE_V1_MULTIPROCESSING"]
+        == "0"
+    )
     assert runtime.operations.count(("reset_prefix_cache", 0)) == 45
     assert runtime.operations.count(("generate", 9_601)) == 90
     assert runtime.operations.count(("generate", 12_800)) == 45
@@ -636,6 +657,8 @@ def test_report_reaudits_raw_p_and_d_samples_instead_of_stored_summaries(
     assert "2" * 40 in report_text
     assert "3" * 40 in report_text
     assert "FLASHINFER" in report_text
+    assert '"VLLM_ENABLE_V1_MULTIPROCESSING": "0"' in report_text
+    assert '"VLLM_KV_CACHE_LAYOUT": "HND"' in report_text
     assert {path.name for path in report.plot_paths} == {
         "p-latency.svg",
         "p-computed-token-throughput.svg",
@@ -643,6 +666,42 @@ def test_report_reaudits_raw_p_and_d_samples_instead_of_stored_summaries(
         "d-output-token-throughput.svg",
     }
     assert all(path.is_file() for path in report.plot_paths)
+
+    p_provenance_path = results_dir / "points/p-b2-hit75/provenance.json"
+    p_provenance = json.loads(p_provenance_path.read_text())
+    p_provenance["runtime"]["runner_boundary"] = "vllm.private.scheduler"
+    p_provenance_path.write_text(json.dumps(p_provenance), encoding="utf-8")
+    with pytest.raises(ValueError, match="runner boundary"):
+        build_fixed_batch_report(
+            plan_path,
+            results_dir,
+            tmp_path / "invalid-runner-boundary-report",
+            hardware={
+                "gpu_count": 2,
+                "gpu_model": "NVIDIA GeForce RTX 3090",
+                "topology": "1P1D TP=1",
+            },
+        )
+    p_provenance["runtime"]["runner_boundary"] = "vllm.LLM.generate"
+    p_provenance_path.write_text(json.dumps(p_provenance), encoding="utf-8")
+
+    p_invocation_path = results_dir / "points/p-b2-hit75/runtime-invocation.json"
+    p_invocation = json.loads(p_invocation_path.read_text())
+    p_invocation["environment"]["VLLM_ENABLE_V1_MULTIPROCESSING"] = "1"
+    p_invocation_path.write_text(json.dumps(p_invocation), encoding="utf-8")
+    with pytest.raises(ValueError, match="runtime invocation"):
+        build_fixed_batch_report(
+            plan_path,
+            results_dir,
+            tmp_path / "invalid-runtime-invocation-report",
+            hardware={
+                "gpu_count": 2,
+                "gpu_model": "NVIDIA GeForce RTX 3090",
+                "topology": "1P1D TP=1",
+            },
+        )
+    p_invocation["environment"]["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    p_invocation_path.write_text(json.dumps(p_invocation), encoding="utf-8")
 
     for run_index, elapsed_ms in ((2, 16.0), (3, 24.0)):
         for batch_index in range(1, 11):
@@ -819,6 +878,60 @@ def test_offline_runtime_passes_only_supported_public_llm_arguments(
     assert "device" not in llm_kwargs
     assert llm_kwargs["attention_config"] == {"backend": "FLASH_ATTN"}
     assert llm_kwargs["enable_chunked_prefill"] is False
+
+
+def test_subprocess_runtime_retains_fixed_batch_engine_core_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_environment: dict[str, str] = {}
+
+    class FakeProcess:
+        stdin = StringIO()
+        stdout = StringIO('{"event":"ready","provenance":{}}\n')
+
+        @staticmethod
+        def poll() -> int:
+            return 0
+
+    def fake_popen(_command: Any, **kwargs: Any) -> FakeProcess:
+        captured_environment.update(kwargs["env"])
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        "benchmarks.ds4_profile.fixed_batch_runtime.subprocess.Popen",
+        fake_popen,
+    )
+    point_dir = tmp_path / "point"
+    point_dir.mkdir()
+    runtime = SubprocessOfflineRuntime(
+        FixedBatchPoint(
+            id="p-b2-hit75",
+            role="P",
+            batch_size=2,
+            input_tokens=12_800,
+            hit_ratio=0.75,
+            output_tokens=1,
+            repetitions=1,
+            warmup_batches=1,
+            measured_batches=1,
+            execution_mode="feasibility_smoke",
+        ),
+        {
+            "cpu_affinity": "0,2",
+            "cuda_visible_devices": "0",
+            "numa_node": 0,
+            "runtime_environment": {
+                "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+            },
+        },
+        point_dir,
+    )
+    runtime.close()
+
+    invocation = json.loads((point_dir / "runtime-invocation.json").read_text())
+    assert captured_environment["VLLM_ENABLE_V1_MULTIPROCESSING"] == "0"
+    assert invocation["environment"]["VLLM_ENABLE_V1_MULTIPROCESSING"] == "0"
 
 
 def test_diagnostic_point_profiles_only_the_target_phase_and_is_not_primary(
