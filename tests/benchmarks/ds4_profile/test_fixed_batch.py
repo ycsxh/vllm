@@ -42,7 +42,13 @@ class FakeRuntime:
         self.profile_calls: list[str] = []
 
     def provenance(self) -> dict[str, Any]:
-        return {"runtime": "fake", "hardware": "cpu-contract"}
+        return {
+            "runtime": "fake",
+            "hardware": "cpu-contract",
+            "runtime_versions": {"vllm": "test"},
+            "visible_gpu_count": 1,
+            "visible_gpu_model": "NVIDIA GeForce RTX 3090",
+        }
 
     def wait_idle(self) -> None:
         self.operations.append(("wait_idle", 0))
@@ -199,6 +205,27 @@ class CacheMismatchRuntime(FakeRuntime):
         )
 
 
+class CapacityFailureRuntime(FakeRuntime):
+    def __init__(
+        self,
+        point: Any,
+        engine_config: dict[str, Any],
+        point_dir: Path,
+        message: str,
+    ) -> None:
+        super().__init__(point, engine_config, point_dir)
+        self.message = message
+
+    def generate(
+        self,
+        prompt_token_ids: tuple[tuple[int, ...], ...],
+        *,
+        max_tokens: int,
+        ignore_eos: bool,
+    ) -> BatchObservation:
+        raise RuntimeError(self.message)
+
+
 def test_runner_profiles_one_exact_p_batch_and_retains_auditable_artifacts(
     tmp_path: Path,
 ) -> None:
@@ -338,6 +365,11 @@ def test_runner_excludes_d_setup_and_first_step_from_steady_tpot_proxy(
     assert summary["metric_label"] == "D-side TPOT proxy"
     assert summary["metrics"]["latency_ms"]["mean"] == 1.0
     assert summary["metrics"]["output_token_throughput_per_s"]["mean"] == 4_000.0
+    assert summary["metrics"]["first_decode_latency_ms"]["mean"] == 2.0
+    assert (
+        summary["metrics"]["first_decode_output_token_throughput_per_s"]["mean"]
+        == 2_000.0
+    )
     measured = json.loads((point_dir / "run-01/measured-01.json").read_text())
     assert measured["setup_iteration"]["context_tokens"] == 51_200
     assert measured["first_decode_iteration"]["elapsed_ms"] == 2.0
@@ -454,6 +486,65 @@ def test_runner_retains_partial_evidence_when_cache_validation_fails(
     assert runtimes[0].operations[-1] == ("close", 0)
 
 
+@pytest.mark.parametrize(
+    "message",
+    (
+        "No available memory for the cache blocks.",
+        "KV cache is needed, which is larger than the available KV cache memory.",
+    ),
+)
+def test_runner_classifies_verified_vllm_capacity_failures_as_unsupported(
+    tmp_path: Path,
+    message: str,
+) -> None:
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "points": [
+                    {
+                        "id": "p-b1-hit0-smoke",
+                        "role": "P",
+                        "batch_size": 1,
+                        "input_tokens": 12_800,
+                        "hit_ratio": 0.0,
+                        "output_tokens": 1,
+                        "repetitions": 1,
+                        "warmup_batches": 1,
+                        "measured_batches": 1,
+                        "execution_mode": "feasibility_smoke",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_fixed_batch_profile(
+        plan_path,
+        tmp_path / "results",
+        execution=FixedBatchExecution(
+            model_revision="1" * 40,
+            tokenizer_revision="2" * 40,
+            vllm_commit="3" * 40,
+            attention_backend="FLASHINFER",
+        ),
+        runtime_factory=lambda point, engine_config, point_dir: (
+            CapacityFailureRuntime(point, engine_config, point_dir, message)
+        ),
+    )
+
+    assert result == {
+        "status": "valid_with_unsupported",
+        "point_statuses": {"p-b1-hit0-smoke": "unsupported"},
+    }
+    failure = json.loads(
+        (tmp_path / "results/points/p-b1-hit0-smoke/point-failure.json").read_text()
+    )
+    assert failure["status"] == "unsupported"
+
+
 def test_report_reaudits_raw_p_and_d_samples_instead_of_stored_summaries(
     tmp_path: Path,
 ) -> None:
@@ -533,6 +624,7 @@ def test_report_reaudits_raw_p_and_d_samples_instead_of_stored_summaries(
     assert float(rows["p-b2-hit75"]["latency_p50_mean_ms"]) == 8.0
     assert float(rows["p-b2-hit75"]["latency_p95_mean_ms"]) == 8.0
     assert float(rows["d-b4"]["latency_p50_mean_ms"]) == 1.0
+    assert float(rows["d-b4"]["first_decode_latency_p50_mean_ms"]) == 2.0
     assert rows["p-b2-hit75"]["metric_label"] == "P-side TTFT proxy"
     assert rows["d-b4"]["metric_label"] == "D-side TPOT proxy"
 
@@ -540,6 +632,10 @@ def test_report_reaudits_raw_p_and_d_samples_instead_of_stored_summaries(
     assert "12,800-token" in report_text
     assert "dual RTX 3090" in report_text
     assert "not client-observed" in report_text
+    assert "1" * 40 in report_text
+    assert "2" * 40 in report_text
+    assert "3" * 40 in report_text
+    assert "FLASHINFER" in report_text
     assert {path.name for path in report.plot_paths} == {
         "p-latency.svg",
         "p-computed-token-throughput.svg",
@@ -547,6 +643,53 @@ def test_report_reaudits_raw_p_and_d_samples_instead_of_stored_summaries(
         "d-output-token-throughput.svg",
     }
     assert all(path.is_file() for path in report.plot_paths)
+
+    for run_index, elapsed_ms in ((2, 16.0), (3, 24.0)):
+        for batch_index in range(1, 11):
+            measured_path = (
+                results_dir
+                / f"points/p-b2-hit75/run-{run_index:02d}"
+                / f"measured-{batch_index:02d}.json"
+            )
+            measured = json.loads(measured_path.read_text())
+            measured["observation"]["iterations"][0]["elapsed_ms"] = elapsed_ms
+            measured_path.write_text(json.dumps(measured), encoding="utf-8")
+    d_status_path = results_dir / "points/d-b4/status.json"
+    d_status = json.loads(d_status_path.read_text())
+    d_status.update({"status": "unsupported", "reason": "capacity frontier"})
+    d_status_path.write_text(json.dumps(d_status), encoding="utf-8")
+
+    build_fixed_batch_report(
+        plan_path,
+        results_dir,
+        tmp_path / "annotated-report",
+        hardware={
+            "gpu_count": 2,
+            "gpu_model": "NVIDIA GeForce RTX 3090",
+            "topology": "1P1D TP=1",
+        },
+    )
+    assert "noisy" in (tmp_path / "annotated-report/p-latency.svg").read_text().lower()
+    assert (
+        "unsupported"
+        in (tmp_path / "annotated-report/d-latency.svg").read_text().lower()
+    )
+
+    resolved_path = results_dir / "resolved-plan.json"
+    resolved = json.loads(resolved_path.read_text())
+    resolved["execution"]["vllm_commit"] = "4" * 40
+    resolved_path.write_text(json.dumps(resolved), encoding="utf-8")
+    with pytest.raises(ValueError, match="provenance"):
+        build_fixed_batch_report(
+            plan_path,
+            results_dir,
+            tmp_path / "invalid-provenance-report",
+            hardware={
+                "gpu_count": 2,
+                "gpu_model": "NVIDIA GeForce RTX 3090",
+                "topology": "1P1D TP=1",
+            },
+        )
 
 
 def test_offline_runtime_uses_public_llm_results_and_iteration_detail_logs(

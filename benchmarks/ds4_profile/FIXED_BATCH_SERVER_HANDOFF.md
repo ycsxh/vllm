@@ -55,6 +55,7 @@ git checkout "$EXPECTED_COMMIT"
 test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
 test -z "$(git status --porcelain)"
 test -x .venv/bin/python
+command -v nvidia-smi
 mkdir -p "$ARTIFACT_ROOT"
 ```
 
@@ -254,9 +255,13 @@ test ! -e "$MAIN_REPORT"
 ```
 
 The report builder recomputes every metric from each measured raw observation;
-it does not trust stored point summaries. Review `summary.csv`, `report.md`, and
-all four SVG plots. Keep frontier results as a clearly labeled supplemental
-table/curve until they are deliberately combined into a later approved report.
+it does not trust stored point summaries. It also cross-checks the resolved
+plan, engine configurations, runtime invocations, revisions, GPU model, and
+runtime provenance. The CSV and Markdown retain the first pure-decode step
+separately from the 126-step steady distribution. Review `summary.csv`,
+`report.md`, and all four SVG plots. Keep frontier results as a clearly labeled
+supplemental table/curve until they are deliberately combined into a later
+approved report.
 
 ## 8. Optional diagnostics
 
