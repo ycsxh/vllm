@@ -2,12 +2,14 @@
 
 ## Status
 
-Ticket 4 is `ready_for_human_gate_d`. Failure classes A and B are diagnosed,
-fixed, reviewed, and validated. The fresh selected-pilot run completed with
-30/30 valid points and 90/90 valid repetitions.
+Ticket 4 Gate D is `accepted`. The human repository operator explicitly
+accepted the report, evidence review, noisy labels, and limitations at
+`2026-07-30T14:56:10+08:00`.
 
-This handoff does not claim human Gate D acceptance. The report keeps that
-checkbox open, and the legacy path has not been retired.
+Failure classes A and B are diagnosed, fixed, reviewed, and validated. The
+fresh selected-pilot run completed with 30/30 valid points and 90/90 valid
+repetitions. The acceptance record is stored separately from the immutable
+run evidence. Legacy retirement remains explicitly deferred.
 
 ## Repository state
 
@@ -47,8 +49,8 @@ used by both the target validations and the successful full pilot.
 
 Do not overwrite, regenerate, relabel, or edit `attempt-02`,
 `diagnostic-a01`, `diagnostic-b01`, any `a02`-through-`a10` probe, any
-validation, `attempt-03`, or `attempt-04`. This branch has not claimed human
-Gate D acceptance and has not retired the legacy path.
+validation, `attempt-03`, or `attempt-04`. This branch records human Gate D
+acceptance but has not retired the legacy path.
 
 ## Class B: complete
 
@@ -306,6 +308,30 @@ the completed result directory is:
 d700d06974fa82a050ce851c016e8c72f5d0365a015a7eed2c1f4d1fb2832af8
 ```
 
+## Gate D acceptance record
+
+The immutable acceptance record is:
+
+```text
+/home/lyc/ds4-storage/runs/
+  ds4-ticket-04-05175de02-attempt-04-gate-d-review-a01/
+    gate-d-review.md
+    checksums.sha256
+```
+
+It records the human verdict, plot and log review, hardware/topology
+confirmation, cleanup state, accepted limitations, and explicit deferral of
+legacy retirement. Its SHA-256 values are:
+
+```text
+gate-d-review.md  39ce48aba49872555439de0bf9afa1104eb74f43b9ca153b06c52a5d30dba709
+checksums.sha256  334d009faa3ed9b74c3f606482914c29a36179ac9385a1e5f79ae7393b489ea9
+```
+
+The generated `attempt-04/report.md` remains unchanged, including its
+pre-acceptance checklist state. This separate review artifact is the
+authoritative post-run human acceptance record.
+
 ## Old checkout and migration note
 
 `/home/lyc/vllm` remains the older
@@ -316,13 +342,14 @@ branch, and the old copies are superseded. No implementation change remains
 stranded there. Do not clean or commit that checkout's untracked `.worktrees`
 or transfer files.
 
-## Next exact gate
+## Closeout boundary
 
-The next action is human Gate D review of `attempt-04`, `report.md`, the two
-noisy labels, and the evidence identities above. Record explicit acceptance
-in a new review artifact; do not edit an existing result or historical
-failure directory.
+Ticket 4 Gate D is complete. The human reviewer explicitly instructed:
 
-Only after explicit human acceptance may a later session execute the legacy
-retirement checklist. No push, PR, upstream mutation, or legacy retirement
-has been performed here.
+```text
+暂不执行 legacy retirement
+```
+
+Legacy retirement therefore remains out of scope and requires a separate
+future authorization and reviewed change. No push, PR, upstream mutation, or
+legacy retirement has been performed here.
