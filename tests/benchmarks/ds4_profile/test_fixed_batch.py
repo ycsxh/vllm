@@ -530,8 +530,8 @@ def test_runner_classifies_verified_vllm_capacity_failures_as_unsupported(
             vllm_commit="3" * 40,
             attention_backend="FLASHINFER",
         ),
-        runtime_factory=lambda point, engine_config, point_dir: (
-            CapacityFailureRuntime(point, engine_config, point_dir, message)
+        runtime_factory=lambda point, engine_config, point_dir: CapacityFailureRuntime(
+            point, engine_config, point_dir, message
         ),
     )
 
