@@ -33,6 +33,7 @@ from vllm.config.vllm import (
     OPTIMIZATION_LEVEL_TO_CONFIG,
     OptimizationLevel,
 )
+from vllm.model_executor.models.config import MambaModelConfig
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionCGSupport
 
@@ -1038,6 +1039,30 @@ def test_is_chunked_prefill_supported(
     with caplog_vllm.at_level(level=logging.DEBUG, logger="vllm"):
         assert model_config.is_chunked_prefill_supported == expected_result
     assert reason in caplog_vllm.text
+
+
+def test_mamba_align_respects_explicit_disabled_chunked_prefill() -> None:
+    cache_config = SimpleNamespace(
+        block_size=128,
+        enable_prefix_caching=True,
+        mamba_block_size=None,
+        mamba_cache_mode="align",
+    )
+    scheduler_config = SimpleNamespace(enable_chunked_prefill=False)
+    config = SimpleNamespace(
+        cache_config=cache_config,
+        model_config=SimpleNamespace(
+            architecture="Qwen3_5ForConditionalGeneration",
+            supports_mamba_prefix_caching=False,
+        ),
+        scheduler_config=scheduler_config,
+    )
+
+    MambaModelConfig.verify_and_update_config(config)
+
+    assert cache_config.mamba_cache_mode == "align"
+    assert cache_config.mamba_block_size == 128
+    assert scheduler_config.enable_chunked_prefill is False
 
 
 @pytest.mark.parametrize(
