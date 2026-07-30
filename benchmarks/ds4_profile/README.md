@@ -31,7 +31,7 @@ autoscaling.
 | 1 | Minimal DS4-to-CustomDataset adapter | Gate B `remote_verified` |
 | 2 | Qwen3.5 NIXL 1P1D feasibility and fixed launcher | Gate A `remote_verified` |
 | 3 | Controlled serving-metric MVP | Gate C `remote_verified` |
-| 4 | Selected measurements and report | Ready; Gate C prerequisite satisfied |
+| 4 | Selected measurements and report | Gate D `accepted`; retirement deferred |
 
 Execution is risk-first: Ticket 2 smoke precedes the remaining implementation.
 The detailed gates are in
@@ -54,13 +54,18 @@ The detailed gates are in
   accepted runtime's 640-token effective HMA cache page.
 - Ticket 3 Gate C passed on the target dual-RTX-3090 machine against immutable
   delivery `163935c12db0545c12eba694bfd6316be1f4094a`.
-- Ticket 4 is ready and unblocked, but its selected pilot and report have not
-  started.
+- Ticket 4 now has a checked-in 30-point selected pilot, explicit report
+  comparisons, OOM/unsupported retention, optional one-point eager diagnostics,
+  and an auditable `summary.csv`/Markdown/SVG report generator.
+- The accepted Ticket 4 implementation is `05175de028`. Its frozen target run
+  produced 30/30 valid points and 90/90 valid repetitions with both measurement
+  failure classes resolved.
+- Gate D human acceptance was recorded on 2026-07-30. Two valid points retain
+  their noisy labels; no correctness or transfer contract failed.
 - Existing Qwen2.5, normalization, workload, container, and profile-spine code
   is legacy implementation retained temporarily for traceability.
 - Legacy code must not be extended or treated as the new experiment path.
-- It is retired only after the replacement passes the hardware and profile
-  acceptance gates.
+- Legacy retirement is explicitly deferred and requires separate authorization.
 
 Follow [`WORKFLOW.md`](WORKFLOW.md) for the implementation and acceptance order.
 Do not copy commands from legacy handoffs or historical design documents into
@@ -103,7 +108,11 @@ These files are current:
   completion;
 - [`TICKET_03_SERVER_HANDOFF.md`](TICKET_03_SERVER_HANDOFF.md): controlled MVP
   Gate C acceptance and historical target-server procedure;
-- [`HANDOFF.md`](HANDOFF.md): current Tickets 1–3 closeout state;
+- [`TICKET_04_SERVER_HANDOFF.md`](TICKET_04_SERVER_HANDOFF.md): replacement
+  Ticket 4 target-server execution, report, and Gate D procedure;
+- [`TICKET_04_MEASUREMENT_FIX_HANDOFF.md`](TICKET_04_MEASUREMENT_FIX_HANDOFF.md):
+  final class-A/class-B fixes, evidence, and Gate D acceptance;
+- [`HANDOFF.md`](HANDOFF.md): current replacement-project handoff state;
 - this README: project entry and current status.
 
 `TICKET_04_HANDOFF.md`, `container/README.md`, and the existing Ticket 01-04

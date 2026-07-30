@@ -32,7 +32,7 @@ from benchmarks.ds4_profile.run_pd import (
 )
 
 MODEL = "Qwen/Qwen3.5-4B"
-POINT_FIELDS = {
+REQUIRED_POINT_FIELDS = {
     "hit_ratio",
     "id",
     "max_concurrency",
@@ -42,6 +42,8 @@ POINT_FIELDS = {
     "repetitions",
     "source_request_id",
 }
+OPTIONAL_POINT_FIELDS = {"execution_mode"}
+EXECUTION_MODES = {"optimized", "eager_diagnostic"}
 
 
 class Tokenizer(Protocol):
@@ -98,6 +100,10 @@ class SubprocessPointRuntime(SubprocessRuntime):
         time.sleep(seconds)
 
 
+class UnsupportedPointError(RuntimeError):
+    """A retained hardware-capacity result that does not invalidate the matrix."""
+
+
 @dataclass(frozen=True)
 class ExperimentPoint:
     """One explicitly selected experiment point."""
@@ -110,6 +116,7 @@ class ExperimentPoint:
     output_tokens: int
     num_prompts: int
     repetitions: int
+    execution_mode: str = "optimized"
 
 
 @dataclass(frozen=True)
@@ -157,6 +164,7 @@ POINT_SUMMARY_METRICS = (
     "p50_tpot_ms",
     "p90_tpot_ms",
     "p95_tpot_ms",
+    "p99_itl_ms",
 )
 
 
@@ -179,8 +187,8 @@ def _positive_int(value: object, name: str) -> int:
 def _parse_point(value: object) -> ExperimentPoint:
     if not isinstance(value, dict):
         raise ValueError("each point must be a JSON object")
-    unexpected = sorted(value.keys() - POINT_FIELDS)
-    missing = sorted(POINT_FIELDS - value.keys())
+    unexpected = sorted(value.keys() - REQUIRED_POINT_FIELDS - OPTIONAL_POINT_FIELDS)
+    missing = sorted(REQUIRED_POINT_FIELDS - value.keys())
     if unexpected:
         raise ValueError(f"point contains unexpected fields: {', '.join(unexpected)}")
     if missing:
@@ -205,7 +213,10 @@ def _parse_point(value: object) -> ExperimentPoint:
         raise ValueError("num_prompts must be between 20 and 50")
     repetitions = _positive_int(value["repetitions"], "repetitions")
     if repetitions != 3:
-        raise ValueError("repetitions must be exactly 3 for Ticket 3")
+        raise ValueError("repetitions must be exactly 3")
+    execution_mode = value.get("execution_mode", "optimized")
+    if execution_mode not in EXECUTION_MODES:
+        raise ValueError("execution_mode must be optimized or eager_diagnostic")
     return ExperimentPoint(
         id=point_id,
         source_request_id=source_request_id,
@@ -217,16 +228,26 @@ def _parse_point(value: object) -> ExperimentPoint:
         output_tokens=_positive_int(value["output_tokens"], "output_tokens"),
         num_prompts=num_prompts,
         repetitions=repetitions,
+        execution_mode=execution_mode,
     )
 
 
 def load_experiment_plan(path: Path) -> tuple[ExperimentPoint, ...]:
     """Load an explicit point list without expanding parameter combinations."""
     value = _load_json_object(path)
-    if set(value) != {"schema_version", "points"}:
-        raise ValueError("plan must contain only schema_version and points")
-    if value["schema_version"] != 1:
+    schema_version = value.get("schema_version")
+    expected_fields = (
+        {"schema_version", "points"}
+        if schema_version == 1
+        else {"schema_version", "points", "report"}
+    )
+    if set(value) != expected_fields:
+        fields = ", ".join(sorted(expected_fields))
+        raise ValueError(f"plan must contain only {fields}")
+    if schema_version not in {1, 2}:
         raise ValueError("unsupported plan schema_version")
+    if schema_version == 2 and not isinstance(value["report"], dict):
+        raise ValueError("version 2 plan report must be a JSON object")
     raw_points = value["points"]
     if not isinstance(raw_points, list) or not raw_points:
         raise ValueError("points must be a non-empty list")
@@ -234,6 +255,8 @@ def load_experiment_plan(path: Path) -> tuple[ExperimentPoint, ...]:
     point_ids = [point.id for point in points]
     if len(point_ids) != len(set(point_ids)):
         raise ValueError("point ids must be unique")
+    if sum(point.execution_mode == "eager_diagnostic" for point in points) > 1:
+        raise ValueError("plan permits at most one eager diagnostic point")
     return points
 
 
@@ -440,6 +463,7 @@ def prepare_experiment(
             point.max_concurrency,
             point.output_tokens,
             point.num_prompts,
+            point.execution_mode,
             tuple(request.planned_cached_tokens for request in prepared.requests),
         )
         previous_id = aligned_conditions.get(condition)
@@ -664,6 +688,13 @@ def derive_run_result(
         ]
         for percentile in (50, 90, 95):
             derived[f"p{percentile}_tpot_ms"] = _percentile(tpots, percentile) * 1000
+        derived["p99_itl_ms"] = (
+            _percentile(
+                [float(value) for samples in itls for value in samples],
+                99,
+            )
+            * 1000
+        )
     return derived
 
 
@@ -742,6 +773,7 @@ def write_point_inputs(point: PreparedPoint, point_dir: Path) -> Path:
                 "output_tokens": point.point.output_tokens,
                 "num_prompts": point.point.num_prompts,
                 "repetitions": point.point.repetitions,
+                "execution_mode": point.point.execution_mode,
             },
             "requests": [
                 {
@@ -780,6 +812,8 @@ def build_benchmark_command(
         f"http://127.0.0.1:{PORTS['proxy']}",
         "--endpoint",
         "/v1/completions",
+        "--extra-body",
+        '{"return_token_ids":true}',
         "--model",
         MODEL,
         "--tokenizer",
@@ -976,6 +1010,7 @@ def execute_point(
         run_dir=point_dir,
         max_num_batched_tokens=point.point.max_num_batched_tokens,
         expected_remote_tokens=None,
+        enforce_eager=point.point.execution_mode == "eager_diagnostic",
     )
     plan = build_plan(config)
     _write_json(point_dir / "server-plan.json", plan.as_dict())
@@ -988,6 +1023,7 @@ def execute_point(
             "tokenizer_path": str(tokenizer_path),
             "vllm_commit": config.vllm_commit,
             "vllm_dirty": config.vllm_dirty,
+            "execution_mode": point.point.execution_mode,
             "topology": plan.as_dict()["topology"],
             "compatibility": plan.as_dict()["compatibility"],
         },
@@ -1051,15 +1087,54 @@ def execute_point(
             )
             return tuple(results)
     except BaseException as error:
+        status, retained_error = _point_failure_details(point_dir, error)
         _write_json(
             point_dir / "point-failure.json",
             {
-                "status": "failed",
+                "status": status,
                 "error_type": type(error).__name__,
-                "error": str(error),
+                "error": retained_error,
             },
         )
+        _write_json(
+            point_dir / "status.json",
+            {
+                "status": status,
+                "completed_repetitions": len(
+                    tuple(point_dir.glob("run-*/derived.json"))
+                ),
+                "required_repetitions": point.point.repetitions,
+                "error_type": type(error).__name__,
+                "error": retained_error,
+            },
+        )
+        if status == "unsupported" and not isinstance(error, UnsupportedPointError):
+            raise UnsupportedPointError(retained_error) from error
         raise
+
+
+def _point_failure_details(point_dir: Path, error: BaseException) -> tuple[str, str]:
+    error_reason = str(error)
+    if isinstance(error, UnsupportedPointError):
+        return "unsupported", error_reason
+    if not isinstance(error, Exception):
+        return "failed", error_reason
+    evidence = [error_reason]
+    for path in (point_dir / "server/p.log", point_dir / "server/d.log"):
+        try:
+            evidence.append(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+    oom_markers = (
+        "cuda out of memory",
+        "outofmemoryerror",
+        "cublas_status_alloc_failed",
+    )
+    for item in evidence:
+        for line in item.splitlines():
+            if any(marker in line.lower() for marker in oom_markers):
+                return "unsupported", line.strip()
+    return "failed", error_reason
 
 
 def _load_tokenizer(model: str, *, revision: str) -> Tokenizer:
@@ -1185,6 +1260,7 @@ def _dry_run_summary(
             run_dir=results_dir / "points" / point.point.id,
             max_num_batched_tokens=point.point.max_num_batched_tokens,
             expected_remote_tokens=None,
+            enforce_eager=point.point.execution_mode == "eager_diagnostic",
         )
         point_summaries.append(
             {
@@ -1219,7 +1295,7 @@ def main(
     *,
     tokenizer_loader: TokenizerLoader = _load_tokenizer,
 ) -> int:
-    """Run the explicit Ticket 3 plan and return its process exit status."""
+    """Run one explicit controlled-cache plan and return its process status."""
     args = _parser().parse_args(argv)
     repo_root = Path(__file__).resolve().parents[2]
     cli_args = tuple(sys.argv[1:] if argv is None else argv)
@@ -1275,6 +1351,7 @@ def main(
     }
     _write_json(results_dir / "run-manifest.json", manifest)
     failed = False
+    unsupported = False
     for point_index, point in enumerate(points):
         try:
             results = execute_point(
@@ -1302,6 +1379,19 @@ def main(
             manifest["status"] = "interrupted"
             _write_json(results_dir / "run-manifest.json", manifest)
             return 130
+        except UnsupportedPointError as error:
+            unsupported = True
+            manifest["points"].append(
+                {
+                    "id": point.point.id,
+                    "status": "unsupported",
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                }
+            )
+            if point_index == 0:
+                failed = True
+                break
         except Exception as error:
             failed = True
             manifest["points"].append(
@@ -1314,7 +1404,9 @@ def main(
             )
             if point_index == 0:
                 break
-    manifest["status"] = "failed" if failed else "valid"
+    manifest["status"] = (
+        "failed" if failed else "complete_with_unsupported" if unsupported else "valid"
+    )
     _write_json(results_dir / "run-manifest.json", manifest)
     return 1 if failed else 0
 

@@ -1,13 +1,15 @@
-# Replacement Tickets 1–3 Closeout Handoff
+# Replacement Tickets 1–4 Handoff
 
 ## Status
 
-Replacement Tickets 1–3 are complete:
+Replacement Tickets 1–4 are complete:
 
 - Ticket 1 Gate B is `remote_verified`.
 - Ticket 2 Gate A is `remote_verified`.
 - Ticket 3 Gate C is `remote_verified`.
-- Ticket 4 is ready and unblocked, but has not started.
+- Ticket 4 Gate D is `accepted` against implementation `05175de028`.
+- The accepted run contains 30/30 valid points and 90/90 valid repetitions.
+- Legacy retirement is explicitly deferred.
 
 The accepted Ticket 2 runtime delivery is:
 
@@ -23,7 +25,10 @@ codex/ds4-replacement-tickets-1-2-continued
 ```
 
 [`AUTHORITATIVE_SPEC.md`](AUTHORITATIVE_SPEC.md) remains normative. This
-handoff records the accepted Tickets 1–3 evidence without starting Ticket 4.
+handoff preserves the accepted Tickets 1–3 evidence. Current Ticket 4 work
+resumes from
+[`TICKET_04_MEASUREMENT_FIX_HANDOFF.md`](TICKET_04_MEASUREMENT_FIX_HANDOFF.md);
+the earlier target procedure remains in the server handoff.
 
 ## Ticket 1 completion
 
@@ -198,9 +203,32 @@ Hardware validation applies only to delivery commit
 `163935c12db0545c12eba694bfd6316be1f4094a`. The documentation closeout commit
 records that accepted state; it is not itself GPU-validated.
 
+## Ticket 4 local delivery
+
+The replacement Ticket 4 implementation adds:
+
+- `config/selected-pilot-points.json`, with 30 explicit optimized-mode points;
+- selected hit/chunk and concurrency/hit interactions without a generic
+  Cartesian planner;
+- three frozen DS4 prompt cut points and explicit 1/32/128 output lengths;
+- ITL p99 alongside three-run mean/CV and noisy labeling;
+- fail-closed OOM classification as `unsupported`;
+- at most one optional `eager_diagnostic` point; and
+- `report_results.py`, which re-audits raw official benchmark JSON and P/D
+  metrics before writing `summary.csv`, `report.md`, and eight SVG plots.
+
+The accepted target run exercised the model against frozen implementation
+`05175de028` and retained complete evidence for 30/30 valid points and 90/90
+valid repetitions. Gate D acceptance is recorded in
+[`TICKET_04_MEASUREMENT_FIX_HANDOFF.md`](TICKET_04_MEASUREMENT_FIX_HANDOFF.md);
+the target commands and review gates remain in
+[`TICKET_04_SERVER_HANDOFF.md`](TICKET_04_SERVER_HANDOFF.md). The legacy path
+remains in place because retirement requires separate authorization.
+
 ## Next scope
 
-There is no remaining Ticket 1, Ticket 2, or Ticket 3 acceptance blocker.
-Ticket 4 is ready and unblocked, but has not started. The next scope is the
-Ticket 4 selected pilot and report defined in [`WORKFLOW.md`](WORKFLOW.md);
-this closeout does not implement any Ticket 4 work.
+There is no remaining Tickets 1–4 acceptance blocker. The accepted evidence
+and exact failure-class diagnoses are in
+[`TICKET_04_MEASUREMENT_FIX_HANDOFF.md`](TICKET_04_MEASUREMENT_FIX_HANDOFF.md).
+Legacy retirement is not part of this closeout and must not proceed without a
+separate authorization and review boundary.
