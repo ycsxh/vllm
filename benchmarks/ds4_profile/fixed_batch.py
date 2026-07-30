@@ -27,6 +27,13 @@ PRIMARY_REPETITIONS = 3
 PRIMARY_WARMUP_BATCHES = 5
 PRIMARY_MEASURED_BATCHES = 10
 NOISY_CV = 0.05
+FIXED_BATCH_RUNTIME_ENVIRONMENT = {
+    "FLASHINFER_JIT_VERBOSE": "0",
+    "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+    "VLLM_KV_CACHE_LAYOUT": "HND",
+    "VLLM_PREFIX_CACHE_RETENTION_INTERVAL": "0",
+    "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
+}
 CAPACITY_ERROR_MARKERS = (
     "cuda out of memory",
     "outofmemoryerror",
@@ -445,10 +452,7 @@ def _engine_config(
         "gpu_memory_utilization": execution.gpu_memory_utilization,
         "seed": execution.seed,
         "enable_logging_iteration_details": True,
-        "runtime_environment": {
-            "VLLM_PREFIX_CACHE_RETENTION_INTERVAL": "0",
-            "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
-        },
+        "runtime_environment": dict(FIXED_BATCH_RUNTIME_ENVIRONMENT),
     }
     if point.execution_mode == "diagnostic":
         config["profiler_config"] = {

@@ -307,12 +307,15 @@ class SubprocessOfflineRuntime:
                         for name in (
                             "CUDA_HOME",
                             "CUDA_VISIBLE_DEVICES",
+                            "FLASHINFER_JIT_VERBOSE",
                             "HF_HOME",
                             "HF_HUB_CACHE",
                             "HF_HUB_OFFLINE",
                             "LD_LIBRARY_PATH",
                             "PATH",
                             "TRANSFORMERS_OFFLINE",
+                            "VLLM_ENABLE_V1_MULTIPROCESSING",
+                            "VLLM_KV_CACHE_LAYOUT",
                             "VLLM_PREFIX_CACHE_RETENTION_INTERVAL",
                             "VLLM_SSM_CONV_STATE_LAYOUT",
                         )
