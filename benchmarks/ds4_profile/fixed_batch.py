@@ -451,6 +451,7 @@ def _engine_config(
         ),
         "gpu_memory_utilization": execution.gpu_memory_utilization,
         "seed": execution.seed,
+        "async_scheduling": False,
         "enable_logging_iteration_details": True,
         "runtime_environment": dict(FIXED_BATCH_RUNTIME_ENVIRONMENT),
     }

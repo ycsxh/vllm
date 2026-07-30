@@ -183,6 +183,7 @@ def _audit_frozen_context(
             "vllm_commit": execution.get("vllm_commit"),
             "vllm_dirty": execution.get("vllm_dirty"),
             "attention_backend": execution.get("attention_backend"),
+            "async_scheduling": False,
             "dtype": "bfloat16",
             "kv_cache_dtype": "bfloat16",
             "tensor_parallel_size": 1,
@@ -470,7 +471,7 @@ def _write_report(
         f"(dirty={execution['vllm_dirty']})",
         f"- Attention backend: `{execution['attention_backend']}`",
         "- Cache/runtime: BF16 KV, 128-token blocks, 640-token HMA pages, "
-        "prefix caching on, chunked prefill off",
+        "prefix caching on, chunked prefill off, async scheduling off",
         "- Fixed-batch runtime environment: "
         f"`{json.dumps(frozen_context['runtime_environment'], sort_keys=True)}`",
         f"- Role GPUs: `{json.dumps(execution['role_gpus'])}`",
