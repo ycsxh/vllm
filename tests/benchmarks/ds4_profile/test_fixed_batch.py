@@ -297,6 +297,7 @@ def test_runner_profiles_one_exact_p_batch_and_retains_auditable_artifacts(
     assert result["point_statuses"] == {"p-b2-hit75": "valid"}
     assert len(runtimes) == 1
     runtime = runtimes[0]
+    assert runtime.engine_config["async_scheduling"] is False
     assert runtime.engine_config["enable_chunked_prefill"] is False
     assert runtime.engine_config["max_num_seqs"] == 2
     assert runtime.engine_config["max_num_batched_tokens"] == 12_801
@@ -657,6 +658,7 @@ def test_report_reaudits_raw_p_and_d_samples_instead_of_stored_summaries(
     assert "2" * 40 in report_text
     assert "3" * 40 in report_text
     assert "FLASHINFER" in report_text
+    assert "async scheduling off" in report_text
     assert '"VLLM_ENABLE_V1_MULTIPROCESSING": "0"' in report_text
     assert '"VLLM_KV_CACHE_LAYOUT": "HND"' in report_text
     assert {path.name for path in report.plot_paths} == {
@@ -853,6 +855,7 @@ def test_offline_runtime_passes_only_supported_public_llm_arguments(
     OfflineLLMRuntime(
         {
             "attention_backend": "FLASH_ATTN",
+            "async_scheduling": False,
             "block_size": 128,
             "cuda_visible_devices": "0",
             "device": "cuda",
@@ -877,6 +880,7 @@ def test_offline_runtime_passes_only_supported_public_llm_arguments(
 
     assert "device" not in llm_kwargs
     assert llm_kwargs["attention_config"] == {"backend": "FLASH_ATTN"}
+    assert llm_kwargs["async_scheduling"] is False
     assert llm_kwargs["enable_chunked_prefill"] is False
 
 

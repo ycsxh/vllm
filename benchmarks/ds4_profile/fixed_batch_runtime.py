@@ -150,6 +150,7 @@ class OfflineLLMRuntime:
                 max_num_batched_tokens=engine_config["max_num_batched_tokens"],
                 gpu_memory_utilization=engine_config["gpu_memory_utilization"],
                 seed=engine_config["seed"],
+                async_scheduling=engine_config["async_scheduling"],
                 mamba_cache_mode=engine_config["mamba_cache_mode"],
                 enable_logging_iteration_details=True,
                 profiler_config=profiler_config,
