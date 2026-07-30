@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "points": [
+    {
+      "id": "p-b16-hit75-smoke",
+      "role": "P",
+      "batch_size": 16,
+      "input_tokens": 12800,
+      "hit_ratio": 0.75,
+      "output_tokens": 1,
+      "repetitions": 1,
+      "warmup_batches": 1,
+      "measured_batches": 1,
+      "execution_mode": "feasibility_smoke"
+    },
+    {
+      "id": "p-b16-hit75",
+      "role": "P",
+      "batch_size": 16,
+      "input_tokens": 12800,
+      "hit_ratio": 0.75,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "warmup_batches": 5,
+      "measured_batches": 10,
+      "execution_mode": "primary",
+      "requires_supported_point": "p-b16-hit75-smoke"
+    },
+    {
+      "id": "p-b16-hit0-smoke",
+      "role": "P",
+      "batch_size": 16,
+      "input_tokens": 12800,
+      "hit_ratio": 0.0,
+      "output_tokens": 1,
+      "repetitions": 1,
+      "warmup_batches": 1,
+      "measured_batches": 1,
+      "execution_mode": "feasibility_smoke"
+    },
+    {
+      "id": "p-b16-hit0",
+      "role": "P",
+      "batch_size": 16,
+      "input_tokens": 12800,
+      "hit_ratio": 0.0,
+      "output_tokens": 1,
+      "repetitions": 3,
+      "warmup_batches": 5,
+      "measured_batches": 10,
+      "execution_mode": "primary",
+      "requires_supported_point": "p-b16-hit0-smoke"
+    }
+  ]
+}

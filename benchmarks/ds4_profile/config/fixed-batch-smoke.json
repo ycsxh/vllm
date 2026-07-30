@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "points": [
+    {
+      "id": "p-b1-hit75-smoke",
+      "role": "P",
+      "batch_size": 1,
+      "input_tokens": 12800,
+      "hit_ratio": 0.75,
+      "output_tokens": 1,
+      "repetitions": 1,
+      "warmup_batches": 1,
+      "measured_batches": 1,
+      "execution_mode": "feasibility_smoke"
+    },
+    {
+      "id": "d-b1-smoke",
+      "role": "D",
+      "batch_size": 1,
+      "input_tokens": 12800,
+      "output_tokens": 128,
+      "repetitions": 1,
+      "warmup_batches": 1,
+      "measured_batches": 1,
+      "execution_mode": "feasibility_smoke"
+    }
+  ]
+}

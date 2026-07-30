@@ -1,12 +1,13 @@
-# DS4-informed Qwen3.5 1P1D Serving-Metrics Profile
+# DS4-informed Qwen3.5 Serving and Fixed-Batch Profile
 
 - Status: **authoritative for all new work**
 - Effective date: 2026-07-22
 - Repository baseline at approval: `65de0de0ab`
 
 This document is the single source of truth for the replacement of the legacy
-12-ticket DS4 profile design. If another planning note, scratch specification,
-ticket, handoff, or README conflicts with this document, this document wins.
+12-ticket DS4 profile design and the additive fixed-batch node profile. If
+another planning note, scratch specification, ticket, handoff, or README
+conflicts with this document, this document wins.
 
 The existing `GPUModelRunner`-based implementation remains historical evidence
 until the replacement path passes hardware acceptance. It must not be extended
@@ -775,3 +776,172 @@ not silently redefine the experiment.
 - `benchmarks/auto_tune/auto_tune.sh`
 - `benchmarks/ds4_profile/prepare_snapshot.py`
 - `benchmarks/ds4_profile/WORKFLOW.md`
+
+## 20. Additive fixed-batch node profile
+
+The accepted 1P1D serving workflow remains authoritative for client-observed
+TTFT, request-level TPOT, and output throughput. It does not directly control
+the batch assembled in a scheduler iteration: `max_concurrency` is offered
+client concurrency and must not be relabeled as batch size.
+
+The additive fixed-batch workflow isolates the P and D nodes to answer two
+different questions:
+
+1. how one exact prefill batch changes P-side prefill latency and throughput
+   under controlled prefix-cache reuse; and
+2. how one exact active decode batch changes D-side decode-step latency and
+   throughput once every sequence has complete prompt KV state.
+
+These node-level latencies are mechanism-oriented proxies. P latency is labeled
+`P-side TTFT proxy`; D latency is labeled `D-side TPOT proxy`. Selected points
+may later be validated through the accepted 1P1D serving path, but proxy and
+client-observed metrics remain separate.
+
+### 20.1 Public runner and reuse boundary
+
+One public fixed-batch runner owns the path from an explicit point plan to
+validated raw artifacts and point summaries. Plans list points directly and
+must not expand a hidden Cartesian product. A point declares its role, batch
+size, fixed input/output lengths, P hit condition when applicable, execution
+mode, and repetition settings.
+
+P and D share plan validation, deterministic request construction, provenance,
+status, failure retention, aggregation, and report auditing. Their execution
+adapters remain phase-specific. Pure artifact and statistical conventions may
+be reused from the accepted serving workflow, but the accepted HTTP/NIXL
+runner must not acquire offline-only assumptions.
+
+The runner uses public offline `LLM.generate`, `LLM.reset_prefix_cache`,
+returned `num_cached_tokens`, and built-in iteration-detail logging. It must
+not call or extend `gpu_profile.py`, `profile_spine.py`, private model-runner or
+scheduler interfaces, hand-constructed `SchedulerOutput`, cache-manager replay,
+or teacher-forced replay. It must not modify vLLM scheduling or cache behavior.
+
+### 20.2 Frozen inputs and cache geometry
+
+Main points use:
+
+- `Qwen/Qwen3.5-4B`, BF16, TP=1;
+- the same pinned model, tokenizer, attention, cache, and hybrid-model runtime
+  settings as the accepted serving profile;
+- exactly 12,800 deterministic prompt token IDs;
+- configured 128-token attention/cache blocks;
+- an effective 640-token HMA cache page;
+- prefix caching enabled, including the 0% P baseline; and
+- chunked prefill disabled.
+
+Every request has a deterministic request-unique first 128-token block so that
+requests in one batch cannot populate cache entries for one another.
+Reproducible synthetic token IDs are valid for the node profile. Exact token
+IDs or their construction seed are retained.
+
+### 20.3 P profile
+
+Main P batch sizes are 1, 2, 4, and 8. Main hit ratios and exact cached-token
+counts per request are:
+
+| Hit ratio | Cached tokens | Computed tokens |
+| ---: | ---: | ---: |
+| 0% | 0 | 12,800 |
+| 75% | 9,600 | 3,200 |
+| 90% | 11,520 | 1,280 |
+
+Before every warmup or measured target batch, the runtime waits for idle,
+resets the prefix cache, and prepares only the requested prefix. A positive-hit
+warm request contains one token beyond the planned cached boundary so the final
+page is reusable. Warm requests are not latency samples.
+
+Each target submits exactly B requests and generates one output token. The
+scheduler token budget is at least B times the computed tokens per request.
+The target must appear in one context/prefill iteration containing exactly B
+context requests and the planned computed-token total. Every returned request
+must report the exact planned cached-token count. A split iteration, cache
+mismatch, or implicit chunk is invalid.
+
+P B=16 is a conditional capacity frontier:
+
+- 90% is a formal measurement point;
+- 75% becomes formal only after a matching feasibility smoke succeeds; and
+- 0% becomes formal only after a matching smoke finishes in one iteration
+  without OOM.
+
+Unsupported frontier points are retained and their inputs are never reduced
+under the same point ID.
+
+### 20.4 D profile
+
+Main D batch sizes are 1, 2, 4, 8, and 16. D points have no hit-ratio field.
+Each target submits exactly B complete 12,800-token prompts and generates 128
+tokens with EOS ignored. The context/prefill iteration establishes the complete
+KV state and is setup, not a D latency sample.
+
+The following 127 pure decode iterations are retained. Every retained
+iteration contains exactly B generation requests and B generated tokens, with
+no context work, batch shrinkage, or preemption. The first pure decode
+iteration is reported separately; the primary steady distribution uses the
+remaining 126 iterations while preserving all 127 raw values.
+
+B=32 is deferred unless a later approved extension is triggered by B=16
+retaining near-linear throughput scaling and sufficient KV capacity.
+
+### 20.5 Repetition and metric contract
+
+Every formal point has three runs. Each run has five validated warmup batches
+and ten measured batches. Engine restart between runs is optional, but idle,
+cache, request, KV, compilation, and fixed-batch preconditions must be restored.
+If an engine is restarted, warmup repeats.
+
+Iteration latency is never divided by B:
+
+```text
+P request throughput = B / prefill_iteration_seconds
+P computed-token throughput =
+  B * computed_tokens_per_request / prefill_iteration_seconds
+D output-token throughput = B / decode_iteration_seconds
+```
+
+Each run reports p50, p90, and p95 for latency and throughput. Point summaries
+report the mean and coefficient of variation of run summaries. A CV above 5%
+is noisy. Profiler-enabled diagnostic runs are stored separately and excluded
+from primary statistics.
+
+### 20.6 Artifacts, failures, and reports
+
+Before execution, retain the resolved point, request construction, effective
+engine configuration, exact commands, model/tokenizer/vLLM revisions, and
+runtime provenance. Per run, retain warmup outcomes, returned outputs and
+cached-token counts, iteration-detail records, raw latency arrays, first decode
+step, steady decode steps, and derived summaries.
+
+Cache reset failure, cache mismatch, invalid iteration composition, unexpected
+early termination, or an unrecognized runtime error fails the point. OOM and
+verified capacity failures are retained as `unsupported`. Partial artifacts
+must exist before failure is surfaced. A conditional formal point whose smoke
+did not pass is retained as unsupported rather than silently executed.
+
+The report builder re-audits raw artifacts instead of trusting stored
+summaries. It produces:
+
+- P latency-versus-B curves with separate hit-ratio series;
+- P computed-token-throughput-versus-B curves;
+- D decode-step-latency-versus-B curves; and
+- D aggregate output-token-throughput-versus-B curves.
+
+Unsupported and noisy points remain visible. Reports state that conclusions
+are conditional on the frozen 12,800-token context, dual RTX 3090 hardware,
+Qwen3.5-4B BF16 model, revisions, and runtime configuration.
+
+### 20.7 Verification and execution order
+
+CPU tests exercise the public runner with an injected fake runtime. They
+validate explicit plans, deterministic requests, P cache preparation and exact
+iteration composition, D setup exclusion and 127 decode iterations, formulas,
+failure retention, and report re-audit. They do not mock `GPUModelRunner`,
+construct `SchedulerOutput`, inspect private cache managers, or assert
+machine-specific latency.
+
+On the target host, run one supported P smoke and one supported D smoke before
+the matrix. The common P B<=8 and D B<=16 matrices may start only after both
+smokes prove the exact model/runtime, fixed iteration composition, cache state,
+KV readiness, output lengths, and artifact contract. Representative B=1, B=8,
+and supported B=16 profiler traces are diagnostic evidence only.
