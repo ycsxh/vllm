@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "points": [
+    {
+      "id": "p-b1-hit75-diagnostic",
+      "role": "P",
+      "batch_size": 1,
+      "input_tokens": 12800,
+      "hit_ratio": 0.75,
+      "output_tokens": 1,
+      "repetitions": 1,
+      "warmup_batches": 1,
+      "measured_batches": 1,
+      "execution_mode": "diagnostic"
+    },
+    {
+      "id": "p-b8-hit75-diagnostic",
+      "role": "P",
+      "batch_size": 8,
+      "input_tokens": 12800,
+      "hit_ratio": 0.75,
+      "output_tokens": 1,
+      "repetitions": 1,
+      "warmup_batches": 1,
+      "measured_batches": 1,
+      "execution_mode": "diagnostic"
+    },
+    {
+      "id": "p-b16-hit90-diagnostic",
+      "role": "P",
+      "batch_size": 16,
+      "input_tokens": 12800,
+      "hit_ratio": 0.9,
+      "output_tokens": 1,
+      "repetitions": 1,
+      "warmup_batches": 1,
+      "measured_batches": 1,
+      "execution_mode": "diagnostic"
+    },
+    {
+      "id": "d-b1-diagnostic",
+      "role": "D",
+      "batch_size": 1,
+      "input_tokens": 12800,
+      "output_tokens": 128,
+      "repetitions": 1,
+      "warmup_batches": 1,
+      "measured_batches": 1,
+      "execution_mode": "diagnostic"
+    },
+    {
+      "id": "d-b8-diagnostic",
+      "role": "D",
+      "batch_size": 8,
+      "input_tokens": 12800,
+      "output_tokens": 128,
+      "repetitions": 1,
+      "warmup_batches": 1,
+      "measured_batches": 1,
+      "execution_mode": "diagnostic"
+    },
+    {
+      "id": "d-b16-diagnostic",
+      "role": "D",
+      "batch_size": 16,
+      "input_tokens": 12800,
+      "output_tokens": 128,
+      "repetitions": 1,
+      "warmup_batches": 1,
+      "measured_batches": 1,
+      "execution_mode": "diagnostic"
+    }
+  ]
+}

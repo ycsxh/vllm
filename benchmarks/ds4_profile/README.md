@@ -1,4 +1,4 @@
-# DS4-informed Qwen3.5 1P1D profile
+# DS4-informed Qwen3.5 serving and fixed-batch profile
 
 This directory is being refactored into a controlled serving-metrics profile
 for a fixed dual-RTX-3090 deployment.
@@ -23,6 +23,12 @@ conflicts with it, the authoritative specification wins.
 This is a serving-oriented metrics experiment. It is not a production traffic
 model and does not study RPS, Poisson arrivals, SLO goodput, routing, or
 autoscaling.
+
+An additive node-level workflow controls the actual P prefill batch and D
+active decode batch at a fixed 12,800-token input. Its P-side TTFT and D-side
+TPOT values are explicitly labeled as proxies and do not replace the accepted
+client-observed 1P1D metrics. See
+[`AUTHORITATIVE_SPEC.md`](AUTHORITATIVE_SPEC.md#20-additive-fixed-batch-node-profile).
 
 ## Implementation tickets
 
@@ -62,6 +68,10 @@ The detailed gates are in
   failure classes resolved.
 - Gate D human acceptance was recorded on 2026-07-30. Two valid points retain
   their noisy labels; no correctness or transfer contract failed.
+- The additive fixed-batch P/D runner, explicit smoke/main/frontier/diagnostic
+  plans, raw-artifact report re-audit, and CPU contract tests are implemented
+  locally. Real dual-RTX-3090 smoke, matrix execution, and acceptance remain a
+  target-server task.
 - Existing Qwen2.5, normalization, workload, container, and profile-spine code
   is legacy implementation retained temporarily for traceability.
 - Legacy code must not be extended or treated as the new experiment path.
@@ -113,6 +123,8 @@ These files are current:
 - [`TICKET_04_MEASUREMENT_FIX_HANDOFF.md`](TICKET_04_MEASUREMENT_FIX_HANDOFF.md):
   final class-A/class-B fixes, evidence, and Gate D acceptance;
 - [`HANDOFF.md`](HANDOFF.md): current replacement-project handoff state;
+- [`FIXED_BATCH_SERVER_HANDOFF.md`](FIXED_BATCH_SERVER_HANDOFF.md): target
+  commands and gates for the additive node-level fixed-batch profile;
 - this README: project entry and current status.
 
 `TICKET_04_HANDOFF.md`, `container/README.md`, and the existing Ticket 01-04
