@@ -1113,7 +1113,8 @@ def test_oom_point_is_retained_as_unsupported(tmp_path: Path) -> None:
     prepared = _prepared_point(tmp_path, id="unsupported")
     point_dir = tmp_path / "results/points/unsupported"
 
-    with pytest.raises(UnsupportedPointError, match="before readiness"):
+    oom_reason = "torch.OutOfMemoryError: CUDA out of memory"
+    with pytest.raises(UnsupportedPointError, match=oom_reason):
         execute_point(
             prepared,
             _launch_config(tmp_path),
@@ -1124,13 +1125,13 @@ def test_oom_point_is_retained_as_unsupported(tmp_path: Path) -> None:
         )
 
     assert json.loads((point_dir / "point-failure.json").read_text()) == {
-        "error": "prefill exited before readiness",
+        "error": oom_reason,
         "error_type": "RuntimeError",
         "status": "unsupported",
     }
-    assert json.loads((point_dir / "status.json").read_text())["status"] == (
-        "unsupported"
-    )
+    status = json.loads((point_dir / "status.json").read_text())
+    assert status["status"] == "unsupported"
+    assert status["error"] == oom_reason
 
 
 def test_cli_dry_run_exposes_the_frozen_point_and_server_plans(

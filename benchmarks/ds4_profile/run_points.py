@@ -1087,13 +1087,13 @@ def execute_point(
             )
             return tuple(results)
     except BaseException as error:
-        status = _point_failure_status(point_dir, error)
+        status, retained_error = _point_failure_details(point_dir, error)
         _write_json(
             point_dir / "point-failure.json",
             {
                 "status": status,
                 "error_type": type(error).__name__,
-                "error": str(error),
+                "error": retained_error,
             },
         )
         _write_json(
@@ -1105,36 +1105,36 @@ def execute_point(
                 ),
                 "required_repetitions": point.point.repetitions,
                 "error_type": type(error).__name__,
-                "error": str(error),
+                "error": retained_error,
             },
         )
         if status == "unsupported" and not isinstance(error, UnsupportedPointError):
-            raise UnsupportedPointError(str(error)) from error
+            raise UnsupportedPointError(retained_error) from error
         raise
 
 
-def _point_failure_status(point_dir: Path, error: BaseException) -> str:
+def _point_failure_details(point_dir: Path, error: BaseException) -> tuple[str, str]:
+    error_reason = str(error)
     if isinstance(error, UnsupportedPointError):
-        return "unsupported"
+        return "unsupported", error_reason
     if not isinstance(error, Exception):
-        return "failed"
-    evidence = [str(error)]
+        return "failed", error_reason
+    evidence = [error_reason]
     for path in (point_dir / "server/p.log", point_dir / "server/d.log"):
         try:
             evidence.append(path.read_text(encoding="utf-8", errors="replace"))
         except OSError:
             continue
-    normalized = "\n".join(evidence).lower()
     oom_markers = (
         "cuda out of memory",
         "outofmemoryerror",
         "cublas_status_alloc_failed",
     )
-    return (
-        "unsupported"
-        if any(marker in normalized for marker in oom_markers)
-        else "failed"
-    )
+    for item in evidence:
+        for line in item.splitlines():
+            if any(marker in line.lower() for marker in oom_markers):
+                return "unsupported", line.strip()
+    return "failed", error_reason
 
 
 def _load_tokenizer(model: str, *, revision: str) -> Tokenizer:

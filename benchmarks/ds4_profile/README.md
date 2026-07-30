@@ -31,7 +31,7 @@ autoscaling.
 | 1 | Minimal DS4-to-CustomDataset adapter | Gate B `remote_verified` |
 | 2 | Qwen3.5 NIXL 1P1D feasibility and fixed launcher | Gate A `remote_verified` |
 | 3 | Controlled serving-metric MVP | Gate C `remote_verified` |
-| 4 | Selected measurements and report | Target run retained; Gate D blocked on class A |
+| 4 | Selected measurements and report | Gate D `accepted`; retirement deferred |
 
 Execution is risk-first: Ticket 2 smoke precedes the remaining implementation.
 The detailed gates are in
@@ -57,14 +57,15 @@ The detailed gates are in
 - Ticket 4 now has a checked-in 30-point selected pilot, explicit report
   comparisons, OOM/unsupported retention, optional one-point eager diagnostics,
   and an auditable `summary.csv`/Markdown/SVG report generator.
-- The frozen Ticket 4 target run retained 20 valid and 10 failed points. Class
-  B has a locally reviewed token-accurate ITL fix; class A remains reproduced
-  but undiagnosed. Gate D human acceptance remains blocked.
+- The accepted Ticket 4 implementation is `05175de028`. Its frozen target run
+  produced 30/30 valid points and 90/90 valid repetitions with both measurement
+  failure classes resolved.
+- Gate D human acceptance was recorded on 2026-07-30. Two valid points retain
+  their noisy labels; no correctness or transfer contract failed.
 - Existing Qwen2.5, normalization, workload, container, and profile-spine code
   is legacy implementation retained temporarily for traceability.
 - Legacy code must not be extended or treated as the new experiment path.
-- It is retired only after the replacement passes the hardware and profile
-  acceptance gates.
+- Legacy retirement is explicitly deferred and requires separate authorization.
 
 Follow [`WORKFLOW.md`](WORKFLOW.md) for the implementation and acceptance order.
 Do not copy commands from legacy handoffs or historical design documents into
@@ -110,7 +111,7 @@ These files are current:
 - [`TICKET_04_SERVER_HANDOFF.md`](TICKET_04_SERVER_HANDOFF.md): replacement
   Ticket 4 target-server execution, report, and Gate D procedure;
 - [`TICKET_04_MEASUREMENT_FIX_HANDOFF.md`](TICKET_04_MEASUREMENT_FIX_HANDOFF.md):
-  current class-A/class-B diagnosis, fix, and next-session state;
+  final class-A/class-B fixes, evidence, and Gate D acceptance;
 - [`HANDOFF.md`](HANDOFF.md): current replacement-project handoff state;
 - this README: project entry and current status.
 

@@ -67,10 +67,10 @@ scheduler internals.
 
 - [ ] Extend `test_build_plan_freezes_complete_child_environments` at the
   confirmed public seam:
-  - P environment has the exact string value `"0"`;
-  - D environment has the exact string value `"0"`;
-  - proxy environment does not contain the setting;
-  - compatibility records numeric
+    - P environment has the exact string value `"0"`;
+    - D environment has the exact string value `"0"`;
+    - proxy environment does not contain the setting;
+    - compatibility records numeric
     `prefix_cache_retention_interval == 0`.
 - [ ] Use literal expected values from the approved design; do not derive the
   expected value from `run_pd`.

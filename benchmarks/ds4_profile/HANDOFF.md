@@ -2,14 +2,14 @@
 
 ## Status
 
-Replacement Tickets 1–3 are complete:
+Replacement Tickets 1–4 are complete:
 
 - Ticket 1 Gate B is `remote_verified`.
 - Ticket 2 Gate A is `remote_verified`.
 - Ticket 3 Gate C is `remote_verified`.
-- Ticket 4 target execution completed against frozen commit `24e2ef4fc`, but
-  Gate D is blocked by two retained measurement-failure classes. Class B now
-  has a locally reviewed fix; class A remains reproduced but undiagnosed.
+- Ticket 4 Gate D is `accepted` against implementation `05175de028`.
+- The accepted run contains 30/30 valid points and 90/90 valid repetitions.
+- Legacy retirement is explicitly deferred.
 
 The accepted Ticket 2 runtime delivery is:
 
@@ -217,19 +217,18 @@ The replacement Ticket 4 implementation adds:
 - `report_results.py`, which re-audits raw official benchmark JSON and P/D
   metrics before writing `summary.csv`, `report.md`, and eight SVG plots.
 
-The later target run exercised the model against frozen commit `24e2ef4fc` and
-retained its failed measurement evidence. It does not claim Gate D, and the
-legacy path remains in place. The current failure-fix state is in
+The accepted target run exercised the model against frozen implementation
+`05175de028` and retained complete evidence for 30/30 valid points and 90/90
+valid repetitions. Gate D acceptance is recorded in
 [`TICKET_04_MEASUREMENT_FIX_HANDOFF.md`](TICKET_04_MEASUREMENT_FIX_HANDOFF.md);
-the target commands, review gates, and post-acceptance retirement checklist
-remain in [`TICKET_04_SERVER_HANDOFF.md`](TICKET_04_SERVER_HANDOFF.md).
+the target commands and review gates remain in
+[`TICKET_04_SERVER_HANDOFF.md`](TICKET_04_SERVER_HANDOFF.md). The legacy path
+remains in place because retirement requires separate authorization.
 
 ## Next scope
 
-There is no remaining Ticket 1, Ticket 2, or Ticket 3 acceptance blocker. The
-next scope is to diagnose and fix Ticket 4 failure class A without modifying
-the frozen selected-pilot evidence. After separate class-A and class-B target
-probes pass, rerun the selected pilot in a new directory, audit the report,
-request human Gate D review, and only then retire the legacy path. See
-[`TICKET_04_MEASUREMENT_FIX_HANDOFF.md`](TICKET_04_MEASUREMENT_FIX_HANDOFF.md)
-for the exact state and ordering.
+There is no remaining Tickets 1–4 acceptance blocker. The accepted evidence
+and exact failure-class diagnoses are in
+[`TICKET_04_MEASUREMENT_FIX_HANDOFF.md`](TICKET_04_MEASUREMENT_FIX_HANDOFF.md).
+Legacy retirement is not part of this closeout and must not proceed without a
+separate authorization and review boundary.
