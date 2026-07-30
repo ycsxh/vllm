@@ -140,7 +140,6 @@ class OfflineLLMRuntime:
                 dtype=engine_config["dtype"],
                 kv_cache_dtype=engine_config["kv_cache_dtype"],
                 tensor_parallel_size=engine_config["tensor_parallel_size"],
-                device=engine_config["device"],
                 language_model_only=engine_config["language_model_only"],
                 attention_config={"backend": engine_config["attention_backend"]},
                 block_size=engine_config["block_size"],
