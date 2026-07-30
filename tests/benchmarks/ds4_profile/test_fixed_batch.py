@@ -774,6 +774,53 @@ def test_offline_runtime_uses_public_llm_results_and_iteration_detail_logs(
     assert runtime.provenance()["runtime_versions"]["vllm"] == "test"
 
 
+def test_offline_runtime_passes_only_supported_public_llm_arguments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm_kwargs: dict[str, Any] = {}
+
+    def fake_llm(**kwargs: Any) -> SimpleNamespace:
+        llm_kwargs.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(
+        "benchmarks.ds4_profile.fixed_batch_runtime._query_nvidia_gpu",
+        lambda _visible_device: {},
+    )
+    monkeypatch.setattr("vllm.LLM", fake_llm)
+    monkeypatch.setenv("VLLM_LOGGING_CONFIG_PATH", "")
+
+    OfflineLLMRuntime(
+        {
+            "attention_backend": "FLASH_ATTN",
+            "block_size": 128,
+            "cuda_visible_devices": "0",
+            "device": "cuda",
+            "dtype": "bfloat16",
+            "enable_chunked_prefill": False,
+            "enable_prefix_caching": True,
+            "gpu_memory_utilization": 0.9,
+            "kv_cache_dtype": "bfloat16",
+            "language_model_only": True,
+            "mamba_cache_mode": "align",
+            "max_model_len": 12_801,
+            "max_num_batched_tokens": 12_801,
+            "max_num_seqs": 1,
+            "model": "Qwen/Qwen3.5-4B",
+            "model_revision": "1" * 40,
+            "seed": 17,
+            "tensor_parallel_size": 1,
+            "tokenizer_revision": "2" * 40,
+        },
+        tmp_path,
+    )
+
+    assert "device" not in llm_kwargs
+    assert llm_kwargs["attention_config"] == {"backend": "FLASH_ATTN"}
+    assert llm_kwargs["enable_chunked_prefill"] is False
+
+
 def test_diagnostic_point_profiles_only_the_target_phase_and_is_not_primary(
     tmp_path: Path,
 ) -> None:
