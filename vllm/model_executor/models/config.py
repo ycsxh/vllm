@@ -576,10 +576,6 @@ class MambaModelConfig(VerifyAndUpdateConfig):
                     "for prefix caching with Mamba cache 'all' mode: "
                     "falling back to 'align' mode."
                 )
-            if cache_config.mamba_cache_mode == "align":
-                assert vllm_config.scheduler_config.enable_chunked_prefill, (
-                    "Chunked prefill is required for mamba cache mode 'align'."
-                )
             logger.info(
                 "Warning: Prefix caching in Mamba cache '%s' "
                 "mode is currently enabled. "
