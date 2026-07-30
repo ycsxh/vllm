@@ -82,6 +82,29 @@ def _write_logging_config(point_dir: Path) -> Path:
     return config_path
 
 
+def _query_nvidia_gpu(physical_index: str) -> dict[str, Any]:
+    result = subprocess.run(
+        (
+            "nvidia-smi",
+            f"--id={physical_index}",
+            "--query-gpu=name,driver_version,uuid",
+            "--format=csv,noheader,nounits",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    fields = [field.strip() for field in result.stdout.strip().split(",")]
+    if len(fields) != 3 or not all(fields):
+        raise RuntimeError("nvidia-smi returned incomplete GPU provenance")
+    return {
+        "visible_gpu_count": 1,
+        "visible_gpu_model": fields[0],
+        "nvidia_driver": fields[1],
+        "gpu_uuid": fields[2],
+    }
+
+
 class OfflineLLMRuntime:
     """Translate public ``LLM`` operations into auditable batch observations."""
 
@@ -101,6 +124,9 @@ class OfflineLLMRuntime:
         if llm is None:
             logging_config = _write_logging_config(point_dir)
             os.environ["VLLM_LOGGING_CONFIG_PATH"] = str(logging_config)
+            self._gpu_provenance = _query_nvidia_gpu(
+                engine_config["cuda_visible_devices"]
+            )
             import torch
 
             from vllm import LLM, SamplingParams, TokensPrompt, __version__
@@ -146,16 +172,19 @@ class OfflineLLMRuntime:
             self._tokens_prompt_factory = tokens_prompt_factory
             self._sampling_params_factory = sampling_params_factory
             self._runtime_versions = runtime_versions or {}
+            self._gpu_provenance = {}
             self._iteration_log.touch()
 
     def provenance(self) -> dict[str, Any]:
         """Return runtime versions and the public API boundary."""
-        return {
+        provenance = {
             "runner_boundary": "vllm.LLM.generate",
             "cache_reset_boundary": "vllm.LLM.reset_prefix_cache",
             "iteration_source": "enable_logging_iteration_details",
             "runtime_versions": self._runtime_versions,
         }
+        provenance.update(self._gpu_provenance)
+        return provenance
 
     def wait_idle(self) -> None:
         """Offline ``generate`` is synchronous, so returning means idle."""

@@ -27,6 +27,14 @@ PRIMARY_REPETITIONS = 3
 PRIMARY_WARMUP_BATCHES = 5
 PRIMARY_MEASURED_BATCHES = 10
 NOISY_CV = 0.05
+CAPACITY_ERROR_MARKERS = (
+    "cuda out of memory",
+    "outofmemoryerror",
+    "cublas_status_alloc_failed",
+    "insufficient kv cache",
+    "no available memory for the cache blocks",
+    "larger than the available kv cache memory",
+)
 CPU_LIST = re.compile(r"\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*")
 GPU_INDEX = re.compile(r"\d+")
 
@@ -66,6 +74,8 @@ class FixedBatchExecution:
             raise ValueError("role_gpus must define exactly P and D")
         if any(not GPU_INDEX.fullmatch(gpu) for _, gpu in self.role_gpus):
             raise ValueError("each role GPU must be one physical GPU index")
+        if len(set(dict(self.role_gpus).values())) != 2:
+            raise ValueError("P and D must use distinct physical GPUs")
         if (self.role_cpu_affinity is None) != (self.role_numa_nodes is None):
             raise ValueError("CPU affinity and NUMA nodes must be provided together")
         if self.role_cpu_affinity is not None and (
@@ -676,12 +686,12 @@ def _derive_d_metric_samples(
         for iteration in decode_iterations
     ):
         raise ValueError("D decode iteration composition differs from the point plan")
+    if any(iteration.elapsed_ms <= 0 for iteration in decode_iterations):
+        raise ValueError("decode iteration latency must be positive")
     steady_iterations = decode_iterations[1:]
     if len(steady_iterations) != 126:
         raise ValueError("D target must retain 126 steady decode iterations")
     latencies = [iteration.elapsed_ms for iteration in steady_iterations]
-    if any(latency <= 0 for latency in latencies):
-        raise ValueError("iteration latency must be positive")
     return tuple(
         {
             "latency_ms": latency,
@@ -701,6 +711,23 @@ def derive_batch_metric_samples(
     return _derive_d_metric_samples(point, observation)
 
 
+def derive_first_decode_metric_sample(
+    point: FixedBatchPoint,
+    observation: BatchObservation,
+) -> dict[str, float]:
+    """Return the separately reported first pure-decode step."""
+    if point.role != "D":
+        raise ValueError("first-decode metrics apply only to D points")
+    _derive_d_metric_samples(point, observation)
+    iteration = observation.iterations[1]
+    return {
+        "first_decode_latency_ms": iteration.elapsed_ms,
+        "first_decode_output_token_throughput_per_s": (
+            point.batch_size / (iteration.elapsed_ms / 1_000)
+        ),
+    }
+
+
 def _sample_artifact(
     point: FixedBatchPoint,
     observation: BatchObservation,
@@ -716,6 +743,10 @@ def _sample_artifact(
             {
                 "setup_iteration": asdict(observation.iterations[0]),
                 "first_decode_iteration": asdict(observation.iterations[1]),
+                "first_decode_sample": derive_first_decode_metric_sample(
+                    point,
+                    observation,
+                ),
                 "steady_decode_iterations": [
                     asdict(iteration) for iteration in observation.iterations[2:]
                 ],
@@ -840,6 +871,7 @@ def _run_point(
                     _sample_artifact(point, observation, metric_samples),
                 )
             measured = []
+            first_decode_measured = []
             for batch_index in range(1, point.measured_batches + 1):
                 active_phase = "measured"
                 active_batch = batch_index
@@ -852,11 +884,17 @@ def _run_point(
                     ),
                 )
                 measured.extend(metric_samples)
+                if point.role == "D":
+                    first_decode_measured.append(
+                        derive_first_decode_metric_sample(point, observation)
+                    )
                 _write_json(
                     run_dir / f"measured-{batch_index:02d}.json",
                     _sample_artifact(point, observation, metric_samples),
                 )
             run_summary = summarize_run_samples(measured)
+            if first_decode_measured:
+                run_summary.update(summarize_run_samples(first_decode_measured))
             run_summaries.append(run_summary)
             _write_json(run_dir / "run-summary.json", run_summary)
         summary = {
@@ -884,15 +922,7 @@ def _run_point(
         lowered = error_text.lower()
         status = (
             "unsupported"
-            if any(
-                marker in lowered
-                for marker in (
-                    "cuda out of memory",
-                    "outofmemoryerror",
-                    "cublas_status_alloc_failed",
-                    "insufficient kv cache",
-                )
-            )
+            if any(marker in lowered for marker in CAPACITY_ERROR_MARKERS)
             else "failed"
         )
         retained_error = (
