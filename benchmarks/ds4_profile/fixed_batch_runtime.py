@@ -259,16 +259,14 @@ class OfflineLLMRuntime:
         """The worker process owns engine teardown on process exit."""
 
 
-class SubprocessOfflineRuntime:
+class SubprocessOfflineEngine:
     """Persistent JSON-lines client for one isolated offline engine process."""
 
     def __init__(
         self,
-        point: FixedBatchPoint,
         engine_config: dict[str, Any],
         point_dir: Path,
     ) -> None:
-        self._point = point
         self._point_dir = point_dir
         engine_config_path = point_dir / "engine-config.json"
         cpu_affinity = engine_config["cpu_affinity"]
@@ -465,6 +463,18 @@ class SubprocessOfflineRuntime:
                 self._process.wait()
         self._stderr.close()
         self._stdout_noise.close()
+
+
+class SubprocessOfflineRuntime(SubprocessOfflineEngine):
+    """Compatibility adapter for the fixed-batch point runtime contract."""
+
+    def __init__(
+        self,
+        point: FixedBatchPoint,
+        engine_config: dict[str, Any],
+        point_dir: Path,
+    ) -> None:
+        super().__init__(engine_config, point_dir)
 
 
 class SubprocessRuntimeFactory:

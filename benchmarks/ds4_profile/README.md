@@ -30,6 +30,13 @@ TPOT values are explicitly labeled as proxies and do not replace the accepted
 client-observed 1P1D metrics. See
 [`AUTHORITATIVE_SPEC.md`](AUTHORITATIVE_SPEC.md#20-additive-fixed-batch-node-profile).
 
+Another additive P-only workflow keeps exact prefill batches but enables
+chunked prefill for a fixed 13,723-token input. It measures the sum of
+P-engine-local context-iteration times across 36 explicit
+hit-by-batch-by-budget points. Its P-side prefill-completion latency is not
+client-observed TTFT and does not alter the unchunked fixed-batch contract. See
+[`AUTHORITATIVE_SPEC.md`](AUTHORITATIVE_SPEC.md#21-additive-p-only-chunked-prefill-profile).
+
 ## Implementation tickets
 
 | Ticket | Scope | Current gate |
@@ -72,6 +79,10 @@ The detailed gates are in
   plans, raw-artifact report re-audit, and CPU contract tests are implemented
   locally. Real dual-RTX-3090 smoke, matrix execution, and acceptance remain a
   target-server task.
+- The additive P-only chunked-prefill runner has an explicit 36-point main
+  plan, required two-point smoke, four persistent token-budget engine groups,
+  raw-observation report audit, and CPU contract tests. Its target acceptance
+  procedure is in `CHUNKED_PREFILL_SERVER_HANDOFF.md`.
 - Existing Qwen2.5, normalization, workload, container, and profile-spine code
   is legacy implementation retained temporarily for traceability.
 - Legacy code must not be extended or treated as the new experiment path.
@@ -125,6 +136,8 @@ These files are current:
 - [`HANDOFF.md`](HANDOFF.md): current replacement-project handoff state;
 - [`FIXED_BATCH_SERVER_HANDOFF.md`](FIXED_BATCH_SERVER_HANDOFF.md): target
   commands and gates for the additive node-level fixed-batch profile;
+- [`CHUNKED_PREFILL_SERVER_HANDOFF.md`](CHUNKED_PREFILL_SERVER_HANDOFF.md):
+  target commands and gates for the additive P-only chunked-prefill profile;
 - this README: project entry and current status.
 
 `TICKET_04_HANDOFF.md`, `container/README.md`, and the existing Ticket 01-04

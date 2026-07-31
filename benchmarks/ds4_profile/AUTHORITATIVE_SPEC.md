@@ -945,3 +945,130 @@ the matrix. The common P B<=8 and D B<=16 matrices may start only after both
 smokes prove the exact model/runtime, fixed iteration composition, cache state,
 KV readiness, output lengths, and artifact contract. Representative B=1, B=8,
 and supported B=16 profiler traces are diagnostic evidence only.
+
+## 21. Additive P-only chunked-prefill profile
+
+The unchunked fixed-batch P/D profile in section 20 remains unchanged. This
+additional profile isolates one narrower mechanism question: how the
+batch-wide scheduler token budget changes P-engine prefill-completion latency
+for the longest 13,723-token request under controlled cache reuse and exact
+submitted prefill batches.
+
+The metric is labeled `P-side prefill-completion latency` or `P-side TTFT
+proxy`. It is not client TTFT. It excludes prefix preparation, P-to-D transfer,
+the D worker, proxy/network work, client timing, and the one-token completion
+phase.
+
+### 21.1 Frozen matrix and runtime
+
+The main plan lists these 36 points explicitly:
+
+- input tokens: exactly 13,723 per request;
+- requested hit ratios: 0%, 75%, and 90%;
+- exact batch sizes: 1, 2, and 4;
+- batch-wide `max_num_batched_tokens`: 512, 1,024, 2,048, and 4,096;
+- output tokens: exactly one with EOS ignored; and
+- three repetitions, each containing one unmeasured warmup target and three
+  measured target batches.
+
+No runtime Cartesian planner may add or remove points. Unsupported points keep
+their original ID and inputs.
+
+The runtime uses Qwen/Qwen3.5-4B BF16, TP=1, BF16 KV, the accepted immutable
+model/tokenizer revisions, FLASH_ATTN, HND KV layout, Mamba/GDN `align`,
+128-token configured blocks, 640-token effective HMA pages, retention interval
+zero, optimized execution, P on physical GPU 0, CPUs `0,2,4,6,8,10`, and NUMA
+node 0.
+
+Prefix caching and chunked prefill are enabled for every point.
+`max_num_seqs=4`; `max_num_batched_tokens` is the selected batch-wide budget,
+not a per-request chunk guarantee.
+
+The planned cached tokens are:
+
+| Requested hit | Planned cached tokens | Aligned hit |
+| ---: | ---: | ---: |
+| 0% | 0 | 0% |
+| 75% | 10,240 | 74.6193% |
+| 90% | 12,160 | 88.6104% |
+
+Every request has a deterministic request-unique first 128-token isolation
+block. Positive hits use a prefix-plus-one warm request for each request.
+
+### 21.2 Public boundary and engine grouping
+
+The profile uses public offline `LLM.generate`, public
+`LLM.reset_prefix_cache`, returned `num_cached_tokens`, and built-in
+iteration-detail logging. It does not call a private scheduler, model runner,
+cache manager, or engine-core method.
+
+All nine points sharing one token budget reuse one persistent P engine. The
+main matrix therefore launches exactly four engines. Before every warmup or
+measured target the runner waits for idle, resets the prefix cache, prepares
+only the requested prefixes, waits for idle again, and submits exactly B
+complete prompts in one synchronous call. Cache preparation is retained as
+setup evidence and excluded from measured samples.
+
+### 21.3 Observation and metric contract
+
+A target is valid only when:
+
+- exactly B requests return with 13,723 prompt tokens and one output token;
+- every returned request reports its exact planned cached-token count;
+- every retained target iteration is context-only and has positive finite
+  elapsed time;
+- each iteration's context work is positive and no larger than the configured
+  batch-wide token budget;
+- context request counts are positive and no greater than B; and
+- total context tokens equal
+  `B * (13,723 - planned_cached_tokens)`.
+
+The total catches missing, duplicated, incomplete, preempted, or recomputed
+context work. Unexpected generation work invalidates the target.
+
+The primary sample is:
+
+```text
+P-side prefill-completion latency =
+  sum(elapsed_ms for every validated target context iteration)
+```
+
+It is never divided by B. Computed-token throughput divides the validated total
+context tokens by that batch latency. Target `LLM.generate` wall time, context
+iteration count, and every iteration's composition remain diagnostic evidence.
+
+### 21.4 Statistics, failures, and reports
+
+Each run reports p50 from its three measured samples. Point results report the
+mean and sample CV of the three run-p50 values. A primary-latency p50 CV above
+5% marks the point noisy. The global nine-sample p50 and p90 remain diagnostic.
+
+Recognized OOM and verified capacity limitations are retained as
+`unsupported`. Cache mismatch, invalid accounting or composition, preemption,
+unexpected generation work, and unrecognized runtime errors fail the point.
+Every retry uses a new artifact directory. No retry shortens the prompt,
+reduces B or hit, or raises the token budget under the same point ID.
+
+The report builder independently re-audits deterministic requests, raw setup
+and target observations, cached-token counts, every iteration, budget
+compliance, stored summaries, engine grouping, public-boundary provenance,
+runtime invocation, hardware, revisions, and top-level status. It produces one
+CSV row per point, a Markdown report, raw JSON evidence, and SVG plots for
+prefill-completion latency, context-iteration count, and computed-token
+throughput. Plots use batch-wide token budget on the x-axis and separate
+batch-size/hit-ratio series. Unsupported and noisy points remain visible.
+
+### 21.5 Execution and acceptance gates
+
+CPU contract tests, Ruff check, Ruff format check, dry-run, and fake-artifact
+report audit pass before hardware use. The dual-RTX-3090 target then runs:
+
+1. B=1, requested hit 75%, budget 512; and
+2. B=4, requested hit 0%, budget 512.
+
+Both smoke points must pass independent raw audit before the 36-point matrix
+starts. Hardware acceptance requires every explicit point to retain a valid,
+unsupported, or failed status; complete provenance; raw setup and target
+evidence; an audited report; a SHA-256 inventory; and a requirement-by-
+requirement acceptance record. Historical client-observed 1P1D TTFT remains a
+separate end-to-end serving measurement.
