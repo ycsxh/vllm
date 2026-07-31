@@ -639,8 +639,19 @@ def test_runner_launches_exactly_one_engine_for_each_selected_budget(
     assert all(runtime.operations[-1] == ("close", 0, 0) for runtime in runtimes)
 
 
-def test_runner_retains_group_initialization_capacity_failure_for_every_point(
+@pytest.mark.parametrize(
+    "error_text",
+    (
+        "No available memory for the cache blocks.",
+        (
+            "In Mamba cache align mode, block_size (640) must be <= "
+            "max_num_batched_tokens (512)."
+        ),
+    ),
+)
+def test_runner_retains_group_initialization_limit_for_every_point(
     tmp_path: Path,
+    error_text: str,
 ) -> None:
     def runtime_factory(
         _budget: int,
@@ -648,7 +659,7 @@ def test_runner_retains_group_initialization_capacity_failure_for_every_point(
         engine_dir: Path,
     ) -> FakeGroupedRuntime:
         _write_fake_runtime_invocation(engine_config, engine_dir)
-        raise RuntimeError("No available memory for the cache blocks.")
+        raise RuntimeError(error_text)
 
     results_dir = tmp_path / "results"
     result = run_chunked_prefill_profile(

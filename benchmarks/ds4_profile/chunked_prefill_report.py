@@ -16,6 +16,7 @@ from typing import Any
 
 from benchmarks.ds4_profile.chunked_prefill import (
     MODEL,
+    UNSUPPORTED_ERROR_MARKERS,
     ChunkedPrefillExecution,
     ChunkedPrefillPoint,
     build_engine_config,
@@ -27,7 +28,6 @@ from benchmarks.ds4_profile.chunked_prefill import (
     summarize_run_samples,
 )
 from benchmarks.ds4_profile.fixed_batch import (
-    CAPACITY_ERROR_MARKERS,
     BatchObservation,
     batch_observation_from_dict,
 )
@@ -294,9 +294,9 @@ def _audit_runtime_invocation(
         raise ValueError("runtime invocation lacks a required environment path")
 
 
-def _capacity_status(error: object) -> str:
+def _expected_failure_status(error: object) -> str:
     error_text = str(error).lower()
-    if any(marker in error_text for marker in CAPACITY_ERROR_MARKERS):
+    if any(marker in error_text for marker in UNSUPPORTED_ERROR_MARKERS):
         return "unsupported"
     return "failed"
 
@@ -420,7 +420,7 @@ def _audit_failure_record(
             raise ValueError(f"{point.id} point-failure field {name} is invalid")
     if failure["status"] not in {"failed", "unsupported"}:
         raise ValueError(f"{point.id} point-failure status is invalid")
-    if failure["status"] != _capacity_status(failure["error"]):
+    if failure["status"] != _expected_failure_status(failure["error"]):
         raise ValueError(f"{point.id} point-failure classification differs")
     if any(status.get(name) != value for name, value in failure.items()):
         raise ValueError(f"{point.id} status differs from point-failure evidence")

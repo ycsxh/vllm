@@ -297,7 +297,9 @@ outputs. Never rerun in place or modify an axis under the same point ID.
 jq . "$MAIN_RESULTS/status.json"
 test "$(find "$MAIN_RESULTS/points" -mindepth 1 -maxdepth 1 -type d | wc -l)" = 36
 test "$(find "$MAIN_RESULTS/engines" -mindepth 1 -maxdepth 1 -type d | wc -l)" = 4
-test "$(wc -l < "$MAIN_REPORT/summary.csv")" = 37
+.venv/bin/python -c \
+  'import csv,sys; assert sum(1 for _ in csv.DictReader(open(sys.argv[1]))) == 36' \
+  "$MAIN_REPORT/summary.csv"
 test "$(find "$MAIN_REPORT" -name '*.svg' | wc -l)" = 3
 
 if jq -e '.status == "valid"' "$MAIN_RESULTS/status.json" >/dev/null; then

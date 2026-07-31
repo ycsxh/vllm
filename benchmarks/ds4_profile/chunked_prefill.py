@@ -31,6 +31,10 @@ CACHE_PAGE_TOKENS = 640
 HIT_RATIOS = {0.0, 0.75, 0.9}
 BATCH_SIZES = {1, 2, 4}
 TOKEN_BUDGETS = {512, 1_024, 2_048, 4_096}
+UNSUPPORTED_ERROR_MARKERS = (
+    *CAPACITY_ERROR_MARKERS,
+    "in mamba cache align mode, block_size",
+)
 PRIMARY_REPETITIONS = 3
 PRIMARY_WARMUP_BATCHES = 1
 PRIMARY_MEASURED_BATCHES = 3
@@ -641,7 +645,7 @@ def summarize_point_runs(
 
 def _classify_failure(error: BaseException) -> Literal["failed", "unsupported"]:
     error_text = str(error).lower()
-    if any(marker in error_text for marker in CAPACITY_ERROR_MARKERS):
+    if any(marker in error_text for marker in UNSUPPORTED_ERROR_MARKERS):
         return "unsupported"
     return "failed"
 
