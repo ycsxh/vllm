@@ -41,11 +41,12 @@ Complete 640-token HMA pages determine the planned cached tokens:
 | 75% | 10,240 | 74.6193% |
 | 90% | 12,160 | 88.6104% |
 
-The model and runtime remain frozen to Qwen/Qwen3.5-4B BF16, TP=1, BF16 KV,
-128-token blocks, 640-token effective HMA pages, HND KV layout, Mamba/GDN
-`align`, prefix-cache retention interval zero, prefix caching enabled,
-optimized execution, synchronous scheduling, the accepted attention backend,
-and the accepted P GPU/CPU/NUMA placement.
+The model and tokenizer remain frozen to Qwen/Qwen3.5-4B BF16 at revision
+`851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`. The runtime remains frozen to
+TP=1, BF16 KV, 128-token blocks, 640-token effective HMA pages, HND KV layout,
+Mamba/GDN `align`, prefix-cache retention interval zero, prefix caching
+enabled, optimized execution, synchronous scheduling, the accepted attention
+backend, and the accepted P GPU/CPU/NUMA placement.
 
 Chunked prefill is enabled, `max_num_seqs` is always 4, and
 `max_num_batched_tokens` is the selected batch-wide budget. The budget is never
@@ -223,6 +224,12 @@ Each sample artifact contains:
 
 Failure artifacts are written before a point failure is surfaced. A new
 hardware attempt always uses a new results directory.
+
+When a sample fails after setup starts, its active run also retains
+`partial-sample.json`: all completed cache-warm observations, the precise
+failure stage, and any invalid warm or target observation. Report audit binds
+that partial artifact to the point's phase, batch, completed repetitions, and
+exact preceding run/sample topology.
 
 ## Failure policy
 

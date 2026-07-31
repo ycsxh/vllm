@@ -974,11 +974,11 @@ The main plan lists these 36 points explicitly:
 No runtime Cartesian planner may add or remove points. Unsupported points keep
 their original ID and inputs.
 
-The runtime uses Qwen/Qwen3.5-4B BF16, TP=1, BF16 KV, the accepted immutable
-model/tokenizer revisions, FLASH_ATTN, HND KV layout, Mamba/GDN `align`,
-128-token configured blocks, 640-token effective HMA pages, retention interval
-zero, optimized execution, P on physical GPU 0, CPUs `0,2,4,6,8,10`, and NUMA
-node 0.
+The runtime uses Qwen/Qwen3.5-4B BF16 at immutable model/tokenizer revision
+`851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`, TP=1, BF16 KV, FLASH_ATTN,
+HND KV layout, Mamba/GDN `align`, 128-token configured blocks, 640-token
+effective HMA pages, retention interval zero, optimized execution, P on
+physical GPU 0, CPUs `0,2,4,6,8,10`, and NUMA node 0.
 
 Prefix caching and chunked prefill are enabled for every point.
 `max_num_seqs=4`; `max_num_batched_tokens` is the selected batch-wide budget,
@@ -1046,6 +1046,10 @@ mean and sample CV of the three run-p50 values. A primary-latency p50 CV above
 Recognized OOM and verified capacity limitations are retained as
 `unsupported`. Cache mismatch, invalid accounting or composition, preemption,
 unexpected generation work, and unrecognized runtime errors fail the point.
+If a sample fails after cache preparation starts, `partial-sample.json`
+retains every completed cache-warm observation plus any invalid warm or target
+observation. Its phase, batch, and completed-repetition fields determine the
+exact preceding run/sample topology that the report must re-audit.
 Every retry uses a new artifact directory. No retry shortens the prompt,
 reduces B or hit, or raises the token budget under the same point ID.
 

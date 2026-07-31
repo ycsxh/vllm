@@ -20,10 +20,11 @@ from benchmarks.ds4_profile.fixed_batch import (
     CAPACITY_ERROR_MARKERS,
     FIXED_BATCH_RUNTIME_ENVIRONMENT,
     BatchObservation,
-    ObservationValidationError,
 )
 
 MODEL = "Qwen/Qwen3.5-4B"
+MODEL_REVISION = "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+TOKENIZER_REVISION = MODEL_REVISION
 INPUT_TOKENS = 13_723
 BLOCK_TOKENS = 128
 CACHE_PAGE_TOKENS = 640
@@ -82,6 +83,10 @@ class ChunkedPrefillExecution:
             raise ValueError("gpu_memory_utilization must be in (0, 1]")
         if self.attention_backend != ATTENTION_BACKEND:
             raise ValueError(f"attention_backend must be {ATTENTION_BACKEND}")
+        if self.model_revision != MODEL_REVISION:
+            raise ValueError(f"model_revision must be {MODEL_REVISION}")
+        if self.tokenizer_revision != TOKENIZER_REVISION:
+            raise ValueError(f"tokenizer_revision must be {TOKENIZER_REVISION}")
         if self.p_gpu != P_GPU:
             raise ValueError("the accepted P placement requires physical GPU 0")
         if self.p_cpu_affinity != P_CPU_AFFINITY:
@@ -131,6 +136,26 @@ class PreparedRequest:
     prompt_token_ids: tuple[int, ...]
     planned_cached_tokens: int
     warm_prompt_token_ids: tuple[int, ...] | None
+
+
+class PartialSampleError(RuntimeError):
+    """Carry raw setup or invalid-target evidence out of a failed sample."""
+
+    def __init__(
+        self,
+        error: Exception,
+        *,
+        failure_stage: str,
+        cache_warm_observations: tuple[BatchObservation, ...],
+        cache_warm_index: int | None = None,
+        observation: BatchObservation | None = None,
+    ) -> None:
+        super().__init__(str(error))
+        self.original_error = error
+        self.failure_stage = failure_stage
+        self.cache_warm_observations = cache_warm_observations
+        self.cache_warm_index = cache_warm_index
+        self.observation = observation
 
 
 class ChunkedPrefillRuntime(Protocol):
@@ -411,16 +436,31 @@ def _validate_warm_observation(
     observation: BatchObservation,
     *,
     prompt_tokens: int,
+    token_budget: int,
 ) -> None:
     if len(observation.requests) != 1:
         raise ValueError("cache warm returned the wrong request count")
     request = observation.requests[0]
     if request.prompt_tokens != prompt_tokens:
         raise ValueError("cache warm returned an unexpected prompt length")
+    if request.cached_tokens != 0:
+        raise ValueError("cache warm unexpectedly reused cached tokens")
     if len(request.output_token_ids) != 1:
         raise ValueError("cache warm returned an unexpected output length")
     if not observation.iterations:
         raise ValueError("cache warm emitted no iteration-detail records")
+    for iteration in observation.iterations:
+        if not math.isfinite(iteration.elapsed_ms) or iteration.elapsed_ms <= 0:
+            raise ValueError("cache warm iteration latency must be positive and finite")
+        if (
+            iteration.context_requests != 1
+            or not 0 < iteration.context_tokens <= token_budget
+        ):
+            raise ValueError("cache warm context work differs from its budget")
+        if iteration.generation_requests or iteration.generation_tokens:
+            raise ValueError("cache warm iterations must contain only context work")
+    if sum(item.context_tokens for item in observation.iterations) != prompt_tokens:
+        raise ValueError("cache warm context tokens differ from its prompt")
 
 
 def _run_sample(
@@ -428,43 +468,89 @@ def _run_sample(
     requests: tuple[PreparedRequest, ...],
     runtime: ChunkedPrefillRuntime,
 ) -> tuple[tuple[BatchObservation, ...], BatchObservation, dict[str, float]]:
-    runtime.wait_idle()
-    if not runtime.reset_prefix_cache():
-        raise RuntimeError("prefix-cache reset failed")
-    cache_warm_observations = []
-    for request in requests:
+    cache_warm_observations: list[BatchObservation] = []
+    try:
+        runtime.wait_idle()
+    except Exception as error:
+        raise PartialSampleError(
+            error,
+            failure_stage="wait_idle_before_reset",
+            cache_warm_observations=(),
+        ) from error
+    try:
+        reset = runtime.reset_prefix_cache()
+    except Exception as error:
+        raise PartialSampleError(
+            error,
+            failure_stage="cache_reset_runtime",
+            cache_warm_observations=(),
+        ) from error
+    if not reset:
+        error = RuntimeError("prefix-cache reset failed")
+        raise PartialSampleError(
+            error,
+            failure_stage="cache_reset_rejected",
+            cache_warm_observations=(),
+        ) from error
+    for warm_index, request in enumerate(requests, start=1):
         if request.warm_prompt_token_ids is None:
             continue
-        warm = runtime.generate(
-            (request.warm_prompt_token_ids,),
-            max_tokens=1,
-            ignore_eos=True,
-        )
+        try:
+            warm = runtime.generate(
+                (request.warm_prompt_token_ids,),
+                max_tokens=1,
+                ignore_eos=True,
+            )
+        except Exception as error:
+            raise PartialSampleError(
+                error,
+                failure_stage="cache_warm_runtime",
+                cache_warm_observations=tuple(cache_warm_observations),
+                cache_warm_index=warm_index,
+            ) from error
         try:
             _validate_warm_observation(
                 warm,
                 prompt_tokens=point.cached_tokens + 1,
+                token_budget=point.max_num_batched_tokens,
             )
         except ValueError as error:
-            raise ObservationValidationError(
-                str(error),
-                warm,
-                "cache_warm",
+            raise PartialSampleError(
+                error,
+                failure_stage="cache_warm_validation",
+                cache_warm_observations=tuple(cache_warm_observations),
+                cache_warm_index=warm_index,
+                observation=warm,
             ) from error
         cache_warm_observations.append(warm)
-    runtime.wait_idle()
-    target = runtime.generate(
-        tuple(request.prompt_token_ids for request in requests),
-        max_tokens=1,
-        ignore_eos=True,
-    )
+    try:
+        runtime.wait_idle()
+    except Exception as error:
+        raise PartialSampleError(
+            error,
+            failure_stage="wait_idle_after_cache_warm",
+            cache_warm_observations=tuple(cache_warm_observations),
+        ) from error
+    try:
+        target = runtime.generate(
+            tuple(request.prompt_token_ids for request in requests),
+            max_tokens=1,
+            ignore_eos=True,
+        )
+    except Exception as error:
+        raise PartialSampleError(
+            error,
+            failure_stage="target_runtime",
+            cache_warm_observations=tuple(cache_warm_observations),
+        ) from error
     try:
         sample = derive_chunked_prefill_sample(point, target)
     except ValueError as error:
-        raise ObservationValidationError(
-            str(error),
-            target,
-            "P_chunked_target",
+        raise PartialSampleError(
+            error,
+            failure_stage="target_validation",
+            cache_warm_observations=tuple(cache_warm_observations),
+            observation=target,
         ) from error
     return tuple(cache_warm_observations), target, sample
 
@@ -480,6 +566,20 @@ def _sample_artifact(
         ],
         "observation": _observation_dict(target),
         "derived_sample": sample,
+    }
+
+
+def _partial_sample_artifact(error: PartialSampleError) -> dict[str, Any]:
+    return {
+        "failure_stage": error.failure_stage,
+        "cache_warm_index": error.cache_warm_index,
+        "cache_warm_observations": [
+            _observation_dict(observation)
+            for observation in error.cache_warm_observations
+        ],
+        "observation": (
+            None if error.observation is None else _observation_dict(error.observation)
+        ),
     }
 
 
@@ -537,6 +637,13 @@ def summarize_point_runs(
         "metrics": metrics,
         "noisy": latency["cv"] > NOISY_CV,
     }
+
+
+def _classify_failure(error: BaseException) -> Literal["failed", "unsupported"]:
+    error_text = str(error).lower()
+    if any(marker in error_text for marker in CAPACITY_ERROR_MARKERS):
+        return "unsupported"
+    return "failed"
 
 
 def _run_point(
@@ -597,9 +704,14 @@ def _run_point(
                     run_dir / f"measured-{batch_index:02d}.json",
                     _sample_artifact(cache_warm, target, sample),
                 )
+            active_phase = "run_summary"
+            active_batch = 0
             run_summary = summarize_run_samples(run_samples)
-            run_summaries.append(run_summary)
             _write_json(run_dir / "run-summary.json", run_summary)
+            run_summaries.append(run_summary)
+        active_run_dir = None
+        active_phase = "point_summary"
+        active_batch = 0
         summary = {
             "point_id": point.id,
             "metric_label": "P-side prefill-completion latency",
@@ -622,13 +734,9 @@ def _run_point(
         return summary
     except Exception as error:
         error_text = str(error)
-        status = (
-            "unsupported"
-            if any(marker in error_text.lower() for marker in CAPACITY_ERROR_MARKERS)
-            else "failed"
-        )
+        status = _classify_failure(error)
         retained_error = (
-            error.__cause__ if isinstance(error, ObservationValidationError) else error
+            error.original_error if isinstance(error, PartialSampleError) else error
         )
         failure = {
             "status": status,
@@ -638,11 +746,17 @@ def _run_point(
             "error": error_text,
         }
         if active_run_dir is not None:
-            if isinstance(error, ObservationValidationError):
+            if isinstance(error, PartialSampleError):
+                partial = _partial_sample_artifact(error)
+                _write_json(
+                    active_run_dir / "partial-sample.json",
+                    partial,
+                )
+            if isinstance(error, PartialSampleError) and error.observation is not None:
                 _write_json(
                     active_run_dir / "invalid-observation.json",
                     {
-                        "validation_stage": error.validation_stage,
+                        "validation_stage": error.failure_stage,
                         **_observation_dict(error.observation),
                     },
                 )
@@ -737,13 +851,7 @@ def run_chunked_prefill_profile(
                 point_statuses[point.id] = result["status"]
         except Exception as error:
             error_text = str(error)
-            status = (
-                "unsupported"
-                if any(
-                    marker in error_text.lower() for marker in CAPACITY_ERROR_MARKERS
-                )
-                else "failed"
-            )
+            status = _classify_failure(error)
             failure = {
                 "status": status,
                 "phase": "runtime_initialization",

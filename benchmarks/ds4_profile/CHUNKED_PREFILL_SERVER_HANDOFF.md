@@ -195,7 +195,10 @@ test ! -e "$SMOKE_LOG"
   --report-dir "$SMOKE_REPORT" \
   --gpu-count 2 \
   --gpu-model "NVIDIA GeForce RTX 3090" \
-  --topology "P=GPU0/NUMA0 on dual RTX 3090"
+  --topology "P=GPU0/NUMA0 on dual RTX 3090" \
+  --expected-model-revision "$MODEL_REVISION" \
+  --expected-tokenizer-revision "$TOKENIZER_REVISION" \
+  --expected-vllm-commit "$EXPECTED_COMMIT"
 ```
 
 The smoke passes only when:
@@ -253,7 +256,10 @@ test ! -e "$MAIN_LOG"
   --report-dir "$MAIN_REPORT" \
   --gpu-count 2 \
   --gpu-model "NVIDIA GeForce RTX 3090" \
-  --topology "P=GPU0/NUMA0 on dual RTX 3090"
+  --topology "P=GPU0/NUMA0 on dual RTX 3090" \
+  --expected-model-revision "$MODEL_REVISION" \
+  --expected-tokenizer-revision "$TOKENIZER_REVISION" \
+  --expected-vllm-commit "$EXPECTED_COMMIT"
 ```
 
 The runner performs exactly four engine launches and retains all 36 statuses.
@@ -270,10 +276,24 @@ outputs. Never rerun in place or modify an axis under the same point ID.
 jq . "$MAIN_RESULTS/status.json"
 test "$(find "$MAIN_RESULTS/points" -mindepth 1 -maxdepth 1 -type d | wc -l)" = 36
 test "$(find "$MAIN_RESULTS/engines" -mindepth 1 -maxdepth 1 -type d | wc -l)" = 4
-test "$(find "$MAIN_RESULTS/points" -name 'measured-*.json' | wc -l)" = 324
-test "$(find "$MAIN_RESULTS/points" -name 'run-summary.json' | wc -l)" = 108
 test "$(wc -l < "$MAIN_REPORT/summary.csv")" = 37
 test "$(find "$MAIN_REPORT" -name '*.svg' | wc -l)" = 3
+
+if jq -e '.status == "valid"' "$MAIN_RESULTS/status.json" >/dev/null; then
+  test "$(find "$MAIN_RESULTS/points" -name 'measured-*.json' | wc -l)" = 324
+  test "$(find "$MAIN_RESULTS/points" -name 'run-summary.json' | wc -l)" = 108
+else
+  find "$MAIN_RESULTS/points" -name 'status.json' -print0 |
+    xargs -0 jq -e '
+      .status == "valid" or
+      ((.status == "unsupported" or .status == "failed") and
+       (.error | type == "string") and
+       (.phase | type == "string"))
+    '
+  test -n "$(find "$MAIN_RESULTS" \
+    \( -name 'point-failure.json' -o -name 'engine-failure.json' \) \
+    -print -quit)"
+fi
 
 find "$MAIN_RESULTS/points" -name status.json -print0 |
   sort -z |
@@ -292,15 +312,35 @@ proxy from historical client-observed 1P1D TTFT in every conclusion.
 
 ## 8. Checksums, archive, and acceptance record
 
-Create new output paths:
+Create new output paths, then write `acceptance.md` in the audit directory
+before inventorying or archiving anything. The record must contain:
+
+- exact clean source commit and baseline-ancestor result;
+- origin/upstream URLs and confirmation of no upstream mutation;
+- model/tokenizer revision;
+- GPU, driver, CUDA, PyTorch, vLLM, CPU, NUMA, and runtime environment;
+- every test, lint, dry-run, smoke, matrix, report, and audit command plus
+  output;
+- absolute evidence/report/archive paths and SHA-256 values available before
+  archive creation;
+- a 36-point PASS/unsupported/failed/noisy table;
+- token/cache/iteration/budget/provenance/statistics audit verdicts;
+- chunk-budget, requested-hit, and exact-B main effects and interactions;
+- an explicit distinction from historical client-observed 1P1D TTFT;
+- retained failure/retry history and remaining risks; and
+- requirement-by-requirement PASS/FAIL with a final acceptance verdict.
 
 ```bash
 AUDIT_DIR="$ARTIFACT_ROOT/ds4-chunked-prefill-${EXPECTED_COMMIT:0:10}-audit-a${ATTEMPT}"
 ARCHIVE="$ARTIFACT_ROOT/ds4-chunked-prefill-${EXPECTED_COMMIT:0:10}-evidence-a${ATTEMPT}.tar.zst"
+DELIVERY_MANIFEST="$ARTIFACT_ROOT/ds4-chunked-prefill-${EXPECTED_COMMIT:0:10}-delivery-a${ATTEMPT}.sha256"
 test ! -e "$AUDIT_DIR"
 test ! -e "$ARCHIVE"
+test ! -e "$DELIVERY_MANIFEST"
 mkdir -p "$AUDIT_DIR"
 
+test -s "$AUDIT_DIR/acceptance.md"
+MANIFEST_TMP="$(mktemp)"
 (
   cd "$ARTIFACT_ROOT"
   find \
@@ -309,10 +349,14 @@ mkdir -p "$AUDIT_DIR"
     "$(basename "$SMOKE_REPORT")" \
     "$(basename "$MAIN_RESULTS")" \
     "$(basename "$MAIN_REPORT")" \
+    "$(basename "$SMOKE_LOG")" \
+    "$(basename "$MAIN_LOG")" \
+    "$(basename "$AUDIT_DIR")" \
     -type f -print0 |
     sort -z |
     xargs -0 sha256sum
-) > "$AUDIT_DIR/evidence-checksums.sha256"
+) > "$MANIFEST_TMP"
+mv "$MANIFEST_TMP" "$AUDIT_DIR/evidence-checksums.sha256"
 
 tar --zstd -cf "$ARCHIVE" -C "$ARTIFACT_ROOT" \
   "$(basename "$PREFLIGHT")" \
@@ -320,26 +364,19 @@ tar --zstd -cf "$ARCHIVE" -C "$ARTIFACT_ROOT" \
   "$(basename "$SMOKE_REPORT")" \
   "$(basename "$MAIN_RESULTS")" \
   "$(basename "$MAIN_REPORT")" \
+  "$(basename "$SMOKE_LOG")" \
+  "$(basename "$MAIN_LOG")" \
   "$(basename "$AUDIT_DIR")"
 
-sha256sum "$AUDIT_DIR/evidence-checksums.sha256" "$ARCHIVE" \
-  "$SMOKE_LOG" "$MAIN_LOG" > "$AUDIT_DIR/delivery-checksums.sha256"
+sha256sum \
+  "$AUDIT_DIR/acceptance.md" \
+  "$AUDIT_DIR/evidence-checksums.sha256" \
+  "$ARCHIVE" > "$DELIVERY_MANIFEST"
 ```
 
-Write `acceptance.md` in the audit directory with:
-
-- exact clean source commit and baseline-ancestor result;
-- origin/upstream URLs and confirmation of no upstream mutation;
-- model/tokenizer revision;
-- GPU, driver, CUDA, PyTorch, vLLM, CPU, NUMA, and runtime environment;
-- every test, lint, dry-run, smoke, matrix, report, and audit command plus
-  output;
-- absolute evidence/report/archive paths and SHA-256 values;
-- a 36-point PASS/unsupported/failed/noisy table;
-- token/cache/iteration/budget/provenance/statistics audit verdicts;
-- chunk-budget, requested-hit, and exact-B main effects and interactions;
-- an explicit distinction from historical client-observed 1P1D TTFT;
-- retained failure/retry history and remaining risks; and
-- requirement-by-requirement PASS/FAIL with a final acceptance verdict.
+The adjacent delivery manifest records the final archive hash; embedding an
+archive's own hash inside that archive is impossible. The archive itself
+contains the acceptance record, launcher logs, complete raw/report evidence,
+and the per-file SHA-256 inventory.
 
 Only a complete target record can mark this profile `ACCEPTED`.

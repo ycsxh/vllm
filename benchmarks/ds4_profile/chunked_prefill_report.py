@@ -8,6 +8,8 @@ import argparse
 import csv
 import html
 import json
+import math
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -24,7 +26,11 @@ from benchmarks.ds4_profile.chunked_prefill import (
     summarize_point_runs,
     summarize_run_samples,
 )
-from benchmarks.ds4_profile.fixed_batch import batch_observation_from_dict
+from benchmarks.ds4_profile.fixed_batch import (
+    CAPACITY_ERROR_MARKERS,
+    BatchObservation,
+    batch_observation_from_dict,
+)
 
 CSV_FIELDS = (
     "point_id",
@@ -78,26 +84,54 @@ def _load_json_object(path: Path) -> dict[str, Any]:
     return value
 
 
+def _audit_cache_warm_observation(
+    point: ChunkedPrefillPoint,
+    observation: BatchObservation,
+) -> None:
+    if len(observation.requests) != 1:
+        raise ValueError(f"{point.id} cache warm returned the wrong request count")
+    request = observation.requests[0]
+    if request.prompt_tokens != point.cached_tokens + 1:
+        raise ValueError(f"{point.id} cache warm prompt length differs")
+    if request.cached_tokens != 0:
+        raise ValueError(f"{point.id} cache warm unexpectedly reused cached tokens")
+    if len(request.output_token_ids) != 1:
+        raise ValueError(f"{point.id} cache warm output length differs")
+    if not observation.iterations:
+        raise ValueError(f"{point.id} cache warm lacks iteration evidence")
+    for iteration in observation.iterations:
+        if not math.isfinite(iteration.elapsed_ms) or iteration.elapsed_ms <= 0:
+            raise ValueError(f"{point.id} cache warm latency is not positive")
+        if (
+            iteration.context_requests != 1
+            or not 0 < iteration.context_tokens <= point.max_num_batched_tokens
+        ):
+            raise ValueError(f"{point.id} cache warm context work exceeds its budget")
+        if iteration.generation_requests or iteration.generation_tokens:
+            raise ValueError(f"{point.id} cache warm must be context-only")
+    if sum(item.context_tokens for item in observation.iterations) != (
+        point.cached_tokens + 1
+    ):
+        raise ValueError(f"{point.id} cache warm context-token total differs")
+
+
 def _audit_cache_warm_observations(
     point: ChunkedPrefillPoint,
     raw_observations: object,
+    *,
+    expected_count: int | None = None,
 ) -> None:
     if not isinstance(raw_observations, list):
         raise ValueError(f"{point.id} cache-warm observations must be a list")
-    expected_count = point.batch_size if point.cached_tokens else 0
+    if expected_count is None:
+        expected_count = point.batch_size if point.cached_tokens else 0
     if len(raw_observations) != expected_count:
         raise ValueError(f"{point.id} cache-warm observation count differs")
     for value in raw_observations:
-        observation = batch_observation_from_dict(value)
-        if len(observation.requests) != 1:
-            raise ValueError(f"{point.id} cache warm returned the wrong request count")
-        request = observation.requests[0]
-        if request.prompt_tokens != point.cached_tokens + 1:
-            raise ValueError(f"{point.id} cache warm prompt length differs")
-        if len(request.output_token_ids) != 1:
-            raise ValueError(f"{point.id} cache warm output length differs")
-        if not observation.iterations:
-            raise ValueError(f"{point.id} cache warm lacks iteration evidence")
+        _audit_cache_warm_observation(
+            point,
+            batch_observation_from_dict(value),
+        )
 
 
 def _audit_sample_artifact(
@@ -192,10 +226,346 @@ def _audit_valid_point(
     return expected_summary, actual_cached_tokens.pop()
 
 
+def _audit_expected_execution(
+    execution: ChunkedPrefillExecution,
+    *,
+    expected_model_revision: str,
+    expected_tokenizer_revision: str,
+    expected_vllm_commit: str,
+) -> None:
+    expected = {
+        "model_revision": expected_model_revision,
+        "tokenizer_revision": expected_tokenizer_revision,
+        "vllm_commit": expected_vllm_commit,
+    }
+    for name, value in expected.items():
+        if not isinstance(value, str) or len(value) != 40:
+            raise ValueError(f"expected {name} must be a full revision")
+        if getattr(execution, name) != value:
+            label = "vLLM commit" if name == "vllm_commit" else name.replace("_", " ")
+            raise ValueError(f"resolved execution differs from expected {label}")
+
+
+def _audit_runtime_invocation(
+    engine_dir: Path,
+    engine_config: dict[str, Any],
+    execution: ChunkedPrefillExecution,
+) -> None:
+    invocation = _load_json_object(engine_dir / "runtime-invocation.json")
+    expected_command = [
+        "numactl",
+        f"--physcpubind={execution.p_cpu_affinity}",
+        f"--membind={execution.p_numa_node}",
+        sys.executable,
+        "-m",
+        "benchmarks.ds4_profile.fixed_batch_runtime",
+        "--serve",
+        "--engine-config",
+        str(engine_dir / "engine-config.json"),
+        "--point-dir",
+        str(engine_dir),
+    ]
+    if invocation.get("command") != expected_command:
+        raise ValueError("runtime invocation command differs from frozen placement")
+    environment = invocation.get("environment")
+    if not isinstance(environment, dict):
+        raise ValueError("runtime invocation environment is missing")
+    expected_environment = {
+        **engine_config["runtime_environment"],
+        "CUDA_VISIBLE_DEVICES": execution.p_gpu,
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+    }
+    if any(
+        environment.get(name) != value for name, value in expected_environment.items()
+    ):
+        raise ValueError("runtime invocation environment differs from provenance")
+    required_paths = (
+        "CUDA_HOME",
+        "HF_HOME",
+        "HF_HUB_CACHE",
+        "LD_LIBRARY_PATH",
+        "PATH",
+    )
+    if any(
+        not isinstance(environment.get(name), str) or not environment[name]
+        for name in required_paths
+    ):
+        raise ValueError("runtime invocation lacks a required environment path")
+
+
+def _capacity_status(error: object) -> str:
+    error_text = str(error).lower()
+    if any(marker in error_text for marker in CAPACITY_ERROR_MARKERS):
+        return "unsupported"
+    return "failed"
+
+
+def _audit_partial_sample(
+    point: ChunkedPrefillPoint,
+    path: Path,
+) -> str:
+    partial = _load_json_object(path)
+    if set(partial) != {
+        "failure_stage",
+        "cache_warm_index",
+        "cache_warm_observations",
+        "observation",
+    }:
+        raise ValueError(f"{point.id} partial-sample fields differ")
+    stage = partial["failure_stage"]
+    valid_stages = {
+        "wait_idle_before_reset",
+        "cache_reset_runtime",
+        "cache_reset_rejected",
+        "cache_warm_runtime",
+        "cache_warm_validation",
+        "wait_idle_after_cache_warm",
+        "target_runtime",
+        "target_validation",
+    }
+    if stage not in valid_stages:
+        raise ValueError(f"{point.id} partial-sample stage is invalid")
+    warm_index = partial["cache_warm_index"]
+    if stage in {"cache_warm_runtime", "cache_warm_validation"}:
+        if (
+            isinstance(warm_index, bool)
+            or not isinstance(warm_index, int)
+            or not 1 <= warm_index <= point.batch_size
+            or not point.cached_tokens
+        ):
+            raise ValueError(f"{point.id} partial cache-warm index is invalid")
+        expected_warm_count = warm_index - 1
+    else:
+        if warm_index is not None:
+            raise ValueError(f"{point.id} partial cache-warm index differs")
+        expected_warm_count = (
+            point.batch_size
+            if point.cached_tokens
+            and stage
+            in {
+                "wait_idle_after_cache_warm",
+                "target_runtime",
+                "target_validation",
+            }
+            else 0
+        )
+    _audit_cache_warm_observations(
+        point,
+        partial["cache_warm_observations"],
+        expected_count=expected_warm_count,
+    )
+    raw_observation = partial["observation"]
+    if stage not in {"cache_warm_validation", "target_validation"}:
+        if raw_observation is not None:
+            raise ValueError(f"{point.id} runtime failure has an observation")
+        return stage
+    observation = batch_observation_from_dict(raw_observation)
+    try:
+        if stage == "cache_warm_validation":
+            _audit_cache_warm_observation(point, observation)
+        else:
+            derive_chunked_prefill_sample(point, observation)
+    except ValueError:
+        return stage
+    raise ValueError(f"{point.id} retained invalid observation is valid")
+
+
+def _expected_sample_names(prefix: str, count: int) -> set[str]:
+    return {f"{prefix}-{index:02d}.json" for index in range(1, count + 1)}
+
+
+def _audit_complete_run(
+    point: ChunkedPrefillPoint,
+    run_dir: Path,
+) -> None:
+    warm_paths = sorted(run_dir.glob("warmup-*.json"))
+    measured_paths = sorted(run_dir.glob("measured-*.json"))
+    if {path.name for path in warm_paths} != _expected_sample_names(
+        "warmup", point.warmup_batches
+    ):
+        raise ValueError(f"{point.id} completed run warmup topology differs")
+    if {path.name for path in measured_paths} != _expected_sample_names(
+        "measured", point.measured_batches
+    ):
+        raise ValueError(f"{point.id} completed run measured topology differs")
+    for path in warm_paths:
+        _audit_sample_artifact(point, path)
+    measured_samples = [
+        _audit_sample_artifact(point, path)[0] for path in measured_paths
+    ]
+    summary_path = run_dir / "run-summary.json"
+    if not summary_path.is_file() or _load_json_object(
+        summary_path
+    ) != summarize_run_samples(measured_samples):
+        raise ValueError(f"{point.id} completed run summary differs from raw data")
+    if any(
+        (run_dir / filename).exists()
+        for filename in ("failure.json", "partial-sample.json")
+    ):
+        raise ValueError(f"{point.id} completed run has failure evidence")
+
+
+def _audit_failure_record(
+    point: ChunkedPrefillPoint,
+    point_dir: Path,
+) -> None:
+    status = _load_json_object(point_dir / "status.json")
+    failure_path = point_dir / "point-failure.json"
+    if not failure_path.is_file():
+        raise ValueError(f"{point.id} lacks point-failure evidence")
+    failure = _load_json_object(failure_path)
+    for name in ("status", "phase", "error_type", "error"):
+        if not isinstance(failure.get(name), str) or not failure[name]:
+            raise ValueError(f"{point.id} point-failure field {name} is invalid")
+    if failure["status"] not in {"failed", "unsupported"}:
+        raise ValueError(f"{point.id} point-failure status is invalid")
+    if failure["status"] != _capacity_status(failure["error"]):
+        raise ValueError(f"{point.id} point-failure classification differs")
+    if any(status.get(name) != value for name, value in failure.items()):
+        raise ValueError(f"{point.id} status differs from point-failure evidence")
+
+    engine_dir = (
+        point_dir.parents[1] / "engines" / f"budget-{point.max_num_batched_tokens:04d}"
+    )
+    engine_failure_path = engine_dir / "engine-failure.json"
+    if engine_failure_path.is_file():
+        if _load_json_object(engine_failure_path) != failure:
+            raise ValueError(f"{point.id} engine and point failures differ")
+        if status != failure or failure["phase"] != "runtime_initialization":
+            raise ValueError(f"{point.id} initialization failure evidence differs")
+        if any(point_dir.glob("run-*")):
+            raise ValueError(f"{point.id} initialization failure has run artifacts")
+        if any(
+            (point_dir / filename).exists()
+            for filename in (
+                "point-summary.json",
+                "partial-sample.json",
+                "invalid-observation.json",
+            )
+        ):
+            raise ValueError(
+                f"{point.id} initialization failure has sample or summary evidence"
+            )
+        return
+
+    if failure["phase"] not in {
+        "warmup",
+        "measured",
+        "run_summary",
+        "point_summary",
+    }:
+        raise ValueError(f"{point.id} point-failure phase is invalid")
+    completed = status.get("completed_repetitions")
+    if (
+        isinstance(completed, bool)
+        or not isinstance(completed, int)
+        or not 0 <= completed <= point.repetitions
+        or status.get("required_repetitions") != point.repetitions
+    ):
+        raise ValueError(f"{point.id} failure repetition counts differ")
+    if failure["phase"] == "point_summary":
+        if completed != point.repetitions or failure.get("batch") != 0:
+            raise ValueError(f"{point.id} point-summary failure position differs")
+    elif completed >= point.repetitions:
+        raise ValueError(f"{point.id} failure exceeds the repetition plan")
+    run_dirs = sorted(point_dir.glob("run-*"))
+    expected_run_names = {
+        f"run-{index:02d}"
+        for index in range(
+            1,
+            completed + (0 if failure["phase"] == "point_summary" else 1) + 1,
+        )
+    }
+    if {path.name for path in run_dirs} != expected_run_names:
+        raise ValueError(f"{point.id} retained failure run topology differs")
+    for run_dir in run_dirs[:completed]:
+        _audit_complete_run(point, run_dir)
+
+    if failure["phase"] == "point_summary":
+        summary_path = point_dir / "point-summary.json"
+        if summary_path.exists():
+            run_summaries = [
+                _load_json_object(run_dir / "run-summary.json") for run_dir in run_dirs
+            ]
+            measured_samples = [
+                _audit_sample_artifact(point, path)[0]
+                for run_dir in run_dirs
+                for path in sorted(run_dir.glob("measured-*.json"))
+            ]
+            if _load_json_object(summary_path) != _expected_point_summary(
+                point,
+                run_summaries,
+                measured_samples,
+            ):
+                raise ValueError(f"{point.id} failed point summary differs")
+        return
+
+    active_run = run_dirs[-1]
+    active_failure = active_run / "failure.json"
+    if not active_failure.is_file() or _load_json_object(active_failure) != failure:
+        raise ValueError(f"{point.id} active run failure evidence differs")
+    batch = failure.get("batch")
+    if failure["phase"] == "run_summary":
+        if batch != 0:
+            raise ValueError(f"{point.id} run-summary failure batch differs")
+        warm_count = point.warmup_batches
+        measured_count = point.measured_batches
+        if (active_run / "partial-sample.json").exists():
+            raise ValueError(f"{point.id} run-summary failure has partial evidence")
+    else:
+        limit = (
+            point.warmup_batches
+            if failure["phase"] == "warmup"
+            else point.measured_batches
+        )
+        if (
+            isinstance(batch, bool)
+            or not isinstance(batch, int)
+            or not 1 <= batch <= limit
+        ):
+            raise ValueError(f"{point.id} failure batch differs")
+        warm_count = batch - 1 if failure["phase"] == "warmup" else point.warmup_batches
+        measured_count = batch - 1 if failure["phase"] == "measured" else 0
+        partial_path = active_run / "partial-sample.json"
+        if not partial_path.is_file():
+            raise ValueError(f"{point.id} lacks partial-sample evidence")
+        failure_stage = _audit_partial_sample(point, partial_path)
+        invalid_path = active_run / "invalid-observation.json"
+        if failure_stage in {"cache_warm_validation", "target_validation"}:
+            if not invalid_path.is_file():
+                raise ValueError(f"{point.id} lacks invalid-observation evidence")
+            invalid = _load_json_object(invalid_path)
+            if invalid.pop("validation_stage", None) != failure_stage:
+                raise ValueError(f"{point.id} invalid-observation stage differs")
+            if invalid != _load_json_object(partial_path)["observation"]:
+                raise ValueError(f"{point.id} invalid observations differ")
+        elif invalid_path.exists():
+            raise ValueError(f"{point.id} runtime failure has invalid-observation")
+    warm_paths = sorted(active_run.glob("warmup-*.json"))
+    measured_paths = sorted(active_run.glob("measured-*.json"))
+    if {path.name for path in warm_paths} != _expected_sample_names(
+        "warmup", warm_count
+    ) or {path.name for path in measured_paths} != _expected_sample_names(
+        "measured", measured_count
+    ):
+        raise ValueError(f"{point.id} active run sample topology differs")
+    for path in (*warm_paths, *measured_paths):
+        _audit_sample_artifact(point, path)
+    if (active_run / "run-summary.json").exists():
+        raise ValueError(f"{point.id} active failed run has a summary")
+    if (point_dir / "point-summary.json").exists():
+        raise ValueError(f"{point.id} failed point unexpectedly has a summary")
+
+
 def _audit_frozen_context(
     points: tuple[ChunkedPrefillPoint, ...],
     results_dir: Path,
     hardware: dict[str, Any],
+    *,
+    expected_model_revision: str,
+    expected_tokenizer_revision: str,
+    expected_vllm_commit: str,
 ) -> dict[str, Any]:
     groups = group_points_by_token_budget(points)
     resolved = _load_json_object(results_dir / "resolved-plan.json")
@@ -221,6 +591,12 @@ def _audit_frozen_context(
         raise ValueError("resolved execution provenance is invalid") from error
     if execution.vllm_dirty:
         raise ValueError("hardware report requires a clean vLLM checkout")
+    _audit_expected_execution(
+        execution,
+        expected_model_revision=expected_model_revision,
+        expected_tokenizer_revision=expected_tokenizer_revision,
+        expected_vllm_commit=expected_vllm_commit,
+    )
     order = _load_json_object(results_dir / "execution-order.json")
     if order.get("points") != [
         {
@@ -292,6 +668,7 @@ def _audit_frozen_context(
         engine_config = _load_json_object(engine_dir / "engine-config.json")
         if engine_config != build_engine_config(budget, execution):
             raise ValueError(f"budget {budget} engine config differs from provenance")
+        _audit_runtime_invocation(engine_dir, engine_config, execution)
         provenance_path = engine_dir / "provenance.json"
         if not provenance_path.is_file():
             failure = _load_json_object(engine_dir / "engine-failure.json")
@@ -315,24 +692,25 @@ def _audit_frozen_context(
             raise ValueError("runtime cache-reset boundary is not public")
         if runtime.get("iteration_source") != "enable_logging_iteration_details":
             raise ValueError("runtime iteration-detail provenance is invalid")
-        if runtime.get("visible_gpu_count") not in {None, 1}:
+        if runtime.get("visible_gpu_count") != 1:
             raise ValueError("P engine did not isolate one visible GPU")
-        invocation = _load_json_object(engine_dir / "runtime-invocation.json")
-        environment = invocation.get("environment")
-        expected_environment = engine_config["runtime_environment"]
+        if runtime.get("visible_gpu_model") != hardware["gpu_model"]:
+            raise ValueError("runtime GPU model differs from frozen hardware")
         if (
-            not isinstance(invocation.get("command"), list)
-            or not isinstance(environment, dict)
-            or environment.get("CUDA_VISIBLE_DEVICES") != execution.p_gpu
-            or any(
-                environment.get(name) != value
-                for name, value in expected_environment.items()
-            )
+            not isinstance(runtime.get("nvidia_driver"), str)
+            or not runtime["nvidia_driver"]
+            or not isinstance(runtime.get("gpu_uuid"), str)
+            or not runtime["gpu_uuid"].startswith("GPU-")
         ):
-            raise ValueError("runtime invocation differs from engine provenance")
+            raise ValueError("runtime physical-GPU provenance is incomplete")
+        versions = runtime.get("runtime_versions")
+        if not isinstance(versions, dict) or any(
+            not isinstance(versions.get(name), str) or not versions[name]
+            for name in ("python", "torch", "vllm", "cuda")
+        ):
+            raise ValueError("runtime version provenance is incomplete")
         runtime_provenance.append(runtime)
-        if runtime.get("visible_gpu_model"):
-            gpu_models.add(runtime["visible_gpu_model"])
+        gpu_models.add(runtime["visible_gpu_model"])
     if gpu_models and gpu_models != {hardware["gpu_model"]}:
         raise ValueError("hardware GPU model differs from runtime provenance")
     runtime_versions = {
@@ -375,6 +753,7 @@ def _row_for_point(
         }
     )
     if status != "valid":
+        _audit_failure_record(point, point_dir)
         return row
     engine_dir = results_dir / "engines" / f"budget-{point.max_num_batched_tokens:04d}"
     summary, actual_cached = _audit_valid_point(
@@ -640,16 +1019,30 @@ def build_chunked_prefill_report(
     report_dir: Path,
     *,
     hardware: dict[str, Any],
+    expected_model_revision: str,
+    expected_tokenizer_revision: str,
+    expected_vllm_commit: str,
 ) -> ReportArtifacts:
     """Recompute every result from raw observations and build the report."""
     if set(hardware) != {"gpu_count", "gpu_model", "topology"}:
         raise ValueError("hardware must contain gpu_count, gpu_model, and topology")
-    if hardware["gpu_count"] != 2 or hardware["gpu_model"] != "NVIDIA GeForce RTX 3090":
+    if (
+        hardware["gpu_count"] != 2
+        or hardware["gpu_model"] != "NVIDIA GeForce RTX 3090"
+        or hardware["topology"] != "P=GPU0/NUMA0 on dual RTX 3090"
+    ):
         raise ValueError("hardware must be the frozen dual RTX 3090 target")
     if report_dir.exists():
         raise FileExistsError(f"report directory already exists: {report_dir}")
     points = load_chunked_prefill_plan(plan_path)
-    frozen_context = _audit_frozen_context(points, results_dir, hardware)
+    frozen_context = _audit_frozen_context(
+        points,
+        results_dir,
+        hardware,
+        expected_model_revision=expected_model_revision,
+        expected_tokenizer_revision=expected_tokenizer_revision,
+        expected_vllm_commit=expected_vllm_commit,
+    )
     rows = [_row_for_point(point, results_dir) for point in points]
     report_dir.mkdir(parents=True)
     summary_csv = report_dir / "summary.csv"
@@ -711,6 +1104,9 @@ def _parser() -> argparse.ArgumentParser:
         "--topology",
         default="P=GPU0/NUMA0 on dual RTX 3090",
     )
+    parser.add_argument("--expected-model-revision", required=True)
+    parser.add_argument("--expected-tokenizer-revision", required=True)
+    parser.add_argument("--expected-vllm-commit", required=True)
     return parser
 
 
@@ -725,6 +1121,9 @@ def main(argv: list[str] | None = None) -> int:
             "gpu_model": args.gpu_model,
             "topology": args.topology,
         },
+        expected_model_revision=args.expected_model_revision,
+        expected_tokenizer_revision=args.expected_tokenizer_revision,
+        expected_vllm_commit=args.expected_vllm_commit,
     )
     return 0
 

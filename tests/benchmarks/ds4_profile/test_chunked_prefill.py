@@ -12,6 +12,8 @@ from typing import Any
 import pytest
 
 from benchmarks.ds4_profile.chunked_prefill import (
+    MODEL_REVISION,
+    TOKENIZER_REVISION,
     ChunkedPrefillExecution,
     ChunkedPrefillPoint,
     build_engine_config,
@@ -38,6 +40,64 @@ from benchmarks.ds4_profile.fixed_batch import (
 from benchmarks.ds4_profile.fixed_batch_runtime import OfflineLLMRuntime
 
 CONFIG_DIR = Path(__file__).parents[3] / "benchmarks/ds4_profile/config"
+TEST_MODEL_REVISION = MODEL_REVISION
+TEST_TOKENIZER_REVISION = TOKENIZER_REVISION
+TEST_VLLM_COMMIT = "3" * 40
+
+
+def _build_test_report(
+    plan_path: Path,
+    results_dir: Path,
+    report_dir: Path,
+    *,
+    hardware: dict[str, Any],
+):
+    return build_chunked_prefill_report(
+        plan_path,
+        results_dir,
+        report_dir,
+        hardware=hardware,
+        expected_model_revision=TEST_MODEL_REVISION,
+        expected_tokenizer_revision=TEST_TOKENIZER_REVISION,
+        expected_vllm_commit=TEST_VLLM_COMMIT,
+    )
+
+
+def _write_fake_runtime_invocation(
+    engine_config: dict[str, Any],
+    engine_dir: Path,
+) -> None:
+    (engine_dir / "runtime-invocation.json").write_text(
+        json.dumps(
+            {
+                "command": [
+                    "numactl",
+                    "--physcpubind=0,2,4,6,8,10",
+                    "--membind=0",
+                    sys.executable,
+                    "-m",
+                    "benchmarks.ds4_profile.fixed_batch_runtime",
+                    "--serve",
+                    "--engine-config",
+                    str(engine_dir / "engine-config.json"),
+                    "--point-dir",
+                    str(engine_dir),
+                ],
+                "environment": {
+                    "CUDA_HOME": "/test/cuda",
+                    "CUDA_VISIBLE_DEVICES": engine_config["cuda_visible_devices"],
+                    "HF_HOME": "/test/hf",
+                    "HF_HUB_CACHE": "/test/hf/hub",
+                    "HF_HUB_OFFLINE": "1",
+                    "LD_LIBRARY_PATH": "/test/cuda/lib",
+                    "PATH": "/test/bin",
+                    "TRANSFORMERS_OFFLINE": "1",
+                    **engine_config["runtime_environment"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 class FakeGroupedRuntime:
@@ -50,27 +110,23 @@ class FakeGroupedRuntime:
         self.engine_dir = engine_dir
         self.operations: list[tuple[str, int, int]] = []
         self.warm_prefix_lengths: list[int] = []
-        (engine_dir / "runtime-invocation.json").write_text(
-            json.dumps(
-                {
-                    "command": ["fake-public-llm"],
-                    "environment": {
-                        "CUDA_VISIBLE_DEVICES": engine_config["cuda_visible_devices"],
-                        **engine_config["runtime_environment"],
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
+        _write_fake_runtime_invocation(engine_config, engine_dir)
 
     def provenance(self) -> dict[str, Any]:
         return {
             "runner_boundary": "vllm.LLM.generate",
             "cache_reset_boundary": "vllm.LLM.reset_prefix_cache",
             "iteration_source": "enable_logging_iteration_details",
-            "runtime_versions": {"vllm": "test"},
+            "runtime_versions": {
+                "python": "test",
+                "torch": "test",
+                "vllm": "test",
+                "cuda": "test",
+            },
             "visible_gpu_count": 1,
             "visible_gpu_model": "NVIDIA GeForce RTX 3090",
+            "nvidia_driver": "test-driver",
+            "gpu_uuid": "GPU-00000000-0000-0000-0000-000000000000",
         }
 
     def wait_idle(self) -> None:
@@ -173,20 +229,22 @@ def test_plan_loads_explicit_point_with_aligned_cache_tokens(
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     (
+        ("model_revision", "1" * 40, "model_revision"),
+        ("tokenizer_revision", "2" * 40, "tokenizer_revision"),
         ("attention_backend", "FLASHINFER", "FLASH_ATTN"),
         ("p_gpu", "1", "GPU 0"),
         ("p_cpu_affinity", "1,3,5,7,9,11", "CPU affinity"),
         ("p_numa_node", 1, "NUMA node 0"),
     ),
 )
-def test_execution_rejects_changes_to_accepted_p_placement(
+def test_execution_rejects_changes_to_frozen_provenance(
     field: str,
     value: object,
     message: str,
 ) -> None:
     arguments: dict[str, object] = {
-        "model_revision": "1" * 40,
-        "tokenizer_revision": "2" * 40,
+        "model_revision": MODEL_REVISION,
+        "tokenizer_revision": TOKENIZER_REVISION,
         "vllm_commit": "3" * 40,
         "attention_backend": "FLASH_ATTN",
         "p_gpu": "0",
@@ -478,8 +536,8 @@ def test_runner_reuses_one_engine_and_retains_warm_evidence_outside_samples(
         CONFIG_DIR / "chunked-prefill-smoke.json",
         results_dir,
         execution=ChunkedPrefillExecution(
-            model_revision="1" * 40,
-            tokenizer_revision="2" * 40,
+            model_revision=MODEL_REVISION,
+            tokenizer_revision=TOKENIZER_REVISION,
             vllm_commit="3" * 40,
             attention_backend="FLASH_ATTN",
             p_gpu="0",
@@ -564,8 +622,8 @@ def test_runner_launches_exactly_one_engine_for_each_selected_budget(
         plan_path,
         tmp_path / "results",
         execution=ChunkedPrefillExecution(
-            model_revision="1" * 40,
-            tokenizer_revision="2" * 40,
+            model_revision=MODEL_REVISION,
+            tokenizer_revision=TOKENIZER_REVISION,
             vllm_commit="3" * 40,
             attention_backend="FLASH_ATTN",
             p_gpu="0",
@@ -586,9 +644,10 @@ def test_runner_retains_group_initialization_capacity_failure_for_every_point(
 ) -> None:
     def runtime_factory(
         _budget: int,
-        _engine_config: dict[str, Any],
-        _engine_dir: Path,
+        engine_config: dict[str, Any],
+        engine_dir: Path,
     ) -> FakeGroupedRuntime:
+        _write_fake_runtime_invocation(engine_config, engine_dir)
         raise RuntimeError("No available memory for the cache blocks.")
 
     results_dir = tmp_path / "results"
@@ -596,8 +655,8 @@ def test_runner_retains_group_initialization_capacity_failure_for_every_point(
         CONFIG_DIR / "chunked-prefill-smoke.json",
         results_dir,
         execution=ChunkedPrefillExecution(
-            model_revision="1" * 40,
-            tokenizer_revision="2" * 40,
+            model_revision=MODEL_REVISION,
+            tokenizer_revision=TOKENIZER_REVISION,
             vllm_commit="3" * 40,
             attention_backend="FLASH_ATTN",
             p_gpu="0",
@@ -619,6 +678,115 @@ def test_runner_retains_group_initialization_capacity_failure_for_every_point(
         )
         assert status["status"] == "unsupported"
         assert status["phase"] == "runtime_initialization"
+
+    hardware = {
+        "gpu_count": 2,
+        "gpu_model": "NVIDIA GeForce RTX 3090",
+        "topology": "P=GPU0/NUMA0 on dual RTX 3090",
+    }
+    _build_test_report(
+        CONFIG_DIR / "chunked-prefill-smoke.json",
+        results_dir,
+        tmp_path / "report",
+        hardware=hardware,
+    )
+    forged_summary = (
+        results_dir / "points/p-b1-hit75-budget512-smoke" / "point-summary.json"
+    )
+    forged_summary.write_text(json.dumps({"status": "valid"}), encoding="utf-8")
+    with pytest.raises(ValueError, match="sample or summary evidence"):
+        _build_test_report(
+            CONFIG_DIR / "chunked-prefill-smoke.json",
+            results_dir,
+            tmp_path / "forged-initialization-summary-report",
+            hardware=hardware,
+        )
+
+
+def test_runner_retains_cache_warm_evidence_when_target_runtime_fails(
+    tmp_path: Path,
+) -> None:
+    class TargetFailureRuntime(FakeGroupedRuntime):
+        def generate(
+            self,
+            prompt_token_ids: tuple[tuple[int, ...], ...],
+            *,
+            max_tokens: int,
+            ignore_eos: bool,
+        ) -> BatchObservation:
+            if (
+                len(prompt_token_ids) == 1
+                and len(prompt_token_ids[0]) == 13_723
+                and self.warm_prefix_lengths
+            ):
+                raise RuntimeError("target transport failed")
+            return super().generate(
+                prompt_token_ids,
+                max_tokens=max_tokens,
+                ignore_eos=ignore_eos,
+            )
+
+    results_dir = tmp_path / "results"
+    result = run_chunked_prefill_profile(
+        CONFIG_DIR / "chunked-prefill-smoke.json",
+        results_dir,
+        execution=ChunkedPrefillExecution(
+            model_revision=MODEL_REVISION,
+            tokenizer_revision=TOKENIZER_REVISION,
+            vllm_commit=TEST_VLLM_COMMIT,
+            attention_backend="FLASH_ATTN",
+            p_gpu="0",
+            p_cpu_affinity="0,2,4,6,8,10",
+            p_numa_node=0,
+        ),
+        runtime_factory=lambda _budget, engine_config, engine_dir: TargetFailureRuntime(
+            engine_config, engine_dir
+        ),
+    )
+
+    assert result["status"] == "failed"
+    point_dir = results_dir / "points/p-b1-hit75-budget512-smoke"
+    partial_path = point_dir / "run-01/partial-sample.json"
+    partial = json.loads(partial_path.read_text())
+    assert partial["failure_stage"] == "target_runtime"
+    assert len(partial["cache_warm_observations"]) == 1
+    assert partial["observation"] is None
+
+    hardware = {
+        "gpu_count": 2,
+        "gpu_model": "NVIDIA GeForce RTX 3090",
+        "topology": "P=GPU0/NUMA0 on dual RTX 3090",
+    }
+    _build_test_report(
+        CONFIG_DIR / "chunked-prefill-smoke.json",
+        results_dir,
+        tmp_path / "report",
+        hardware=hardware,
+    )
+
+    status_path = point_dir / "status.json"
+    status = json.loads(status_path.read_text())
+    status["completed_repetitions"] = 1
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+    with pytest.raises(ValueError, match="exceeds the repetition plan"):
+        _build_test_report(
+            CONFIG_DIR / "chunked-prefill-smoke.json",
+            results_dir,
+            tmp_path / "extra-repetition-report",
+            hardware=hardware,
+        )
+    status["completed_repetitions"] = 0
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    partial["cache_warm_observations"] = []
+    partial_path.write_text(json.dumps(partial), encoding="utf-8")
+    with pytest.raises(ValueError, match="cache-warm observation count"):
+        _build_test_report(
+            CONFIG_DIR / "chunked-prefill-smoke.json",
+            results_dir,
+            tmp_path / "missing-partial-warm-report",
+            hardware=hardware,
+        )
 
 
 def test_grouped_runtime_factory_starts_one_point_independent_engine_client(
@@ -660,8 +828,8 @@ def test_report_reaudits_raw_observations_and_fails_closed_on_tampering(
         CONFIG_DIR / "chunked-prefill-smoke.json",
         results_dir,
         execution=ChunkedPrefillExecution(
-            model_revision="1" * 40,
-            tokenizer_revision="2" * 40,
+            model_revision=MODEL_REVISION,
+            tokenizer_revision=TOKENIZER_REVISION,
             vllm_commit="3" * 40,
             attention_backend="FLASH_ATTN",
             p_gpu="0",
@@ -678,7 +846,7 @@ def test_report_reaudits_raw_observations_and_fails_closed_on_tampering(
         "topology": "P=GPU0/NUMA0 on dual RTX 3090",
     }
 
-    artifacts = build_chunked_prefill_report(
+    artifacts = _build_test_report(
         CONFIG_DIR / "chunked-prefill-smoke.json",
         results_dir,
         tmp_path / "report",
@@ -702,7 +870,7 @@ def test_report_reaudits_raw_observations_and_fails_closed_on_tampering(
         "p-computed-token-throughput.svg",
     }
     with pytest.raises(ValueError, match="dual RTX 3090"):
-        build_chunked_prefill_report(
+        _build_test_report(
             CONFIG_DIR / "chunked-prefill-smoke.json",
             results_dir,
             tmp_path / "wrong-hardware-report",
@@ -713,13 +881,62 @@ def test_report_reaudits_raw_observations_and_fails_closed_on_tampering(
             },
         )
 
+    cold_dir = results_dir / "points/p-b4-hit0-budget512-smoke"
+    cold_status_path = cold_dir / "status.json"
+    root_status_path = results_dir / "status.json"
+    original_cold_status = json.loads(cold_status_path.read_text())
+    original_root_status = json.loads(root_status_path.read_text())
+    forged_failure = {
+        "status": "failed",
+        "phase": "point_summary",
+        "batch": 99,
+        "error_type": "RuntimeError",
+        "error": "synthetic report failure",
+    }
+    (cold_dir / "point-failure.json").write_text(
+        json.dumps(forged_failure),
+        encoding="utf-8",
+    )
+    cold_status_path.write_text(
+        json.dumps(
+            {
+                **forged_failure,
+                "completed_repetitions": 1,
+                "required_repetitions": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    root_status_path.write_text(
+        json.dumps(
+            {
+                "status": "failed",
+                "point_statuses": {
+                    "p-b1-hit75-budget512-smoke": "valid",
+                    "p-b4-hit0-budget512-smoke": "failed",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="point-summary failure position"):
+        _build_test_report(
+            CONFIG_DIR / "chunked-prefill-smoke.json",
+            results_dir,
+            tmp_path / "forged-point-summary-position-report",
+            hardware=hardware,
+        )
+    (cold_dir / "point-failure.json").unlink()
+    cold_status_path.write_text(json.dumps(original_cold_status), encoding="utf-8")
+    root_status_path.write_text(json.dumps(original_root_status), encoding="utf-8")
+
     point_dir = results_dir / "points/p-b1-hit75-budget512-smoke"
     point_summary_path = point_dir / "point-summary.json"
     point_summary = json.loads(point_summary_path.read_text())
     point_summary["metrics"]["prefill_completion_latency_ms"]["mean"] = 999.0
     point_summary_path.write_text(json.dumps(point_summary), encoding="utf-8")
     with pytest.raises(ValueError, match="stored point summary"):
-        build_chunked_prefill_report(
+        _build_test_report(
             CONFIG_DIR / "chunked-prefill-smoke.json",
             results_dir,
             tmp_path / "tampered-summary-report",
@@ -733,7 +950,7 @@ def test_report_reaudits_raw_observations_and_fails_closed_on_tampering(
     provenance["runtime"]["runner_boundary"] = "vllm.private.scheduler"
     provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
     with pytest.raises(ValueError, match="runner boundary"):
-        build_chunked_prefill_report(
+        _build_test_report(
             CONFIG_DIR / "chunked-prefill-smoke.json",
             results_dir,
             tmp_path / "tampered-provenance-report",
@@ -742,12 +959,51 @@ def test_report_reaudits_raw_observations_and_fails_closed_on_tampering(
     provenance["runtime"]["runner_boundary"] = "vllm.LLM.generate"
     provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
 
+    resolved_path = results_dir / "resolved-plan.json"
+    resolved = json.loads(resolved_path.read_text())
+    resolved["execution"]["vllm_commit"] = "4" * 40
+    resolved_path.write_text(json.dumps(resolved), encoding="utf-8")
+    engine_config_path = results_dir / "engines/budget-0512/engine-config.json"
+    engine_config = json.loads(engine_config_path.read_text())
+    engine_config["vllm_commit"] = "4" * 40
+    engine_config_path.write_text(json.dumps(engine_config), encoding="utf-8")
+    provenance["execution"]["vllm_commit"] = "4" * 40
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+    with pytest.raises(ValueError, match="expected vLLM commit"):
+        _build_test_report(
+            CONFIG_DIR / "chunked-prefill-smoke.json",
+            results_dir,
+            tmp_path / "tampered-revision-report",
+            hardware=hardware,
+        )
+    resolved["execution"]["vllm_commit"] = TEST_VLLM_COMMIT
+    resolved_path.write_text(json.dumps(resolved), encoding="utf-8")
+    engine_config["vllm_commit"] = TEST_VLLM_COMMIT
+    engine_config_path.write_text(json.dumps(engine_config), encoding="utf-8")
+    provenance["execution"]["vllm_commit"] = TEST_VLLM_COMMIT
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    warm_path = point_dir / "run-01/measured-01.json"
+    warm_artifact = json.loads(warm_path.read_text())
+    warm_iteration = warm_artifact["cache_warm_observations"][0]["iterations"][0]
+    warm_iteration["generation_requests"] = 1
+    warm_path.write_text(json.dumps(warm_artifact), encoding="utf-8")
+    with pytest.raises(ValueError, match="cache warm.*context-only"):
+        _build_test_report(
+            CONFIG_DIR / "chunked-prefill-smoke.json",
+            results_dir,
+            tmp_path / "tampered-warm-report",
+            hardware=hardware,
+        )
+    warm_iteration["generation_requests"] = 0
+    warm_path.write_text(json.dumps(warm_artifact), encoding="utf-8")
+
     measured_path = point_dir / "run-01/measured-01.json"
     measured = json.loads(measured_path.read_text())
     measured["observation"]["requests"][0]["cached_tokens"] = 0
     measured_path.write_text(json.dumps(measured), encoding="utf-8")
     with pytest.raises(ValueError, match="cached-token count"):
-        build_chunked_prefill_report(
+        _build_test_report(
             CONFIG_DIR / "chunked-prefill-smoke.json",
             results_dir,
             tmp_path / "tampered-raw-report",
@@ -829,8 +1085,8 @@ def test_report_keeps_noisy_and_unsupported_points_visible(
         plan_path,
         results_dir,
         execution=ChunkedPrefillExecution(
-            model_revision="1" * 40,
-            tokenizer_revision="2" * 40,
+            model_revision=MODEL_REVISION,
+            tokenizer_revision=TOKENIZER_REVISION,
             vllm_commit="3" * 40,
             attention_backend="FLASH_ATTN",
             p_gpu="0",
@@ -842,7 +1098,7 @@ def test_report_keeps_noisy_and_unsupported_points_visible(
         ),
     )
 
-    report = build_chunked_prefill_report(
+    report = _build_test_report(
         plan_path,
         results_dir,
         tmp_path / "report",
@@ -865,6 +1121,43 @@ def test_report_keeps_noisy_and_unsupported_points_visible(
     assert "noisy" in latency_svg
     assert "unsupported" in latency_svg
 
+    unsupported_dir = results_dir / "points/p-b4-hit0-budget512"
+    failure_paths = (
+        unsupported_dir / "point-failure.json",
+        unsupported_dir / "status.json",
+        unsupported_dir / "run-01/failure.json",
+    )
+    original_failures = [json.loads(path.read_text()) for path in failure_paths]
+    for path, failure in zip(failure_paths, original_failures):
+        forged = {**failure, "phase": "measured", "batch": 3}
+        path.write_text(json.dumps(forged), encoding="utf-8")
+    with pytest.raises(ValueError, match="sample topology"):
+        _build_test_report(
+            plan_path,
+            results_dir,
+            tmp_path / "forged-failure-topology-report",
+            hardware={
+                "gpu_count": 2,
+                "gpu_model": "NVIDIA GeForce RTX 3090",
+                "topology": "P=GPU0/NUMA0 on dual RTX 3090",
+            },
+        )
+    for path, failure in zip(failure_paths, original_failures):
+        path.write_text(json.dumps(failure), encoding="utf-8")
+
+    (unsupported_dir / "point-failure.json").unlink()
+    with pytest.raises(ValueError, match="point-failure"):
+        _build_test_report(
+            plan_path,
+            results_dir,
+            tmp_path / "missing-failure-report",
+            hardware={
+                "gpu_count": 2,
+                "gpu_model": "NVIDIA GeForce RTX 3090",
+                "topology": "P=GPU0/NUMA0 on dual RTX 3090",
+            },
+        )
+
 
 def test_chunked_prefill_cli_dry_run_resolves_four_engines_without_gpu(
     tmp_path: Path,
@@ -879,9 +1172,9 @@ def test_chunked_prefill_cli_dry_run_resolves_four_engines_without_gpu(
             "--results-dir",
             str(results_dir),
             "--model-revision",
-            "1" * 40,
+            MODEL_REVISION,
             "--tokenizer-revision",
-            "2" * 40,
+            TOKENIZER_REVISION,
             "--attention-backend",
             "FLASH_ATTN",
             "--prefill-cpus",
@@ -940,8 +1233,8 @@ def test_chunked_engine_uses_only_supported_public_llm_arguments(
         lambda _visible_device: {},
     )
     execution = ChunkedPrefillExecution(
-        model_revision="1" * 40,
-        tokenizer_revision="2" * 40,
+        model_revision=MODEL_REVISION,
+        tokenizer_revision=TOKENIZER_REVISION,
         vllm_commit="3" * 40,
         attention_backend="FLASH_ATTN",
         p_gpu="0",
