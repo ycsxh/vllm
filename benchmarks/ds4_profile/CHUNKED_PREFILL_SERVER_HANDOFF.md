@@ -57,6 +57,27 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export CUDA_HOME=/home/lyc/ds4-storage/runtime/ticket-03-venv-47438683/lib/python3.12/site-packages/nvidia/cu13
 export LD_LIBRARY_PATH=/home/lyc/ds4-storage/runtime/ticket-04-cuda-link-compat-0762f2afe-a01:$CUDA_HOME/lib
+
+PRECOMPILED_ROOT=/home/lyc/ds4-storage/runtime/ticket-04-precompiled-0762f2afe-a01
+for extension in \
+  vllm/_C_stable_libtorch.abi3.so \
+  vllm/_flashmla_C.abi3.so \
+  vllm/_flashmla_extension_C.abi3.so \
+  vllm/_moe_C_stable_libtorch.abi3.so \
+  vllm/_qutlass_C.abi3.so \
+  vllm/_rust_tool_parser.abi3.so \
+  vllm/cumem_allocator.abi3.so \
+  vllm/fs_io_C.abi3.so \
+  vllm/spinloop.abi3.so \
+  vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so \
+  vllm/vllm_flash_attn/_vllm_fa3_C.abi3.so
+do
+  test "$(readlink -f "$extension")" = "$PRECOMPILED_ROOT/$extension"
+done
+
+.venv/bin/python -c \
+  'import vllm.vllm_flash_attn; print("flash-attn-import=PASS")'
+test -z "$(git status --porcelain)"
 ```
 
 Never execute production evidence from a dirty checkout. Never reuse a
