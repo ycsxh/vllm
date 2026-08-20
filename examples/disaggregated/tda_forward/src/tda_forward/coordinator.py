@@ -19,6 +19,7 @@ from tda_forward.contracts import (
     AdmissionResult,
     CacheAction,
     CacheActionAck,
+    CacheActionStatus,
     PlannedPath,
     PrefillResult,
     PreparedTurn,
@@ -268,7 +269,7 @@ class ReentryCoordinator:
                 CacheAction.RETAIN_D if turn.t_pred <= self.g else CacheAction.EVICT_D
             )
             ack = await self.decode.finish(turn, action)
-            self._validate_ack(ack)
+            self._validate_ack(ack, action)
             state.turn_sequence = turn_sequence
             state.plan = ReentryPlan(
                 action=action,
@@ -387,9 +388,16 @@ class ReentryCoordinator:
             raise RuntimeError(f"{result.outcome.value} requires a positive local hit")
 
     @staticmethod
-    def _validate_ack(ack: CacheActionAck) -> None:
-        if not isinstance(ack.status, str) or not ack.status:
+    def _validate_ack(ack: CacheActionAck, action: CacheAction) -> None:
+        if not isinstance(ack.status, CacheActionStatus):
             raise RuntimeError("Decode returned a malformed Cache Action ACK")
+        expected_statuses = (
+            {CacheActionStatus.RETAINED}
+            if action is CacheAction.RETAIN_D
+            else {CacheActionStatus.EVICTED, CacheActionStatus.DEFERRED}
+        )
+        if ack.status not in expected_statuses:
+            raise RuntimeError("Decode returned an ACK inconsistent with its action")
         counts = (
             ack.invalidated_blocks,
             ack.immediately_reusable_blocks,

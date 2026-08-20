@@ -11,6 +11,7 @@ from tda_forward.contracts import (
     AdmissionResult,
     CacheAction,
     CacheActionAck,
+    CacheActionStatus,
     PlannedPath,
 )
 from tda_forward.coordinator import ReentryCoordinator, RequestValidationError
@@ -132,7 +133,7 @@ async def test_first_and_p_bound_turn_use_prefill_side_path() -> None:
     assert record.g == 10.0
     assert record.planned_path is PlannedPath.P_SIDE_AP
     assert record.engine_outcome is None
-    assert record.eviction_status == "evicted"
+    assert record.eviction_status is CacheActionStatus.EVICTED
 
 
 @pytest.mark.asyncio
@@ -243,7 +244,7 @@ async def test_evict_ack_changes_intent_without_fabricating_mirror_removes() -> 
     decode.queue_ack(
         "s",
         CacheActionAck(
-            status="evicted",
+            status=CacheActionStatus.DEFERRED,
             invalidated_blocks=2,
             immediately_reusable_blocks=1,
             deferred_active_blocks=1,

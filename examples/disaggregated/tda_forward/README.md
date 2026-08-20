@@ -4,7 +4,7 @@ This directory is the locally executable part of TDAforward issue #16. It runs
 on ARM64 macOS without CUDA, a model, NIXL, or a live vLLM engine. A thin
 OpenAI-compatible FastAPI adapter delegates all policy and state transitions to
 `ReentryCoordinator`; deterministic fake Prefill and Decode adapters exercise
-the worker contract.
+the Engine Reentry Contract.
 
 ## Local environment and tests
 
@@ -79,18 +79,17 @@ There was no dependency-light Dynamo Python primitive for these required
 operations at the pinned revision, so the portable slice ports the minimal Rust
 behavior instead of taking a runtime dependency on Dynamo.
 
-Two TDAforward-specific divergences are intentional and tested:
+One TDAforward-specific structural divergence is intentional and tested:
 
 1. A fixed 1P1D deployment uses ordered per-session lineages and reverse shared
    references instead of Dynamo's multi-worker radix index and recovery service.
    Any source gap or malformed batch invalidates the run and clears advisory
    presence; it does not replay or rebuild online.
-2. Native vLLM `extra_keys` may include engine-specific multimodal, prompt
-   embedding, LoRA, or cache-salt values. The portable fake harness frames those
-   opaque values in a documented `tdaforward/vllm-extra-keys/v1` suffix after the
-   pinned Dynamo token bytes. The base, LoRA, namespace, and sequence domains
-   remain byte-for-byte Dynamo-compatible; the divergence vector is pinned in
-   `test_hashing_ignores_partial_tail_and_separates_extra_keys`.
+
+The mirror compares native vLLM `extra_keys` structurally when correlating
+events; it does not add another hash domain. Presence is tracked independently
+per native `group_idx`, and a prefix is considered resident only when every
+group observed for that session is present.
 
 The slice makes no claim about CUDA behavior, real model output, live vLLM
 scheduler admission, NIXL transfer, physical block eviction, or performance on

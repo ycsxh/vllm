@@ -14,6 +14,12 @@ class CacheAction(StrEnum):
     EVICT_D = "EVICT_D"
 
 
+class CacheActionStatus(StrEnum):
+    RETAINED = "RETAINED"
+    EVICTED = "EVICTED"
+    DEFERRED = "DEFERRED"
+
+
 class PlannedPath(StrEnum):
     D_LOCAL_AP = "D_LOCAL_AP"
     P_SIDE_AP = "P_SIDE_AP"
@@ -48,7 +54,7 @@ class AdmissionResult:
 
 @dataclass(frozen=True)
 class CacheActionAck:
-    status: str
+    status: CacheActionStatus
     invalidated_blocks: int = 0
     immediately_reusable_blocks: int = 0
     deferred_active_blocks: int = 0
@@ -92,7 +98,7 @@ class TurnRecord:
     hit_ratio: float | None
     estimate_error: int | None
     capacity_delay_ms: float | None
-    eviction_status: str | None
+    eviction_status: CacheActionStatus | None
     invalidated_blocks: int | None
     immediately_reusable_blocks: int | None
     deferred_active_blocks: int | None

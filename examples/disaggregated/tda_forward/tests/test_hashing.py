@@ -39,15 +39,7 @@ def test_lora_and_cache_namespace_match_dynamo_salt_domains() -> None:
     ]
 
 
-def test_hashing_ignores_partial_tail_and_separates_extra_keys() -> None:
+def test_hashing_ignores_partial_tail() -> None:
     tokens = list(range(10))
 
     assert len(block_hashes(tokens, 4)) == 2
-    without_mm = block_hashes(tokens, 4)
-    with_mm = block_hashes(
-        tokens,
-        4,
-        block_extra_keys=[None, ("image", 42)],
-    )
-    assert with_mm[0] == without_mm[0]
-    assert with_mm[1] == 4_191_548_840_009_763_456

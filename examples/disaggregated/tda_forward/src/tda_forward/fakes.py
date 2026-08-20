@@ -15,6 +15,7 @@ from tda_forward.contracts import (
     AdmissionResult,
     CacheAction,
     CacheActionAck,
+    CacheActionStatus,
     PrefillResult,
     PreparedTurn,
 )
@@ -119,7 +120,11 @@ class FakeDecodeAdapter:
         if queued:
             return queued.popleft()
         return CacheActionAck(
-            status="retained" if action is CacheAction.RETAIN_D else "evicted"
+            status=(
+                CacheActionStatus.RETAINED
+                if action is CacheAction.RETAIN_D
+                else CacheActionStatus.EVICTED
+            )
         )
 
     @staticmethod
