@@ -4,6 +4,7 @@
 import asyncio
 import json
 import threading
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -16,7 +17,35 @@ from tda_forward.contracts import (
     PreparedTurn,
 )
 from tda_forward.mirror import DecodePrefixMirror
-from tda_forward.native import NativeEventPump, VllmDecodeAdapter, VllmPrefillAdapter
+from tda_forward.native import (
+    NativeEventPump,
+    VllmDecodeAdapter,
+    VllmPrefillAdapter,
+    VllmTokenizerAdapter,
+)
+
+
+def test_vllm_tokenizer_adapter_uses_public_tokenizer_api(monkeypatch):
+    class Tokenizer:
+        def encode(self, prompt: str) -> list[int]:
+            assert prompt == "hello"
+            return [11, 12]
+
+    def get_tokenizer(model: str, *, trust_remote_code: bool):
+        assert model == "test-model"
+        assert trust_remote_code is True
+        return Tokenizer()
+
+    def import_module(name: str):
+        if name != "vllm.tokenizers":
+            raise ModuleNotFoundError(name)
+        return SimpleNamespace(get_tokenizer=get_tokenizer)
+
+    monkeypatch.setattr("tda_forward.native.importlib.import_module", import_module)
+
+    adapter = VllmTokenizerAdapter("test-model", trust_remote_code=True)
+
+    assert adapter.token_ids({"prompt": "hello"}) == [11, 12]
 
 
 def _turn(cache_action: CacheAction = CacheAction.RETAIN_D) -> PreparedTurn:

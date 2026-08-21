@@ -35,7 +35,7 @@ class VllmTokenizerAdapter:
     """Use the model tokenizer loaded through vLLM's native tokenizer helper."""
 
     def __init__(self, model: str, *, trust_remote_code: bool = False) -> None:
-        tokenizer_module = importlib.import_module("vllm.transformers_utils.tokenizer")
+        tokenizer_module = importlib.import_module("vllm.tokenizers")
         self._tokenizer = tokenizer_module.get_tokenizer(
             model,
             trust_remote_code=trust_remote_code,
