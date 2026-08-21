@@ -8,8 +8,9 @@ import pytest
 
 from tda_forward.coordinator import ReentryCoordinator
 from tda_forward.fakes import FakeDecodeAdapter, FakePrefillAdapter
-from tda_forward.http import create_app
+from tda_forward.http import _aggregate_stream, create_app
 from tda_forward.mirror import DecodePrefixMirror
+from tda_forward.native import NativeEventPump
 
 
 def make_app(
@@ -109,3 +110,96 @@ async def test_delayed_event_producer_does_not_block_streaming() -> None:
     assert response.status_code == 200
     assert 'data: {"choices":[{"text":"prefill"}]}' in response.text
     assert response.text.endswith("data: [DONE]\n\n")
+
+
+def test_non_stream_response_aggregates_native_chat_deltas() -> None:
+    response = _aggregate_stream(
+        [
+            {
+                "id": "chatcmpl-1",
+                "created": 1,
+                "model": "test",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": ""},
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl-1",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "hello"},
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl-1",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": " world"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+            {"id": "chatcmpl-1", "choices": [], "usage": {"total_tokens": 7}},
+        ],
+        "/v1/chat/completions",
+    )
+
+    assert response == {
+        "id": "chatcmpl-1",
+        "created": 1,
+        "model": "test",
+        "object": "chat.completion",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello world"},
+                "logprobs": None,
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"total_tokens": 7},
+    }
+
+
+@pytest.mark.asyncio
+async def test_health_fails_closed_when_native_event_task_dies() -> None:
+    class BrokenSubscriber:
+        def receive_one(self, timeout: int):
+            del timeout
+            raise ValueError("malformed native frame")
+
+        def close(self) -> None:
+            return
+
+    event_queue: asyncio.Queue[tuple[int, object, float | None] | None] = (
+        asyncio.Queue()
+    )
+    _, coordinator = make_app(event_queue)
+    pump = NativeEventPump(
+        BrokenSubscriber,
+        on_failure=coordinator.mirror.invalidate,
+    )
+    app = create_app(coordinator, event_queue=event_queue, event_pump=pump)
+    transport = httpx.ASGITransport(app=app)
+
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://test") as client,
+    ):
+        for _ in range(100):
+            if not coordinator.mirror.is_valid:
+                break
+            await asyncio.sleep(0)
+        response = await client.get("/health")
+
+    assert response.json()["mirror_valid"] is False
+    assert response.json()["event_pump"]["alive"] is False
+    assert "malformed native frame" in response.json()["mirror_invalid_reason"]

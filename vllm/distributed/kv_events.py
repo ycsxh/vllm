@@ -7,9 +7,10 @@ import time
 from abc import ABC, abstractmethod
 from collections import Counter, deque
 from collections.abc import Callable
-from dataclasses import asdict
+from contextlib import suppress
+from dataclasses import asdict, dataclass
 from itertools import count
-from queue import Queue
+from queue import Full, Queue
 from typing import Any
 
 import msgspec
@@ -113,6 +114,14 @@ class AllBlocksCleared(KVCacheEvent):
 
 class KVEventBatch(EventBatch):
     events: list[BlockStored | BlockRemoved | AllBlocksCleared]
+
+
+def _changed_block_count(events: EventBatch) -> int:
+    return sum(
+        len(event.block_hashes)
+        for event in events.events
+        if isinstance(event, (BlockStored, BlockRemoved))
+    )
 
 
 class KVEventAggregator:
@@ -237,6 +246,27 @@ class KVConnectorKVEvents(ABC):
         return self
 
 
+@dataclass(frozen=True)
+class EventPublisherStats:
+    """Snapshot of bounded producer queue activity."""
+
+    enqueued_batches: int
+    enqueued_events: int
+    enqueued_blocks: int
+    published_batches: int
+    published_events: int
+    published_blocks: int
+    published_bytes: int
+    dropped_batches: int
+    dropped_events: int
+    dropped_blocks: int
+    queue_depth: int
+    queue_high_watermark: int
+    total_event_construction_time_seconds: float
+    total_enqueue_time_seconds: float
+    total_publish_lag_seconds: float
+
+
 class EventPublisher(ABC):
     """Lightweight publisher for EventBatch batches with data parallelism
     support.
@@ -259,13 +289,17 @@ class EventPublisher(ABC):
     def publish(self, events: EventBatch) -> None:
         """Emit events in order.
 
-        Implementations should guarantee at-least-once delivery and
-        monotonic ordering (e.g., via sequence numbers).
+        Implementations must make delivery loss visible through their
+        sequence contract rather than silently closing sequence gaps.
         """
 
     @abstractmethod
     def shutdown(self) -> None:
         """Shutdown the publisher."""
+
+    def observe_event_construction_time(self, duration_seconds: float) -> None:
+        """Record Scheduler-side event collection and batch construction time."""
+        del duration_seconds
 
 
 class NullEventPublisher(EventPublisher):
@@ -279,7 +313,7 @@ class NullEventPublisher(EventPublisher):
 
 
 class ZmqEventPublisher(EventPublisher):
-    """Reliable PUB/ROUTER publisher with an in-memory replay buffer.
+    """Bounded PUB/ROUTER publisher with an in-memory replay buffer.
 
     Spawns a separate thread to handle publishing from a queue.
 
@@ -317,8 +351,22 @@ class ZmqEventPublisher(EventPublisher):
     ) -> None:
         # Storage
         super().__init__(data_parallel_rank)
-        self._event_queue = Queue[EventBatch | None](maxsize=max_queue_size)
+        self._event_queue = Queue[tuple[int, EventBatch] | None](maxsize=max_queue_size)
         self._buffer = deque[tuple[int, bytes]](maxlen=buffer_steps)
+        self._enqueued_batches = 0
+        self._enqueued_events = 0
+        self._enqueued_blocks = 0
+        self._published_batches = 0
+        self._published_events = 0
+        self._published_blocks = 0
+        self._published_bytes = 0
+        self._dropped_batches = 0
+        self._dropped_events = 0
+        self._dropped_blocks = 0
+        self._queue_high_watermark = 0
+        self._total_event_construction_time_seconds = 0.0
+        self._total_enqueue_time_seconds = 0.0
+        self._total_publish_lag_seconds = 0.0
 
         # ZMQ sockets
         self._ctx = zmq.Context.instance()
@@ -351,12 +399,58 @@ class ZmqEventPublisher(EventPublisher):
             raise RuntimeError("Publisher is closed")
         if events.data_parallel_rank is None:
             events.data_parallel_rank = self._data_parallel_rank
-        self._event_queue.put(events)
+        seq = next(self._seq_gen)
+        changed_blocks = _changed_block_count(events)
+        enqueue_start = time.perf_counter()
+        queue_depth_after_enqueue = self._event_queue.qsize() + 1
+        try:
+            self._event_queue.put_nowait((seq, events))
+        except Full:
+            self._dropped_batches += 1
+            self._dropped_events += len(events.events)
+            self._dropped_blocks += changed_blocks
+            self._total_enqueue_time_seconds += time.perf_counter() - enqueue_start
+            return
+        self._total_enqueue_time_seconds += time.perf_counter() - enqueue_start
+        self._enqueued_batches += 1
+        self._enqueued_events += len(events.events)
+        self._enqueued_blocks += changed_blocks
+        self._queue_high_watermark = max(
+            self._queue_high_watermark,
+            queue_depth_after_enqueue,
+        )
+
+    @property
+    def stats(self) -> EventPublisherStats:
+        """Return a point-in-time snapshot of producer queue activity."""
+        return EventPublisherStats(
+            enqueued_batches=self._enqueued_batches,
+            enqueued_events=self._enqueued_events,
+            enqueued_blocks=self._enqueued_blocks,
+            published_batches=self._published_batches,
+            published_events=self._published_events,
+            published_blocks=self._published_blocks,
+            published_bytes=self._published_bytes,
+            dropped_batches=self._dropped_batches,
+            dropped_events=self._dropped_events,
+            dropped_blocks=self._dropped_blocks,
+            queue_depth=self._event_queue.qsize(),
+            queue_high_watermark=self._queue_high_watermark,
+            total_event_construction_time_seconds=(
+                self._total_event_construction_time_seconds
+            ),
+            total_enqueue_time_seconds=self._total_enqueue_time_seconds,
+            total_publish_lag_seconds=self._total_publish_lag_seconds,
+        )
+
+    def observe_event_construction_time(self, duration_seconds: float) -> None:
+        self._total_event_construction_time_seconds += duration_seconds
 
     def shutdown(self) -> None:
         """Stop the publisher thread and clean up resources."""
         self._running = False
-        self._event_queue.put_nowait(None)
+        with suppress(Full):
+            self._event_queue.put_nowait(None)
 
         start = time.time()
         pending_items = True
@@ -383,6 +477,7 @@ class ZmqEventPublisher(EventPublisher):
                 self._replay.close(linger=0)
         finally:
             pass  # Do not terminate context; other sockets may use it
+        logger.info("KV event publisher final stats: %s", self.stats)
 
     def _socket_setup(self) -> None:
         """Initialize sockets
@@ -427,26 +522,34 @@ class ZmqEventPublisher(EventPublisher):
 
             # --- main queue (critical) ---------------------------------
             try:
-                event = self._event_queue.get(timeout=0.1)
-                if event is None:
+                queued_event = self._event_queue.get(timeout=0.1)
+                if queued_event is None:
                     break  # Sentinel received, exit thread
             except queue.Empty:
                 continue
 
+            seq, event = queued_event
             try:
-                seq = next(self._seq_gen)
-
                 payload = self._pack.encode(event)
                 seq_bytes = seq.to_bytes(8, "big")
                 self._pub.send_multipart((self._topic_bytes, seq_bytes, payload))
 
                 self._buffer.append((seq, payload))
-                self._event_queue.task_done()
+                self._published_batches += 1
+                self._published_events += len(event.events)
+                self._published_blocks += _changed_block_count(event)
+                self._published_bytes += len(payload)
+                self._total_publish_lag_seconds += max(0.0, time.time() - event.ts)
 
             except Exception as e:
+                self._dropped_batches += 1
+                self._dropped_events += len(event.events)
+                self._dropped_blocks += _changed_block_count(event)
                 # Publishing failed;  back-off a bit to avoid a tight error loop
                 logger.exception("Error in publisher thread: %s", e)
                 time.sleep(0.1)
+            finally:
+                self._event_queue.task_done()
 
     def _service_replay(self) -> None:
         """If a replay request is waiting, send buffered batches."""
@@ -500,6 +603,81 @@ class ZmqEventPublisher(EventPublisher):
                 return f"{base_addr}:{new_port}"
             return endpoint
         raise ValueError("Invalid endpoint: must contain 'inproc' or 'tcp'")
+
+
+@dataclass(frozen=True)
+class EventSubscriberStats:
+    """Snapshot of decoded native subscriber activity."""
+
+    received_batches: int
+    received_events: int
+    received_blocks: int
+    received_bytes: int
+    sequence_gaps: int
+
+
+class ZmqEventSubscriber:
+    """Decode native KV event batches from a publisher sequence envelope."""
+
+    def __init__(
+        self,
+        endpoints: str | list[str],
+        topic: str = "",
+        hwm: int = 100_000,
+    ) -> None:
+        if isinstance(endpoints, str):
+            endpoints = [endpoints]
+        if not endpoints:
+            raise ValueError("at least one event publisher endpoint is required")
+        if len(endpoints) != 1:
+            raise ValueError("one subscriber requires exactly one publisher endpoint")
+        self._ctx = zmq.Context.instance()
+        self._sub = self._ctx.socket(zmq.SUB)
+        self._sub.set_hwm(hwm)
+        self._topic_bytes = topic.encode()
+        self._sub.setsockopt(zmq.SUBSCRIBE, self._topic_bytes)
+        for endpoint in endpoints:
+            self._sub.connect(endpoint)
+        self._decoder = msgspec.msgpack.Decoder(type=KVEventBatch)
+        self._received_batches = 0
+        self._received_events = 0
+        self._received_blocks = 0
+        self._received_bytes = 0
+        self._sequence_gaps = 0
+        self._last_sequence: int | None = None
+
+    def receive_one(self, timeout: int = 1000) -> tuple[int, KVEventBatch] | None:
+        """Receive one native batch, returning ``None`` on timeout."""
+        if not self._sub.poll(timeout):
+            return None
+        topic, seq_bytes, payload = self._sub.recv_multipart()
+        if topic != self._topic_bytes or len(seq_bytes) != 8:
+            raise ValueError("invalid KV event publisher envelope")
+        sequence = int.from_bytes(seq_bytes, "big")
+        batch = self._decoder.decode(payload)
+        if self._last_sequence is not None and sequence != self._last_sequence + 1:
+            self._sequence_gaps += 1
+        self._last_sequence = sequence
+        self._received_batches += 1
+        self._received_events += len(batch.events)
+        self._received_blocks += _changed_block_count(batch)
+        self._received_bytes += len(payload)
+        return sequence, batch
+
+    @property
+    def stats(self) -> EventSubscriberStats:
+        """Return a point-in-time snapshot of subscriber activity."""
+        return EventSubscriberStats(
+            received_batches=self._received_batches,
+            received_events=self._received_events,
+            received_blocks=self._received_blocks,
+            received_bytes=self._received_bytes,
+            sequence_gaps=self._sequence_gaps,
+        )
+
+    def close(self) -> None:
+        """Close the subscriber without waiting for buffered messages."""
+        self._sub.close(linger=0)
 
 
 class EventPublisherFactory:

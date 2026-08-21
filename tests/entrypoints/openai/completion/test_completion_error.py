@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -142,6 +144,66 @@ def _build_renderer(model_config: MockModelConfig):
         MockVllmConfig(model_config, parallel_config=MockParallelConfig()),
         cached_tokenizer_from_config(model_config),
     )
+
+
+@pytest.mark.asyncio
+async def test_completion_stream_carries_kv_transfer_control_metadata():
+    transfer = {
+        "tda_forward": {
+            "admission_result": {
+                "outcome": "D_HIT",
+                "actual_local_cached_tokens": 16,
+                "prompt_tokens": 17,
+                "locally_computed_tokens": 0,
+                "capacity_delay_ms": 0.0,
+            }
+        }
+    }
+    output = RequestOutput(
+        request_id="test-id",
+        prompt="Test prompt",
+        prompt_token_ids=[1, 2, 3],
+        prompt_logprobs=None,
+        outputs=[
+            CompletionOutput(
+                index=0,
+                text="",
+                token_ids=[],
+                cumulative_logprob=None,
+                logprobs=None,
+            )
+        ],
+        finished=False,
+        kv_transfer_params=transfer,
+    )
+
+    async def result_generator() -> AsyncIterator[tuple[int, RequestOutput]]:
+        yield 0, output
+
+    serving = _build_minimal_metrics_serving_completion(False)
+    serving.enable_force_include_usage = False
+    request = CompletionRequest(
+        model=MODEL_NAME,
+        prompt="Test prompt",
+        max_tokens=1,
+        stream=True,
+    )
+    chunks = []
+    async for line in serving.completion_stream_generator(
+        request,
+        engine_inputs=[],
+        result_generator=result_generator(),
+        request_id="cmpl-test-id",
+        created_time=1,
+        model_name=MODEL_NAME,
+        num_prompts=1,
+        tokenizer=None,
+        request_metadata=RequestResponseMetadata(request_id="cmpl-test-id"),
+    ):
+        if line.startswith("data: {"):
+            chunks.append(json.loads(line.removeprefix("data: ")))
+
+    assert chunks[0]["kv_transfer_params"] == transfer
 
 
 def test_completion_per_request_metrics_follow_server_flag():

@@ -111,6 +111,17 @@ class KVCacheBlocks:
         return KVCacheBlocks(tuple(() for _ in range(len(self.blocks))))
 
 
+@dataclass(frozen=True)
+class RequestBlockEvictionResult:
+    """Aggregate result of invalidating one live request's cached blocks."""
+
+    status: Literal["EVICTED", "DEFERRED"]
+    invalidated_blocks: int
+    immediately_reusable_blocks: int
+    deferred_active_blocks: int
+    estimated_reusable_bytes: int
+
+
 class KVCacheManager:
     def __init__(
         self,
@@ -552,6 +563,52 @@ class KVCacheManager:
             block_ids: Set of block IDs to evict from cache.
         """
         self.block_pool.evict_blocks(block_ids)
+
+    def evict_request_blocks(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+    ) -> RequestBlockEvictionResult:
+        """Invalidate full computed cache blocks while request state is live."""
+        request_blocks = self.get_blocks(request.request_id)
+        targeted_blocks: dict[int, tuple[KVCacheBlock, int]] = {}
+        for group, blocks in zip(
+            self.kv_cache_config.kv_cache_groups,
+            request_blocks.blocks,
+            strict=True,
+        ):
+            spec = group.kv_cache_spec
+            num_full_blocks = num_computed_tokens // spec.block_size
+            for block in blocks[:num_full_blocks]:
+                if block.is_null:
+                    continue
+                is_cached = block.block_hash is not None or (
+                    block.block_id in self.block_pool.cached_block_hashes_by_block
+                )
+                if is_cached:
+                    targeted_blocks.setdefault(
+                        block.block_id,
+                        (block, spec.page_size_bytes),
+                    )
+
+        reusable_blocks = 0
+        deferred_blocks = 0
+        estimated_reusable_bytes = 0
+        for block, page_size_bytes in targeted_blocks.values():
+            if block.ref_cnt == 1:
+                reusable_blocks += 1
+                estimated_reusable_bytes += page_size_bytes
+            else:
+                deferred_blocks += 1
+
+        self.block_pool.evict_blocks(set(targeted_blocks))
+        return RequestBlockEvictionResult(
+            status="DEFERRED" if deferred_blocks else "EVICTED",
+            invalidated_blocks=len(targeted_blocks),
+            immediately_reusable_blocks=reusable_blocks,
+            deferred_active_blocks=deferred_blocks,
+            estimated_reusable_bytes=estimated_reusable_bytes,
+        )
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF

@@ -72,6 +72,7 @@ class PreparedTurn:
     lora_name: str | None = None
     cache_namespace: str | None = None
     block_extra_keys: tuple[object | None, ...] | None = None
+    cache_action: CacheAction = CacheAction.EVICT_D
 
 
 @dataclass(frozen=True)

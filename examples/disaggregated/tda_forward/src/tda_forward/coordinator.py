@@ -192,7 +192,12 @@ class ReentryCoordinator:
                 raise RequestValidationError(
                     f"request g={parsed_g} does not match configured g={self.g}"
                 )
-        prompt_token_ids = tuple(self.tokenizer.token_ids(payload))
+        try:
+            prompt_token_ids = tuple(self.tokenizer.token_ids(payload))
+        except RequestValidationError:
+            raise
+        except ValueError as error:
+            raise RequestValidationError(str(error)) from error
         lora_name = self._optional_string(payload.get("lora_name"), "lora_name")
         cache_namespace = self._optional_string(
             payload.get("cache_salt", payload.get("cache_namespace")),
@@ -226,6 +231,9 @@ class ReentryCoordinator:
             lora_name=lora_name,
             cache_namespace=cache_namespace,
             block_extra_keys=block_extra_keys,
+            cache_action=(
+                CacheAction.RETAIN_D if t_pred <= self.g else CacheAction.EVICT_D
+            ),
         )
 
     async def _run_turn(self, turn: PreparedTurn) -> AsyncIterator[dict[str, object]]:
@@ -265,9 +273,7 @@ class ReentryCoordinator:
             async for chunk in stream:
                 yield chunk
 
-            action = (
-                CacheAction.RETAIN_D if turn.t_pred <= self.g else CacheAction.EVICT_D
-            )
+            action = turn.cache_action
             ack = await self.decode.finish(turn, action)
             self._validate_ack(ack, action)
             state.turn_sequence = turn_sequence

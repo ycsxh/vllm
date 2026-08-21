@@ -2112,6 +2112,76 @@ def test_kv_cache_events(blocks_to_cache: int):
     assert len(manager.block_pool.cached_block_hash_to_block) == 0
 
 
+def test_evict_request_blocks_invalidates_only_full_computed_blocks():
+    block_size = 4
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, num_blocks=8),
+        max_model_len=64,
+        enable_caching=True,
+        enable_kv_cache_events=True,
+        hash_block_size=block_size,
+    )
+    request = make_request("evict", list(range(10)), block_size, sha256)
+    manager.allocate_slots(request, request.num_tokens)
+    manager.take_events()
+
+    result = manager.evict_request_blocks(request, num_computed_tokens=10)
+
+    assert result.status == "EVICTED"
+    assert result.invalidated_blocks == 2
+    assert result.immediately_reusable_blocks == 2
+    assert result.deferred_active_blocks == 0
+    assert result.estimated_reusable_bytes == (
+        2 * manager.kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
+    )
+    assert all(
+        block.ref_cnt == 1 for block in manager.get_blocks(request.request_id).blocks[0]
+    )
+    events = manager.take_events()
+    assert len(events) == 2
+    assert all(isinstance(event, BlockRemoved) for event in events)
+
+
+def test_evict_request_blocks_defers_capacity_held_by_active_reference():
+    block_size = 4
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, num_blocks=8),
+        max_model_len=64,
+        enable_caching=True,
+        enable_kv_cache_events=True,
+        hash_block_size=block_size,
+    )
+    owner = make_request("owner", list(range(12)), block_size, sha256)
+    manager.allocate_slots(owner, 8)
+    owner.num_computed_tokens = 8
+
+    shared = make_request("shared", list(range(12)), block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(shared)
+    assert num_computed_tokens == 8
+    manager.allocate_slots(
+        shared,
+        4,
+        num_new_computed_tokens=num_computed_tokens,
+        new_computed_blocks=computed_blocks,
+    )
+    manager.take_events()
+
+    result = manager.evict_request_blocks(owner, num_computed_tokens=8)
+
+    assert result.status == "DEFERRED"
+    assert result.invalidated_blocks == 2
+    assert result.immediately_reusable_blocks == 0
+    assert result.deferred_active_blocks == 2
+    assert result.estimated_reusable_bytes == 0
+    owner_blocks = manager.get_blocks(owner.request_id).blocks[0][:2]
+    assert all(
+        block.ref_cnt == 2 and block.block_hash is None for block in owner_blocks
+    )
+
+    manager.free(owner)
+    assert all(block.ref_cnt == 1 for block in owner_blocks)
+
+
 def test_null_parent_block_hash():
     block_size = 1
     num_cached_blocks = 2

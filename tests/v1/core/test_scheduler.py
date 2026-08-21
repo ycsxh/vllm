@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    MambaSpec,
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -745,6 +746,372 @@ def test_stop_via_update_from_output():
     assert len(scheduler.running) == 1
     assert not requests[0].is_finished()
     assert list(requests[0].output_token_ids) == [EOS_TOKEN_ID, 10, 11]
+
+
+def test_evict_cache_action_runs_before_request_blocks_are_freed(monkeypatch):
+    import vllm.platforms as platforms
+    from vllm.platforms.cpu import CpuPlatform
+
+    monkeypatch.setattr(platforms, "_current_platform", CpuPlatform())
+    block_size = 4
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=block_size,
+        max_num_batched_tokens=64,
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=9,
+        max_tokens=1,
+        block_size=block_size,
+    )[0]
+    request.kv_transfer_params = {
+        "tda_forward": {"cache_action": "EVICT_D"},
+    }
+    scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+    outputs = scheduler.update_from_output(
+        scheduler_output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[EOS_TOKEN_ID]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    result = outputs[request.client_index].outputs[0].kv_transfer_params
+    assert result == {
+        "tda_forward": {
+            "cache_action_ack": {
+                "status": "EVICTED",
+                "invalidated_blocks": 2,
+                "immediately_reusable_blocks": 2,
+                "deferred_active_blocks": 0,
+                "estimated_reusable_bytes": 64,
+            }
+        }
+    }
+    assert request.request_id not in scheduler.requests
+    assert len(scheduler.kv_cache_manager.block_pool.cached_block_hash_to_block) == 0
+
+
+def test_retain_cache_action_leaves_normal_prefix_cache_entries(monkeypatch):
+    import vllm.platforms as platforms
+    from vllm.platforms.cpu import CpuPlatform
+
+    monkeypatch.setattr(platforms, "_current_platform", CpuPlatform())
+    block_size = 4
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=block_size,
+        max_num_batched_tokens=64,
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=9,
+        max_tokens=1,
+        block_size=block_size,
+    )[0]
+    request.kv_transfer_params = {
+        "tda_forward": {"cache_action": "RETAIN_D"},
+    }
+    scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+    outputs = scheduler.update_from_output(
+        scheduler_output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[EOS_TOKEN_ID]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    result = outputs[request.client_index].outputs[0].kv_transfer_params
+    assert result == {
+        "tda_forward": {
+            "cache_action_ack": {
+                "status": "RETAINED",
+                "invalidated_blocks": 0,
+                "immediately_reusable_blocks": 0,
+                "deferred_active_blocks": 0,
+                "estimated_reusable_bytes": 0,
+            }
+        }
+    }
+    assert len(scheduler.kv_cache_manager.block_pool.cached_block_hash_to_block) == 2
+
+
+def _empty_model_runner_output() -> ModelRunnerOutput:
+    return ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+
+def test_tda_local_admission_reports_hit_before_scheduling_model_work(monkeypatch):
+    import vllm.platforms as platforms
+    from vllm.platforms.cpu import CpuPlatform
+
+    monkeypatch.setattr(platforms, "_current_platform", CpuPlatform())
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        max_num_batched_tokens=64,
+    )
+    warm, request = create_requests(
+        num_requests=2,
+        num_tokens=9,
+        max_tokens=1,
+        same_prompt=True,
+        block_size=4,
+    )
+    scheduler.add_request(warm)
+    warm_output = scheduler.schedule()
+    scheduler.update_from_output(
+        warm_output,
+        ModelRunnerOutput(
+            req_ids=[warm.request_id],
+            req_id_to_index={warm.request_id: 0},
+            sampled_token_ids=[[EOS_TOKEN_ID]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    request.kv_transfer_params = {
+        "tda_forward": {
+            "admission": {
+                "path": "D_LOCAL_AP",
+                "proxy_estimated_cached_tokens": 8,
+            }
+        }
+    }
+    scheduler.add_request(request)
+
+    admission_step = scheduler.schedule()
+    assert admission_step.total_num_scheduled_tokens == 0
+    outputs = scheduler.update_from_output(admission_step, _empty_model_runner_output())
+
+    result = outputs[request.client_index].outputs[0]
+    assert result.new_token_ids == []
+    assert result.finish_reason is None
+    assert result.kv_transfer_params == {
+        "tda_forward": {
+            "admission_result": {
+                "outcome": "D_HIT",
+                "actual_local_cached_tokens": 8,
+                "prompt_tokens": 9,
+                "locally_computed_tokens": 1,
+                "capacity_delay_ms": 0.0,
+            }
+        }
+    }
+    assert request.status == RequestStatus.WAITING
+
+    model_step = scheduler.schedule()
+    assert model_step.num_scheduled_tokens == {request.request_id: 1}
+    assert request.status == RequestStatus.RUNNING
+
+
+def test_tda_local_admission_returns_miss_without_model_work(monkeypatch):
+    import vllm.platforms as platforms
+    from vllm.platforms.cpu import CpuPlatform
+
+    monkeypatch.setattr(platforms, "_current_platform", CpuPlatform())
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        max_num_batched_tokens=64,
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=9,
+        max_tokens=1,
+        block_size=4,
+    )
+    request.kv_transfer_params = {
+        "tda_forward": {
+            "admission": {
+                "path": "D_LOCAL_AP",
+                "proxy_estimated_cached_tokens": 8,
+            }
+        }
+    }
+    scheduler.add_request(request)
+
+    admission_step = scheduler.schedule()
+    assert admission_step.total_num_scheduled_tokens == 0
+    outputs = scheduler.update_from_output(admission_step, _empty_model_runner_output())
+
+    result = outputs[request.client_index].outputs[0]
+    assert result.new_token_ids == []
+    assert result.finish_reason == FinishReason.STOP
+    assert result.kv_transfer_params == {
+        "tda_forward": {
+            "admission_result": {
+                "outcome": "D_MISS",
+                "actual_local_cached_tokens": 0,
+                "prompt_tokens": 9,
+                "locally_computed_tokens": 0,
+                "capacity_delay_ms": 0.0,
+            }
+        }
+    }
+    assert request.request_id not in scheduler.requests
+
+
+def test_tda_local_admission_requires_a_hit_in_every_cache_group(monkeypatch):
+    import vllm.platforms as platforms
+    from vllm.platforms.cpu import CpuPlatform
+
+    monkeypatch.setattr(platforms, "_current_platform", CpuPlatform())
+    cache_groups = [
+        KVCacheGroupSpec(
+            ["full"],
+            FullAttentionSpec(
+                block_size=4,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["mamba"],
+            MambaSpec(
+                block_size=4,
+                shapes=(1, 1),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+            ),
+        ),
+    ]
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        max_num_batched_tokens=64,
+        kv_cache_groups=cache_groups,
+    )
+    (owner, request) = create_requests(
+        num_requests=2,
+        num_tokens=9,
+        max_tokens=1,
+        block_size=4,
+        same_prompt=True,
+    )
+    full_attention_blocks = scheduler.kv_cache_manager.block_pool.get_new_blocks(2)
+    scheduler.kv_cache_manager.block_pool.cache_full_blocks(
+        request=owner,
+        blocks=full_attention_blocks,
+        num_cached_blocks=0,
+        num_full_blocks=2,
+        block_size=4,
+        kv_cache_group_id=0,
+    )
+    request.kv_transfer_params = {
+        "tda_forward": {
+            "admission": {
+                "path": "D_LOCAL_AP",
+                "proxy_estimated_cached_tokens": 8,
+            }
+        }
+    }
+    scheduler.add_request(request)
+
+    admission_step = scheduler.schedule()
+    outputs = scheduler.update_from_output(admission_step, _empty_model_runner_output())
+
+    admission = (
+        outputs[request.client_index]
+        .outputs[0]
+        .kv_transfer_params["tda_forward"]["admission_result"]
+    )
+    assert admission["outcome"] == "D_MISS"
+    assert admission["actual_local_cached_tokens"] == 0
+
+
+def test_tda_local_admission_retries_positive_hit_after_capacity_deferral(
+    monkeypatch,
+):
+    import vllm.platforms as platforms
+    from vllm.platforms.cpu import CpuPlatform
+
+    monkeypatch.setattr(platforms, "_current_platform", CpuPlatform())
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        max_num_batched_tokens=64,
+    )
+    warm, request = create_requests(
+        num_requests=2,
+        num_tokens=9,
+        max_tokens=1,
+        same_prompt=True,
+        block_size=4,
+    )
+    scheduler.add_request(warm)
+    warm_output = scheduler.schedule()
+    scheduler.update_from_output(
+        warm_output,
+        ModelRunnerOutput(
+            req_ids=[warm.request_id],
+            req_id_to_index={warm.request_id: 0},
+            sampled_token_ids=[[EOS_TOKEN_ID]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    request.kv_transfer_params = {
+        "tda_forward": {
+            "admission": {
+                "path": "D_LOCAL_AP",
+                "proxy_estimated_cached_tokens": 8,
+            }
+        }
+    }
+    scheduler.add_request(request)
+
+    allocate_slots = scheduler.kv_cache_manager.allocate_slots
+    calls = 0
+
+    def defer_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None
+        return allocate_slots(*args, **kwargs)
+
+    monkeypatch.setattr(scheduler.kv_cache_manager, "allocate_slots", defer_once)
+
+    deferred_step = scheduler.schedule()
+    assert deferred_step.total_num_scheduled_tokens == 0
+    assert request.status == RequestStatus.WAITING
+
+    admission_step = scheduler.schedule()
+    assert admission_step.total_num_scheduled_tokens == 0
+    outputs = scheduler.update_from_output(admission_step, _empty_model_runner_output())
+
+    result = outputs[request.client_index].outputs[0]
+    admission = result.kv_transfer_params["tda_forward"]["admission_result"]
+    assert admission["outcome"] == "CAPACITY_DEFERRED"
+    assert admission["actual_local_cached_tokens"] == 8
+    assert admission["prompt_tokens"] == 9
+    assert admission["locally_computed_tokens"] == 1
+    assert admission["capacity_delay_ms"] >= 0.0
+    assert request.status == RequestStatus.WAITING
 
 
 def test_check_stop_min_tokens():
