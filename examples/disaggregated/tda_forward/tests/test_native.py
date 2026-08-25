@@ -128,6 +128,140 @@ async def test_bound_decode_streams_after_cache_observation(
     assert ack.status is CacheActionStatus.RETAINED
 
 
+async def test_bound_decode_preserves_chunks_before_execution_observation():
+    observation = {
+        "cache_status": "D_HIT",
+        "actual_local_cached_tokens": 4,
+        "prompt_tokens": 5,
+        "locally_computed_tokens": 1,
+        "capacity_delay_ms": 0.0,
+    }
+    ack = {
+        "status": "RETAINED",
+        "invalidated_blocks": 0,
+        "immediately_reusable_blocks": 0,
+        "deferred_active_blocks": 0,
+        "estimated_reusable_bytes": 0,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        chunks = [
+            {"choices": [{"index": 0, "text": "before", "finish_reason": None}]},
+            {
+                "kv_transfer_params": {
+                    "tda_forward": {"execution_observation": observation}
+                }
+            },
+            {"choices": [{"index": 0, "text": "after", "finish_reason": None}]},
+            {
+                "choices": [{"index": 0, "text": "", "finish_reason": "stop"}],
+                "kv_transfer_params": {"tda_forward": {"cache_action_ack": ack}},
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+        return httpx.Response(200, content=body + "data: [DONE]\n\n")
+
+    client = httpx.AsyncClient(
+        base_url="http://decode",
+        transport=httpx.MockTransport(handler),
+    )
+    adapter = VllmDecodeAdapter(client)
+    turn = _turn()
+
+    execution = await adapter.start_bound(turn)
+    chunks = [chunk async for chunk in execution.stream]
+    ack = await adapter.finish(turn, CacheAction.RETAIN_D)
+
+    assert [choice["text"] for chunk in chunks for choice in chunk["choices"]] == [
+        "before",
+        "after",
+        "",
+    ]
+    assert ack.status is CacheActionStatus.RETAINED
+    await client.aclose()
+
+
+@pytest.mark.parametrize(
+    ("observation", "message"),
+    [
+        (
+            {
+                "cache_status": "D_MISS",
+                "actual_local_cached_tokens": 1,
+                "prompt_tokens": 5,
+                "locally_computed_tokens": 4,
+                "capacity_delay_ms": 0.0,
+            },
+            "D_MISS must report zero local cached tokens",
+        ),
+        (
+            {
+                "cache_status": "D_HIT",
+                "actual_local_cached_tokens": 0,
+                "prompt_tokens": 5,
+                "locally_computed_tokens": 5,
+                "capacity_delay_ms": 0.0,
+            },
+            "D_HIT requires a positive local hit",
+        ),
+        (
+            {
+                "cache_status": "D_HIT",
+                "actual_local_cached_tokens": 4,
+                "prompt_tokens": 5,
+                "locally_computed_tokens": -1,
+                "capacity_delay_ms": 0.0,
+            },
+            "malformed token counts",
+        ),
+        (
+            {
+                "cache_status": "D_HIT",
+                "actual_local_cached_tokens": 4,
+                "prompt_tokens": 5,
+                "locally_computed_tokens": 1,
+                "capacity_delay_ms": float("nan"),
+            },
+            "malformed capacity delay",
+        ),
+    ],
+)
+async def test_bound_decode_closes_on_semantically_malformed_observation(
+    observation: dict[str, object], message: str
+) -> None:
+    stream_closed = False
+
+    class TrackingStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            chunk = {
+                "kv_transfer_params": {
+                    "tda_forward": {"execution_observation": observation}
+                }
+            }
+            yield f"data: {json.dumps(chunk)}\n\n".encode()
+
+        async def aclose(self) -> None:
+            nonlocal stream_closed
+            stream_closed = True
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, stream=TrackingStream())
+
+    client = httpx.AsyncClient(
+        base_url="http://decode",
+        transport=httpx.MockTransport(handler),
+    )
+    adapter = VllmDecodeAdapter(client)
+
+    with pytest.raises(RuntimeError, match=message):
+        await adapter.start_bound(_turn())
+
+    assert stream_closed
+    await client.aclose()
+
+
 async def test_vllm_prefill_adapter_returns_native_transfer_metadata():
     seen_payload = None
     transfer = {

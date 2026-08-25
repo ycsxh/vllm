@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import math
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -161,6 +162,8 @@ class VllmDecodeAdapter:
                     continue
                 observation = self._execution_observation(chunk)
                 if observation is None:
+                    if chunk.get("choices") or chunk.get("usage"):
+                        session.pending_chunks.append(chunk)
                     continue
                 if chunk.get("choices") or chunk.get("usage"):
                     session.pending_chunks.append(chunk)
@@ -288,7 +291,7 @@ class VllmDecodeAdapter:
             status = LocalCacheStatus(cache_status)
         except ValueError as error:
             raise RuntimeError("Decode returned malformed cache status") from error
-        return DecodeExecutionObservation(
+        observation = DecodeExecutionObservation(
             cache_status=status,
             actual_local_cached_tokens=cls._required_int(
                 value, "actual_local_cached_tokens"
@@ -297,6 +300,38 @@ class VllmDecodeAdapter:
             locally_computed_tokens=cls._required_int(value, "locally_computed_tokens"),
             capacity_delay_ms=cls._optional_number(value, "capacity_delay_ms", 0.0),
         )
+        cls._validate_execution_observation(observation)
+        return observation
+
+    @staticmethod
+    def _validate_execution_observation(
+        observation: DecodeExecutionObservation,
+    ) -> None:
+        numeric = (
+            observation.actual_local_cached_tokens,
+            observation.prompt_tokens,
+            observation.locally_computed_tokens,
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in numeric
+        ):
+            raise RuntimeError("Decode returned malformed token counts")
+        if (
+            not math.isfinite(observation.capacity_delay_ms)
+            or observation.capacity_delay_ms < 0
+        ):
+            raise RuntimeError("Decode returned malformed capacity delay")
+        if (
+            observation.cache_status is LocalCacheStatus.D_MISS
+            and observation.actual_local_cached_tokens != 0
+        ):
+            raise RuntimeError("D_MISS must report zero local cached tokens")
+        if (
+            observation.cache_status is LocalCacheStatus.D_HIT
+            and observation.actual_local_cached_tokens == 0
+        ):
+            raise RuntimeError("D_HIT requires a positive local hit")
 
     @classmethod
     def _cache_action_ack(cls, chunk: Mapping[str, object]) -> CacheActionAck | None:
