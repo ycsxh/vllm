@@ -14,16 +14,15 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from tda_forward.contracts import (
-    ActualPath,
-    AdmissionOutcome,
-    AdmissionResult,
     CacheAction,
     CacheActionAck,
     CacheActionStatus,
-    PlannedPath,
+    DecodeExecution,
+    DecodeExecutionObservation,
+    ExecutionPath,
+    LocalCacheStatus,
     PrefillResult,
     PreparedTurn,
-    ReentryPlan,
     TurnRecord,
 )
 from tda_forward.mirror import DecodePrefixMirror
@@ -38,16 +37,10 @@ class PrefillAdapter(Protocol):
 
 
 class DecodeAdapter(Protocol):
-    async def admit_local(
-        self, turn: PreparedTurn, proxy_estimated_cached_tokens: int
-    ) -> AdmissionResult: ...
+    async def start_bound(self, turn: PreparedTurn) -> DecodeExecution: ...
 
     def stream_from_prefill(
         self, turn: PreparedTurn, prefill: PrefillResult
-    ) -> AsyncIterator[dict[str, object]]: ...
-
-    def stream_local(
-        self, turn: PreparedTurn, admission: AdmissionResult
     ) -> AsyncIterator[dict[str, object]]: ...
 
     async def finish(
@@ -102,14 +95,11 @@ class PortableTokenizer:
 @dataclass
 class _SessionState:
     turn_sequence: int
-    plan: ReentryPlan
-
-
-_INITIAL_PLAN = ReentryPlan(CacheAction.EVICT_D, PlannedPath.P_SIDE_AP)
+    next_turn_d_bound: bool
 
 
 class ReentryCoordinator:
-    """Own routing intent, advisory prefix state, fallback, and records."""
+    """Own D binding, advisory prefix state, and execution records."""
 
     def __init__(
         self,
@@ -135,9 +125,9 @@ class ReentryCoordinator:
         self._states: dict[str, _SessionState] = {}
         self._locks: dict[str, asyncio.Lock] = {}
 
-    def plan_for(self, session_id: str) -> ReentryPlan:
+    def is_d_bound(self, session_id: str) -> bool:
         state = self._states.get(session_id)
-        return _INITIAL_PLAN if state is None else state.plan
+        return False if state is None else state.next_turn_d_bound
 
     def start_turn(
         self,
@@ -241,7 +231,7 @@ class ReentryCoordinator:
         async with lock:
             state = self._states.setdefault(
                 turn.session_id,
-                _SessionState(turn_sequence=0, plan=_INITIAL_PLAN),
+                _SessionState(turn_sequence=0, next_turn_d_bound=False),
             )
             turn_sequence = state.turn_sequence + 1
             self.mirror.register_session(
@@ -252,23 +242,18 @@ class ReentryCoordinator:
                 block_extra_keys=turn.block_extra_keys,
             )
             estimate = self.mirror.estimated_cached_tokens(turn.session_id)
-            planned_path = state.plan.path
-            admission: AdmissionResult | None = None
-            fallback_reason: str | None = None
+            used_d_binding = state.next_turn_d_bound
+            observation: DecodeExecutionObservation | None = None
 
-            if planned_path is PlannedPath.P_SIDE_AP:
-                actual_path = ActualPath.P_SIDE_AP
-                stream = self._prefill_stream(turn)
+            if used_d_binding:
+                execution = await self.decode.start_bound(turn)
+                observation = execution.observation
+                self._validate_observation(observation)
+                execution_path = ExecutionPath.D_LOCAL_AP
+                stream = execution.stream
             else:
-                admission = await self.decode.admit_local(turn, estimate)
-                self._validate_admission(admission)
-                if admission.outcome is AdmissionOutcome.D_MISS:
-                    actual_path = ActualPath.P_FALLBACK
-                    fallback_reason = AdmissionOutcome.D_MISS.value
-                    stream = self._prefill_stream(turn)
-                else:
-                    actual_path = ActualPath.D_LOCAL_AP
-                    stream = self.decode.stream_local(turn, admission)
+                execution_path = ExecutionPath.P_SIDE_AP
+                stream = self._prefill_stream(turn)
 
             async for chunk in stream:
                 yield chunk
@@ -277,26 +262,18 @@ class ReentryCoordinator:
             ack = await self.decode.finish(turn, action)
             self._validate_ack(ack, action)
             state.turn_sequence = turn_sequence
-            state.plan = ReentryPlan(
-                action=action,
-                path=(
-                    PlannedPath.D_LOCAL_AP
-                    if action is CacheAction.RETAIN_D
-                    else PlannedPath.P_SIDE_AP
-                ),
-            )
+            state.next_turn_d_bound = action is CacheAction.RETAIN_D
             self.records.append(
                 self._make_record(
                     turn,
                     turn_sequence=turn_sequence,
                     action=action,
-                    planned_path=planned_path,
-                    actual_path=actual_path,
+                    used_d_binding=used_d_binding,
+                    execution_path=execution_path,
                     estimate=estimate,
                     g=self.g,
-                    admission=admission,
+                    observation=observation,
                     ack=ack,
-                    fallback_reason=fallback_reason,
                 )
             )
 
@@ -313,19 +290,20 @@ class ReentryCoordinator:
         *,
         turn_sequence: int,
         action: CacheAction,
-        planned_path: PlannedPath,
-        actual_path: ActualPath,
+        used_d_binding: bool,
+        execution_path: ExecutionPath,
         estimate: int,
         g: float,
-        admission: AdmissionResult | None,
+        observation: DecodeExecutionObservation | None,
         ack: CacheActionAck,
-        fallback_reason: str | None,
     ) -> TurnRecord:
         actual_cached = (
-            None if admission is None else admission.actual_local_cached_tokens
+            None if observation is None else observation.actual_local_cached_tokens
         )
         prompt_tokens = (
-            len(turn.prompt_token_ids) if admission is None else admission.prompt_tokens
+            len(turn.prompt_token_ids)
+            if observation is None
+            else observation.prompt_tokens
         )
         eviction = action is CacheAction.EVICT_D
         return TurnRecord(
@@ -335,25 +313,27 @@ class ReentryCoordinator:
             t_pred=turn.t_pred,
             g=g,
             action=action,
-            planned_path=planned_path,
-            actual_path=actual_path,
+            used_d_binding=used_d_binding,
+            execution_path=execution_path,
             proxy_estimated_cached_tokens=estimate,
-            engine_outcome=None if admission is None else admission.outcome,
+            local_cache_status=(
+                None if observation is None else observation.cache_status
+            ),
             actual_local_cached_tokens=actual_cached,
             prompt_tokens=prompt_tokens,
             locally_computed_tokens=(
-                None if admission is None else admission.locally_computed_tokens
+                None if observation is None else observation.locally_computed_tokens
             ),
             hit_ratio=(
                 None
-                if admission is None or admission.prompt_tokens == 0
-                else admission.actual_local_cached_tokens / admission.prompt_tokens
+                if observation is None or observation.prompt_tokens == 0
+                else observation.actual_local_cached_tokens / observation.prompt_tokens
             ),
             estimate_error=(
                 None if actual_cached is None else actual_cached - estimate
             ),
             capacity_delay_ms=(
-                None if admission is None else admission.capacity_delay_ms
+                None if observation is None else observation.capacity_delay_ms
             ),
             eviction_status=ack.status if eviction else None,
             invalidated_blocks=ack.invalidated_blocks if eviction else None,
@@ -364,11 +344,12 @@ class ReentryCoordinator:
             estimated_reusable_bytes=(
                 ack.estimated_reusable_bytes if eviction else None
             ),
-            fallback_reason=fallback_reason,
         )
 
     @staticmethod
-    def _validate_admission(result: AdmissionResult) -> None:
+    def _validate_observation(result: DecodeExecutionObservation) -> None:
+        if not isinstance(result.cache_status, LocalCacheStatus):
+            raise RuntimeError("Decode returned a malformed local cache status")
         numeric = (
             result.actual_local_cached_tokens,
             result.prompt_tokens,
@@ -382,16 +363,15 @@ class ReentryCoordinator:
         if not math.isfinite(result.capacity_delay_ms) or result.capacity_delay_ms < 0:
             raise RuntimeError("Decode returned malformed capacity delay")
         if (
-            result.outcome is AdmissionOutcome.D_MISS
+            result.cache_status is LocalCacheStatus.D_MISS
             and result.actual_local_cached_tokens != 0
         ):
             raise RuntimeError("D_MISS must report zero local cached tokens")
         if (
-            result.outcome
-            in (AdmissionOutcome.D_HIT, AdmissionOutcome.CAPACITY_DEFERRED)
+            result.cache_status is LocalCacheStatus.D_HIT
             and result.actual_local_cached_tokens == 0
         ):
-            raise RuntimeError(f"{result.outcome.value} requires a positive local hit")
+            raise RuntimeError("D_HIT requires a positive local hit")
 
     @staticmethod
     def _validate_ack(ack: CacheActionAck, action: CacheAction) -> None:

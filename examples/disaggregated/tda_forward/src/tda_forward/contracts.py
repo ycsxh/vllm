@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 
@@ -20,36 +21,29 @@ class CacheActionStatus(StrEnum):
     DEFERRED = "DEFERRED"
 
 
-class PlannedPath(StrEnum):
+class ExecutionPath(StrEnum):
     D_LOCAL_AP = "D_LOCAL_AP"
     P_SIDE_AP = "P_SIDE_AP"
 
 
-class ActualPath(StrEnum):
-    D_LOCAL_AP = "D_LOCAL_AP"
-    P_SIDE_AP = "P_SIDE_AP"
-    P_FALLBACK = "P_FALLBACK"
-
-
-class AdmissionOutcome(StrEnum):
+class LocalCacheStatus(StrEnum):
     D_HIT = "D_HIT"
     D_MISS = "D_MISS"
-    CAPACITY_DEFERRED = "CAPACITY_DEFERRED"
 
 
 @dataclass(frozen=True)
-class ReentryPlan:
-    action: CacheAction
-    path: PlannedPath
-
-
-@dataclass(frozen=True)
-class AdmissionResult:
-    outcome: AdmissionOutcome
+class DecodeExecutionObservation:
+    cache_status: LocalCacheStatus
     actual_local_cached_tokens: int
     prompt_tokens: int
     locally_computed_tokens: int
     capacity_delay_ms: float = 0.0
+
+
+@dataclass(frozen=True)
+class DecodeExecution:
+    observation: DecodeExecutionObservation
+    stream: AsyncIterator[dict[str, object]]
 
 
 @dataclass(frozen=True)
@@ -89,10 +83,10 @@ class TurnRecord:
     t_pred: float
     g: float
     action: CacheAction
-    planned_path: PlannedPath
-    actual_path: ActualPath
+    used_d_binding: bool
+    execution_path: ExecutionPath
     proxy_estimated_cached_tokens: int
-    engine_outcome: AdmissionOutcome | None
+    local_cache_status: LocalCacheStatus | None
     actual_local_cached_tokens: int | None
     prompt_tokens: int
     locally_computed_tokens: int | None
@@ -104,7 +98,6 @@ class TurnRecord:
     immediately_reusable_blocks: int | None
     deferred_active_blocks: int | None
     estimated_reusable_bytes: int | None
-    fallback_reason: str | None
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
