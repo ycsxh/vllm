@@ -122,6 +122,17 @@ async def test_non_stream_response_aggregates_native_chat_deltas() -> None:
                 "id": "chatcmpl-1",
                 "created": 1,
                 "model": "test",
+                "kv_transfer_params": {
+                    "tda_forward": {
+                        "execution_observation": {
+                            "cache_status": "D_HIT",
+                            "actual_local_cached_tokens": 16,
+                            "prompt_tokens": 17,
+                            "locally_computed_tokens": 1,
+                            "capacity_delay_ms": 0.0,
+                        }
+                    }
+                },
                 "choices": [
                     {
                         "index": 0,
@@ -166,11 +177,13 @@ async def test_non_stream_response_aggregates_native_chat_deltas() -> None:
             },
         )
 
-    assert response.json()["choices"][0]["message"] == {
+    response_body = response.json()
+    assert response_body["choices"][0]["message"] == {
         "role": "assistant",
         "content": "hello world",
     }
-    assert response.json()["usage"] == {"total_tokens": 7}
+    assert response_body["usage"] == {"total_tokens": 7}
+    assert "kv_transfer_params" not in response_body
 
 
 @pytest.mark.asyncio
