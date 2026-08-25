@@ -763,7 +763,6 @@ class Scheduler(SchedulerInterface):
                             self.kv_cache_manager.empty_kv_cache_blocks
                         )
                         num_new_local_computed_tokens = 0
-                        request.shared_prefix_boundary = 0
                     elif (
                         self.connector is not None
                         and not tda_forward_decode_bound

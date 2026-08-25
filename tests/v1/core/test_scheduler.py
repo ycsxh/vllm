@@ -1026,6 +1026,7 @@ def test_tda_bound_reconciles_every_cache_group(monkeypatch):
     from vllm.platforms.cpu import CpuPlatform
 
     monkeypatch.setattr(platforms, "_current_platform", CpuPlatform())
+    monkeypatch.setenv("VLLM_PREFIX_CACHE_RETENTION_INTERVAL", "0")
     cache_groups = [
         KVCacheGroupSpec(
             ["full"],
@@ -1052,9 +1053,11 @@ def test_tda_bound_reconciles_every_cache_group(monkeypatch):
         max_num_batched_tokens=64,
         kv_cache_groups=cache_groups,
     )
+    scheduler.cache_config.mamba_cache_mode = "align"
+    scheduler.need_mamba_block_aligned_split = True
     (owner, request) = create_requests(
         num_requests=2,
-        num_tokens=9,
+        num_tokens=17,
         max_tokens=1,
         block_size=4,
         same_prompt=True,
@@ -1085,6 +1088,54 @@ def test_tda_bound_reconciles_every_cache_group(monkeypatch):
     )
     assert observation["cache_status"] == "D_MISS"
     assert observation["actual_local_cached_tokens"] == 0
+
+    model_step = scheduler.schedule()
+    assert model_step.num_scheduled_tokens == {request.request_id: 8}
+    scheduler.update_from_output(
+        model_step,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    (replay,) = create_requests(
+        num_requests=1,
+        num_tokens=9,
+        max_tokens=1,
+        block_size=4,
+        same_prompt=True,
+        req_ids=["replay"],
+    )
+    replay.client_index = 1
+    replay.kv_transfer_params = {
+        "tda_forward": {"decode_bound": True, "cache_action": "RETAIN_D"}
+    }
+    scheduler.add_request(replay)
+
+    replay_observation_step = scheduler.schedule()
+    replay_outputs = scheduler.update_from_output(
+        replay_observation_step,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[EOS_TOKEN_ID]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    replay_observation = (
+        replay_outputs[replay.client_index]
+        .outputs[0]
+        .kv_transfer_params["tda_forward"]["execution_observation"]
+    )
+    assert replay_observation["cache_status"] == "D_HIT"
+    assert replay_observation["actual_local_cached_tokens"] == 8
 
 
 def test_tda_bound_capacity_delay_reports_final_cache_state(
