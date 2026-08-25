@@ -966,6 +966,61 @@ def test_tda_bound_zero_hit_observes_miss_then_schedules_model_work(monkeypatch)
     assert model_step.num_scheduled_tokens == {request.request_id: 9}
 
 
+def test_tda_bound_zero_hit_does_not_reconcile_after_observation(monkeypatch):
+    import vllm.platforms as platforms
+    from vllm.platforms.cpu import CpuPlatform
+
+    monkeypatch.setattr(platforms, "_current_platform", CpuPlatform())
+    scheduler = create_scheduler_with_priority(
+        enable_prefix_caching=True,
+        block_size=4,
+        max_num_batched_tokens=64,
+        max_num_seqs=1,
+    )
+    request, higher_priority = create_requests_with_priority(
+        num_requests=2,
+        priorities=[1, 0],
+        num_tokens=9,
+        max_tokens=1,
+        same_prompt=True,
+        block_size=4,
+        req_ids=["bound", "higher-priority"],
+    )
+    request.kv_transfer_params = {
+        "tda_forward": {"decode_bound": True, "cache_action": "RETAIN_D"}
+    }
+    scheduler.add_request(request)
+
+    observation_step = scheduler.schedule()
+    outputs = scheduler.update_from_output(
+        observation_step, _empty_model_runner_output()
+    )
+    observation = (
+        outputs[request.client_index]
+        .outputs[0]
+        .kv_transfer_params["tda_forward"]["execution_observation"]
+    )
+    assert observation["cache_status"] == "D_MISS"
+
+    scheduler.add_request(higher_priority)
+    higher_priority_step = scheduler.schedule()
+    assert higher_priority_step.num_scheduled_tokens == {higher_priority.request_id: 9}
+    scheduler.update_from_output(
+        higher_priority_step,
+        ModelRunnerOutput(
+            req_ids=[higher_priority.request_id],
+            req_id_to_index={higher_priority.request_id: 0},
+            sampled_token_ids=[[EOS_TOKEN_ID]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    model_step = scheduler.schedule()
+    assert model_step.num_scheduled_tokens == {request.request_id: 9}
+
+
 def test_tda_bound_reconciles_every_cache_group(monkeypatch):
     import vllm.platforms as platforms
     from vllm.platforms.cpu import CpuPlatform

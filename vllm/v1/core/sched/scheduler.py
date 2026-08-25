@@ -716,10 +716,11 @@ class Scheduler(SchedulerInterface):
                 request = request_queue.peek_request()
                 request_id = request.request_id
                 tda_forward_decode_bound = self._tda_forward_decode_bound(request)
+                tda_forward_observed = request_id in self._tda_forward_observed_requests
                 tda_forward_observation_pending = (
                     request.num_computed_tokens == 0
                     and tda_forward_decode_bound
-                    and request_id not in self._tda_forward_observed_requests
+                    and not tda_forward_observed
                 )
 
                 # try to promote blocked statuses while traversing skipped queue.
@@ -757,7 +758,13 @@ class Scheduler(SchedulerInterface):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
-                    if (
+                    if tda_forward_decode_bound and tda_forward_observed:
+                        new_computed_blocks = (
+                            self.kv_cache_manager.empty_kv_cache_blocks
+                        )
+                        num_new_local_computed_tokens = 0
+                        request.shared_prefix_boundary = 0
+                    elif (
                         self.connector is not None
                         and not tda_forward_decode_bound
                         and self.has_mamba_layers
