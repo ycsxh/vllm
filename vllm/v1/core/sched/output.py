@@ -251,8 +251,8 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
-    # Scheduler-owned admission results that require no model execution.
-    tda_forward_admission_outputs: list[tuple[int, EngineCoreOutput]] | None = None
+    # Scheduler-owned observations emitted before model execution.
+    tda_forward_observation_outputs: list[tuple[int, EngineCoreOutput]] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

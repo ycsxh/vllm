@@ -860,7 +860,7 @@ def _empty_model_runner_output() -> ModelRunnerOutput:
     )
 
 
-def test_tda_local_admission_reports_hit_before_scheduling_model_work(monkeypatch):
+def test_tda_bound_hit_observes_reuse_before_model_work(monkeypatch):
     import vllm.platforms as platforms
     from vllm.platforms.cpu import CpuPlatform
 
@@ -892,26 +892,23 @@ def test_tda_local_admission_reports_hit_before_scheduling_model_work(monkeypatc
     )
 
     request.kv_transfer_params = {
-        "tda_forward": {
-            "admission": {
-                "path": "D_LOCAL_AP",
-                "proxy_estimated_cached_tokens": 8,
-            }
-        }
+        "tda_forward": {"decode_bound": True, "cache_action": "RETAIN_D"}
     }
     scheduler.add_request(request)
 
-    admission_step = scheduler.schedule()
-    assert admission_step.total_num_scheduled_tokens == 0
-    outputs = scheduler.update_from_output(admission_step, _empty_model_runner_output())
+    observation_step = scheduler.schedule()
+    assert observation_step.total_num_scheduled_tokens == 0
+    outputs = scheduler.update_from_output(
+        observation_step, _empty_model_runner_output()
+    )
 
     result = outputs[request.client_index].outputs[0]
     assert result.new_token_ids == []
     assert result.finish_reason is None
     assert result.kv_transfer_params == {
         "tda_forward": {
-            "admission_result": {
-                "outcome": "D_HIT",
+            "execution_observation": {
+                "cache_status": "D_HIT",
                 "actual_local_cached_tokens": 8,
                 "prompt_tokens": 9,
                 "locally_computed_tokens": 1,
@@ -926,7 +923,7 @@ def test_tda_local_admission_reports_hit_before_scheduling_model_work(monkeypatc
     assert request.status == RequestStatus.RUNNING
 
 
-def test_tda_local_admission_returns_miss_without_model_work(monkeypatch):
+def test_tda_bound_zero_hit_observes_miss_then_schedules_model_work(monkeypatch):
     import vllm.platforms as platforms
     from vllm.platforms.cpu import CpuPlatform
 
@@ -943,37 +940,33 @@ def test_tda_local_admission_returns_miss_without_model_work(monkeypatch):
         block_size=4,
     )
     request.kv_transfer_params = {
-        "tda_forward": {
-            "admission": {
-                "path": "D_LOCAL_AP",
-                "proxy_estimated_cached_tokens": 8,
-            }
-        }
+        "tda_forward": {"decode_bound": True, "cache_action": "RETAIN_D"}
     }
     scheduler.add_request(request)
 
-    admission_step = scheduler.schedule()
-    assert admission_step.total_num_scheduled_tokens == 0
-    outputs = scheduler.update_from_output(admission_step, _empty_model_runner_output())
-
-    result = outputs[request.client_index].outputs[0]
-    assert result.new_token_ids == []
-    assert result.finish_reason == FinishReason.STOP
-    assert result.kv_transfer_params == {
-        "tda_forward": {
-            "admission_result": {
-                "outcome": "D_MISS",
-                "actual_local_cached_tokens": 0,
-                "prompt_tokens": 9,
-                "locally_computed_tokens": 0,
-                "capacity_delay_ms": 0.0,
-            }
-        }
+    observation_step = scheduler.schedule()
+    outputs = scheduler.update_from_output(
+        observation_step, _empty_model_runner_output()
+    )
+    observation = (
+        outputs[request.client_index]
+        .outputs[0]
+        .kv_transfer_params["tda_forward"]["execution_observation"]
+    )
+    assert observation == {
+        "cache_status": "D_MISS",
+        "actual_local_cached_tokens": 0,
+        "prompt_tokens": 9,
+        "locally_computed_tokens": 9,
+        "capacity_delay_ms": 0.0,
     }
-    assert request.request_id not in scheduler.requests
+    assert request.request_id in scheduler.requests
+
+    model_step = scheduler.schedule()
+    assert model_step.num_scheduled_tokens == {request.request_id: 9}
 
 
-def test_tda_local_admission_requires_a_hit_in_every_cache_group(monkeypatch):
+def test_tda_bound_reconciles_every_cache_group(monkeypatch):
     import vllm.platforms as platforms
     from vllm.platforms.cpu import CpuPlatform
 
@@ -1021,28 +1014,25 @@ def test_tda_local_admission_requires_a_hit_in_every_cache_group(monkeypatch):
         kv_cache_group_id=0,
     )
     request.kv_transfer_params = {
-        "tda_forward": {
-            "admission": {
-                "path": "D_LOCAL_AP",
-                "proxy_estimated_cached_tokens": 8,
-            }
-        }
+        "tda_forward": {"decode_bound": True, "cache_action": "RETAIN_D"}
     }
     scheduler.add_request(request)
 
-    admission_step = scheduler.schedule()
-    outputs = scheduler.update_from_output(admission_step, _empty_model_runner_output())
+    observation_step = scheduler.schedule()
+    outputs = scheduler.update_from_output(
+        observation_step, _empty_model_runner_output()
+    )
 
-    admission = (
+    observation = (
         outputs[request.client_index]
         .outputs[0]
-        .kv_transfer_params["tda_forward"]["admission_result"]
+        .kv_transfer_params["tda_forward"]["execution_observation"]
     )
-    assert admission["outcome"] == "D_MISS"
-    assert admission["actual_local_cached_tokens"] == 0
+    assert observation["cache_status"] == "D_MISS"
+    assert observation["actual_local_cached_tokens"] == 0
 
 
-def test_tda_local_admission_retries_positive_hit_after_capacity_deferral(
+def test_tda_bound_capacity_delay_reports_final_cache_state(
     monkeypatch,
 ):
     import vllm.platforms as platforms
@@ -1075,12 +1065,7 @@ def test_tda_local_admission_retries_positive_hit_after_capacity_deferral(
         ),
     )
     request.kv_transfer_params = {
-        "tda_forward": {
-            "admission": {
-                "path": "D_LOCAL_AP",
-                "proxy_estimated_cached_tokens": 8,
-            }
-        }
+        "tda_forward": {"decode_bound": True, "cache_action": "RETAIN_D"}
     }
     scheduler.add_request(request)
 
@@ -1098,20 +1083,21 @@ def test_tda_local_admission_retries_positive_hit_after_capacity_deferral(
 
     deferred_step = scheduler.schedule()
     assert deferred_step.total_num_scheduled_tokens == 0
-    assert request.status == RequestStatus.WAITING
+    assert scheduler.reset_prefix_cache()
 
-    admission_step = scheduler.schedule()
-    assert admission_step.total_num_scheduled_tokens == 0
-    outputs = scheduler.update_from_output(admission_step, _empty_model_runner_output())
-
-    result = outputs[request.client_index].outputs[0]
-    admission = result.kv_transfer_params["tda_forward"]["admission_result"]
-    assert admission["outcome"] == "CAPACITY_DEFERRED"
-    assert admission["actual_local_cached_tokens"] == 8
-    assert admission["prompt_tokens"] == 9
-    assert admission["locally_computed_tokens"] == 1
-    assert admission["capacity_delay_ms"] >= 0.0
-    assert request.status == RequestStatus.WAITING
+    observation_step = scheduler.schedule()
+    outputs = scheduler.update_from_output(
+        observation_step, _empty_model_runner_output()
+    )
+    observation = (
+        outputs[request.client_index]
+        .outputs[0]
+        .kv_transfer_params["tda_forward"]["execution_observation"]
+    )
+    assert observation["cache_status"] == "D_MISS"
+    assert observation["actual_local_cached_tokens"] == 0
+    assert observation["capacity_delay_ms"] > 0
+    assert scheduler.schedule().num_scheduled_tokens == {request.request_id: 9}
 
 
 def test_check_stop_min_tokens():

@@ -56,7 +56,6 @@ from vllm.v1.engine import (
     EngineCoreEventType,
     EngineCoreOutput,
     EngineCoreOutputs,
-    FinishReason,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -349,17 +348,15 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
         self._tda_forward_capacity_deferred_at: dict[str, float] = {}
+        self._tda_forward_observed_requests: set[str] = set()
 
     @staticmethod
-    def _tda_forward_local_admission_requested(request: Request) -> bool:
+    def _tda_forward_decode_bound(request: Request) -> bool:
         params = request.kv_transfer_params
         if not isinstance(params, dict):
             return False
-        tda_forward = params.get("tda_forward")
-        if not isinstance(tda_forward, dict):
-            return False
-        admission = tda_forward.get("admission")
-        return isinstance(admission, dict) and admission.get("path") == "D_LOCAL_AP"
+        value = params.get("tda_forward")
+        return isinstance(value, dict) and value.get("decode_bound") is True
 
     @staticmethod
     def _tda_forward_output_params(
@@ -375,14 +372,14 @@ class Scheduler(SchedulerInterface):
         return result
 
     @staticmethod
-    def _tda_forward_admission_result(
-        outcome: str,
+    def _tda_forward_execution_observation(
+        cache_status: str,
         request: Request,
         actual_local_cached_tokens: int,
         capacity_delay_ms: float = 0.0,
     ) -> dict[str, Any]:
         return {
-            "outcome": outcome,
+            "cache_status": cache_status,
             "actual_local_cached_tokens": actual_local_cached_tokens,
             "prompt_tokens": request.num_prompt_tokens,
             "locally_computed_tokens": max(
@@ -478,7 +475,7 @@ class Scheduler(SchedulerInterface):
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
         preempted_reqs: list[Request] = []
-        tda_forward_admission_outputs: list[tuple[int, EngineCoreOutput]] = []
+        tda_forward_observation_outputs: list[tuple[int, EngineCoreOutput]] = []
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
@@ -718,9 +715,11 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
-                tda_forward_admission = (
+                tda_forward_decode_bound = self._tda_forward_decode_bound(request)
+                tda_forward_observation_pending = (
                     request.num_computed_tokens == 0
-                    and self._tda_forward_local_admission_requested(request)
+                    and tda_forward_decode_bound
+                    and request_id not in self._tda_forward_observed_requests
                 )
 
                 # try to promote blocked statuses while traversing skipped queue.
@@ -760,7 +759,7 @@ class Scheduler(SchedulerInterface):
                     # Get locally-cached tokens.
                     if (
                         self.connector is not None
-                        and not tda_forward_admission
+                        and not tda_forward_decode_bound
                         and self.has_mamba_layers
                         and isinstance(
                             self.kv_cache_manager.coordinator,
@@ -807,36 +806,8 @@ class Scheduler(SchedulerInterface):
                         ) = self.kv_cache_manager.get_computed_blocks(request)
                         tda_forward_local_cached_tokens = num_new_local_computed_tokens
 
-                    if tda_forward_admission and tda_forward_local_cached_tokens == 0:
-                        request_queue.pop_request()
-                        request.status = RequestStatus.FINISHED_STOPPED
-                        kv_transfer_params, _ = self._free_request(request)
-                        admission_result = self._tda_forward_admission_result(
-                            "D_MISS", request, 0
-                        )
-                        admission_result["locally_computed_tokens"] = 0
-                        kv_transfer_params = self._tda_forward_output_params(
-                            kv_transfer_params,
-                            "admission_result",
-                            admission_result,
-                        )
-                        tda_forward_admission_outputs.append(
-                            (
-                                request.client_index,
-                                EngineCoreOutput(
-                                    request_id=request_id,
-                                    new_token_ids=[],
-                                    finish_reason=FinishReason.STOP,
-                                    stop_reason="tda_forward_d_miss",
-                                    kv_transfer_params=kv_transfer_params,
-                                    trace_headers=request.trace_headers,
-                                ),
-                            )
-                        )
-                        continue
-
                     # Get externally-cached tokens if using a KVConnector.
-                    if self.connector is not None and not tda_forward_admission:
+                    if self.connector is not None and not tda_forward_decode_bound:
                         ext_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
                                 request, num_new_local_computed_tokens
@@ -1010,7 +981,9 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
                     num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
+                    delay_cache_blocks=(
+                        load_kv_async or tda_forward_observation_pending
+                    ),
                     num_encoder_tokens=num_encoder_tokens,
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
@@ -1020,7 +993,7 @@ class Scheduler(SchedulerInterface):
                 if new_blocks is None:
                     # The request cannot be scheduled.
 
-                    if tda_forward_admission:
+                    if tda_forward_observation_pending:
                         self._tda_forward_capacity_deferred_at.setdefault(
                             request_id, time.monotonic()
                         )
@@ -1031,12 +1004,12 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.free(request)
                     break
 
-                if tda_forward_admission:
+                if tda_forward_observation_pending:
                     deferred_at = self._tda_forward_capacity_deferred_at.pop(
                         request_id, None
                     )
-                    outcome = (
-                        "CAPACITY_DEFERRED" if deferred_at is not None else "D_HIT"
+                    cache_status = (
+                        "D_HIT" if tda_forward_local_cached_tokens > 0 else "D_MISS"
                     )
                     capacity_delay_ms = (
                         0.0
@@ -1044,7 +1017,8 @@ class Scheduler(SchedulerInterface):
                         else (time.monotonic() - deferred_at) * 1000
                     )
                     request.num_computed_tokens = num_computed_tokens
-                    tda_forward_admission_outputs.append(
+                    self._tda_forward_observed_requests.add(request_id)
+                    tda_forward_observation_outputs.append(
                         (
                             request.client_index,
                             EngineCoreOutput(
@@ -1052,9 +1026,9 @@ class Scheduler(SchedulerInterface):
                                 new_token_ids=[],
                                 kv_transfer_params=self._tda_forward_output_params(
                                     None,
-                                    "admission_result",
-                                    self._tda_forward_admission_result(
-                                        outcome,
+                                    "execution_observation",
+                                    self._tda_forward_execution_observation(
+                                        cache_status,
                                         request,
                                         tda_forward_local_cached_tokens,
                                         capacity_delay_ms,
@@ -1261,7 +1235,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=new_block_ids_to_zero,
             kv_cache_block_copies=pending_kv_cache_block_copies,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
-            tda_forward_admission_outputs=(tda_forward_admission_outputs or None),
+            tda_forward_observation_outputs=(tda_forward_observation_outputs or None),
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1678,8 +1652,11 @@ class Scheduler(SchedulerInterface):
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
-        if scheduler_output.tda_forward_admission_outputs:
-            for client_index, output in scheduler_output.tda_forward_admission_outputs:
+        if scheduler_output.tda_forward_observation_outputs:
+            for (
+                client_index,
+                output,
+            ) in scheduler_output.tda_forward_observation_outputs:
                 outputs[client_index].append(output)
         spec_decoding_stats: SpecDecodingStats | None = None
 
@@ -2273,6 +2250,7 @@ class Scheduler(SchedulerInterface):
 
         self._inflight_prefills.discard(request)
         self._tda_forward_capacity_deferred_at.pop(request.request_id, None)
+        self._tda_forward_observed_requests.discard(request.request_id)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         cache_action_params = self._finish_cache_action(request)
         if cache_action_params is not None:
