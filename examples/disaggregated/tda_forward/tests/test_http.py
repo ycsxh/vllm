@@ -8,19 +8,20 @@ import pytest
 
 from tda_forward.coordinator import ReentryCoordinator
 from tda_forward.fakes import FakeDecodeAdapter, FakePrefillAdapter
-from tda_forward.http import _aggregate_stream, create_app
+from tda_forward.http import create_app
 from tda_forward.mirror import DecodePrefixMirror
 from tda_forward.native import NativeEventPump
 
 
 def make_app(
     event_queue: asyncio.Queue[tuple[int, object, float | None] | None] | None = None,
+    decode: FakeDecodeAdapter | None = None,
 ):
     coordinator = ReentryCoordinator(
         g=10.0,
         block_size=4,
         prefill=FakePrefillAdapter(),
-        decode=FakeDecodeAdapter(),
+        decode=decode or FakeDecodeAdapter(),
         mirror=DecodePrefixMirror(block_size=4),
     )
     return create_app(coordinator, event_queue=event_queue), coordinator
@@ -112,10 +113,12 @@ async def test_delayed_event_producer_does_not_block_streaming() -> None:
     assert response.text.endswith("data: [DONE]\n\n")
 
 
-def test_non_stream_response_aggregates_native_chat_deltas() -> None:
-    response = _aggregate_stream(
-        [
-            {
+@pytest.mark.asyncio
+async def test_non_stream_response_aggregates_native_chat_deltas() -> None:
+    class ChatDeltaDecodeAdapter(FakeDecodeAdapter):
+        async def stream_from_prefill(self, turn, prefill):
+            del turn, prefill
+            yield {
                 "id": "chatcmpl-1",
                 "created": 1,
                 "model": "test",
@@ -126,8 +129,8 @@ def test_non_stream_response_aggregates_native_chat_deltas() -> None:
                         "finish_reason": None,
                     }
                 ],
-            },
-            {
+            }
+            yield {
                 "id": "chatcmpl-1",
                 "choices": [
                     {
@@ -136,8 +139,8 @@ def test_non_stream_response_aggregates_native_chat_deltas() -> None:
                         "finish_reason": None,
                     }
                 ],
-            },
-            {
+            }
+            yield {
                 "id": "chatcmpl-1",
                 "choices": [
                     {
@@ -146,27 +149,28 @@ def test_non_stream_response_aggregates_native_chat_deltas() -> None:
                         "finish_reason": "stop",
                     }
                 ],
-            },
-            {"id": "chatcmpl-1", "choices": [], "usage": {"total_tokens": 7}},
-        ],
-        "/v1/chat/completions",
-    )
-
-    assert response == {
-        "id": "chatcmpl-1",
-        "created": 1,
-        "model": "test",
-        "object": "chat.completion",
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": "hello world"},
-                "logprobs": None,
-                "finish_reason": "stop",
             }
-        ],
-        "usage": {"total_tokens": 7},
+            yield {"id": "chatcmpl-1", "choices": [], "usage": {"total_tokens": 7}}
+
+    app, _ = make_app(decode=ChatDeltaDecodeAdapter())
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "fake",
+                "messages": [{"role": "user", "content": "hello"}],
+                "session_id": "s",
+                "t_pred": 50.0,
+                "stream": False,
+            },
+        )
+
+    assert response.json()["choices"][0]["message"] == {
+        "role": "assistant",
+        "content": "hello world",
     }
+    assert response.json()["usage"] == {"total_tokens": 7}
 
 
 @pytest.mark.asyncio

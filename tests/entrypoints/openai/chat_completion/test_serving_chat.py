@@ -671,11 +671,11 @@ async def test_streaming_response_carries_kv_transfer_control_metadata():
     serving = await _async_serving_chat_init()
     transfer = {
         "tda_forward": {
-            "admission_result": {
-                "outcome": "D_HIT",
+            "execution_observation": {
+                "cache_status": "D_HIT",
                 "actual_local_cached_tokens": 16,
                 "prompt_tokens": 17,
-                "locally_computed_tokens": 0,
+                "locally_computed_tokens": 1,
                 "capacity_delay_ms": 0.0,
             }
         }
@@ -716,7 +716,9 @@ async def test_streaming_response_carries_kv_transfer_control_metadata():
         if line.startswith("data: {"):
             chunks.append(json.loads(line.removeprefix("data: ")))
 
-    assert chunks[0]["kv_transfer_params"] == transfer
+    assert [
+        chunk["kv_transfer_params"] for chunk in chunks if "kv_transfer_params" in chunk
+    ] == [transfer]
 
 
 async def _collect_metrics_stream_chunks(

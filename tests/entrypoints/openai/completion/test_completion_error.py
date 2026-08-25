@@ -150,11 +150,11 @@ def _build_renderer(model_config: MockModelConfig):
 async def test_completion_stream_carries_kv_transfer_control_metadata():
     transfer = {
         "tda_forward": {
-            "admission_result": {
-                "outcome": "D_HIT",
+            "execution_observation": {
+                "cache_status": "D_HIT",
                 "actual_local_cached_tokens": 16,
                 "prompt_tokens": 17,
-                "locally_computed_tokens": 0,
+                "locally_computed_tokens": 1,
                 "capacity_delay_ms": 0.0,
             }
         }
@@ -203,7 +203,9 @@ async def test_completion_stream_carries_kv_transfer_control_metadata():
         if line.startswith("data: {"):
             chunks.append(json.loads(line.removeprefix("data: ")))
 
-    assert chunks[0]["kv_transfer_params"] == transfer
+    assert [
+        chunk["kv_transfer_params"] for chunk in chunks if "kv_transfer_params" in chunk
+    ] == [transfer]
 
 
 def test_completion_per_request_metrics_follow_server_flag():
