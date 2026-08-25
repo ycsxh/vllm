@@ -10,10 +10,8 @@ import httpx
 import pytest
 
 from tda_forward.contracts import (
-    AdmissionOutcome,
     CacheAction,
     CacheActionStatus,
-    PrefillResult,
     PreparedTurn,
 )
 from tda_forward.mirror import DecodePrefixMirror
@@ -60,13 +58,20 @@ def _turn(cache_action: CacheAction = CacheAction.RETAIN_D) -> PreparedTurn:
     )
 
 
-async def test_vllm_decode_adapter_uses_native_scheduler_control_outputs():
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "cached", "computed"),
+    [("D_HIT", 4, 1), ("D_MISS", 0, 5)],
+)
+async def test_bound_decode_streams_after_cache_observation(
+    status: str, cached: int, computed: int
+) -> None:
     seen_payload = None
-    admission = {
-        "outcome": "D_HIT",
-        "actual_local_cached_tokens": 4,
+    observation = {
+        "cache_status": status,
+        "actual_local_cached_tokens": cached,
         "prompt_tokens": 5,
-        "locally_computed_tokens": 1,
+        "locally_computed_tokens": computed,
         "capacity_delay_ms": 0.0,
     }
     ack = {
@@ -82,8 +87,9 @@ async def test_vllm_decode_adapter_uses_native_scheduler_control_outputs():
         seen_payload = json.loads(request.content)
         chunks = [
             {
-                "choices": [{"index": 0, "text": "", "finish_reason": None}],
-                "kv_transfer_params": {"tda_forward": {"admission_result": admission}},
+                "kv_transfer_params": {
+                    "tda_forward": {"execution_observation": observation}
+                },
             },
             {"choices": [{"index": 0, "text": "ok", "finish_reason": None}]},
             {
@@ -102,35 +108,24 @@ async def test_vllm_decode_adapter_uses_native_scheduler_control_outputs():
     adapter = VllmDecodeAdapter(client)
     turn = _turn()
 
-    result = await adapter.admit_local(turn, proxy_estimated_cached_tokens=4)
-    chunks = [chunk async for chunk in adapter.stream_local(turn, result)]
-    finish = await adapter.finish(turn, CacheAction.RETAIN_D)
+    execution = await adapter.start_bound(turn)
+    chunks = [chunk async for chunk in execution.stream]
+    ack = await adapter.finish(turn, CacheAction.RETAIN_D)
     await client.aclose()
 
     assert seen_payload is not None
     assert seen_payload["stream"] is True
     assert seen_payload["stream_options"] == {"include_usage": True}
     assert seen_payload["kv_transfer_params"]["tda_forward"] == {
-        "admission": {
-            "path": "D_LOCAL_AP",
-            "proxy_estimated_cached_tokens": 4,
-        },
+        "decode_bound": True,
         "cache_action": "RETAIN_D",
     }
-    assert result.outcome is AdmissionOutcome.D_HIT
-    assert result.actual_local_cached_tokens == 4
-    first_choices = []
-    for chunk in chunks:
-        choices = chunk["choices"]
-        assert isinstance(choices, list)
-        choice = choices[0]
-        assert isinstance(choice, dict)
-        first_choices.append(choice)
-    assert [choice["text"] for choice in first_choices] == ["", "ok", ""]
-    assert first_choices[-1]["finish_reason"] == "stop"
-    assert finish.status is CacheActionStatus.RETAINED
-    assert adapter._sessions == {}
-    assert adapter._completed_acks == {}
+    assert execution.observation.cache_status.value == status
+    assert [choice["text"] for chunk in chunks for choice in chunk["choices"]] == [
+        "ok",
+        "",
+    ]
+    assert ack.status is CacheActionStatus.RETAINED
 
 
 async def test_vllm_prefill_adapter_returns_native_transfer_metadata():
@@ -166,39 +161,79 @@ async def test_vllm_prefill_adapter_returns_native_transfer_metadata():
     assert result.transfer == {**transfer, "remote_host": "10.0.0.1"}
 
 
-async def test_vllm_decode_adapter_falls_back_after_terminal_miss():
-    payloads = []
-    miss = {
-        "outcome": "D_MISS",
-        "actual_local_cached_tokens": 0,
+async def test_bound_decode_rejects_a_missing_execution_observation():
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            content='data: {"choices": [{"text": "partial"}]}\n\ndata: [DONE]\n\n',
+        )
+
+    client = httpx.AsyncClient(
+        base_url="http://decode",
+        transport=httpx.MockTransport(handler),
+    )
+    adapter = VllmDecodeAdapter(client)
+
+    with pytest.raises(RuntimeError, match="without an execution observation"):
+        await adapter.start_bound(_turn())
+
+    await client.aclose()
+
+
+async def test_bound_decode_rejects_a_malformed_execution_observation():
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        chunk = {
+            "kv_transfer_params": {
+                "tda_forward": {"execution_observation": {"cache_status": "D_HIT"}}
+            }
+        }
+        return httpx.Response(200, content=f"data: {json.dumps(chunk)}\n\n")
+
+    client = httpx.AsyncClient(
+        base_url="http://decode",
+        transport=httpx.MockTransport(handler),
+    )
+    adapter = VllmDecodeAdapter(client)
+
+    with pytest.raises(RuntimeError, match="non-integer actual_local_cached_tokens"):
+        await adapter.start_bound(_turn())
+
+    await client.aclose()
+
+
+async def test_bound_decode_rejects_a_duplicate_execution_observation():
+    observation = {
+        "cache_status": "D_HIT",
+        "actual_local_cached_tokens": 4,
         "prompt_tokens": 5,
-        "locally_computed_tokens": 0,
+        "locally_computed_tokens": 1,
         "capacity_delay_ms": 0.0,
     }
     ack = {
-        "status": "EVICTED",
-        "invalidated_blocks": 1,
-        "immediately_reusable_blocks": 1,
+        "status": "RETAINED",
+        "invalidated_blocks": 0,
+        "immediately_reusable_blocks": 0,
         "deferred_active_blocks": 0,
-        "estimated_reusable_bytes": 32,
+        "estimated_reusable_bytes": 0,
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
-        payload = json.loads(request.content)
-        payloads.append(payload)
-        if len(payloads) == 1:
-            chunks = [
-                {"kv_transfer_params": {"tda_forward": {"admission_result": miss}}}
-            ]
-        else:
-            chunks = [
-                {
-                    "choices": [
-                        {"index": 0, "text": "fallback", "finish_reason": "stop"}
-                    ]
-                },
-                {"kv_transfer_params": {"tda_forward": {"cache_action_ack": ack}}},
-            ]
+        del request
+        chunks = [
+            {
+                "kv_transfer_params": {
+                    "tda_forward": {"execution_observation": observation}
+                }
+            },
+            {
+                "kv_transfer_params": {
+                    "tda_forward": {"execution_observation": observation}
+                }
+            },
+            {"kv_transfer_params": {"tda_forward": {"cache_action_ack": ack}}},
+        ]
         body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
         return httpx.Response(200, content=body + "data: [DONE]\n\n")
 
@@ -207,34 +242,15 @@ async def test_vllm_decode_adapter_falls_back_after_terminal_miss():
         transport=httpx.MockTransport(handler),
     )
     adapter = VllmDecodeAdapter(client)
-    turn = _turn(CacheAction.EVICT_D)
+    turn = _turn()
+    execution = await adapter.start_bound(turn)
 
-    admission = await adapter.admit_local(turn, proxy_estimated_cached_tokens=4)
-    chunks = [
-        chunk
-        async for chunk in adapter.stream_from_prefill(
-            turn,
-            PrefillResult(
-                prompt_tokens=5,
-                transfer={"do_remote_prefill": True, "remote_block_ids": [[7]]},
-            ),
-        )
-    ]
-    finish = await adapter.finish(turn, CacheAction.EVICT_D)
+    with pytest.raises(RuntimeError, match="duplicate execution observation"):
+        [chunk async for chunk in execution.stream]
+    with pytest.raises(RuntimeError, match="without a Cache Action ACK"):
+        await adapter.finish(turn, CacheAction.RETAIN_D)
+
     await client.aclose()
-
-    assert admission.outcome is AdmissionOutcome.D_MISS
-    choices = chunks[0]["choices"]
-    assert isinstance(choices, list)
-    first_choice = choices[0]
-    assert isinstance(first_choice, dict)
-    assert first_choice["text"] == "fallback"
-    assert "admission" not in payloads[1]["kv_transfer_params"]["tda_forward"]
-    assert payloads[1]["kv_transfer_params"]["tda_forward"]["cache_action"] == (
-        "EVICT_D"
-    )
-    assert finish.status is CacheActionStatus.EVICTED
-    assert finish.immediately_reusable_blocks == 1
 
 
 async def test_native_event_pump_fails_closed_on_malformed_native_frame():
@@ -268,8 +284,8 @@ async def test_native_event_pump_fails_closed_on_malformed_native_frame():
 
 
 async def test_decode_stream_without_ack_does_not_leak_session():
-    admission = {
-        "outcome": "D_HIT",
+    observation = {
+        "cache_status": "D_HIT",
         "actual_local_cached_tokens": 4,
         "prompt_tokens": 5,
         "locally_computed_tokens": 1,
@@ -279,7 +295,11 @@ async def test_decode_stream_without_ack_does_not_leak_session():
     def handler(request: httpx.Request) -> httpx.Response:
         del request
         chunks = [
-            {"kv_transfer_params": {"tda_forward": {"admission_result": admission}}},
+            {
+                "kv_transfer_params": {
+                    "tda_forward": {"execution_observation": observation}
+                }
+            },
             {"choices": [{"index": 0, "text": "partial"}]},
         ]
         body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
@@ -292,19 +312,17 @@ async def test_decode_stream_without_ack_does_not_leak_session():
     adapter = VllmDecodeAdapter(client)
     turn = _turn()
 
-    result = await adapter.admit_local(turn, proxy_estimated_cached_tokens=4)
-    assert [chunk async for chunk in adapter.stream_local(turn, result)]
+    execution = await adapter.start_bound(turn)
+    assert [chunk async for chunk in execution.stream]
     with pytest.raises(RuntimeError, match="without a Cache Action ACK"):
         await adapter.finish(turn, CacheAction.RETAIN_D)
 
-    assert adapter._sessions == {}
-    assert adapter._completed_acks == {}
     await client.aclose()
 
 
 async def test_ack_followed_by_malformed_stream_is_not_retained():
-    admission = {
-        "outcome": "D_HIT",
+    observation = {
+        "cache_status": "D_HIT",
         "actual_local_cached_tokens": 4,
         "prompt_tokens": 5,
         "locally_computed_tokens": 1,
@@ -321,7 +339,11 @@ async def test_ack_followed_by_malformed_stream_is_not_retained():
     def handler(request: httpx.Request) -> httpx.Response:
         del request
         chunks = [
-            {"kv_transfer_params": {"tda_forward": {"admission_result": admission}}},
+            {
+                "kv_transfer_params": {
+                    "tda_forward": {"execution_observation": observation}
+                }
+            },
             {"kv_transfer_params": {"tda_forward": {"cache_action_ack": ack}}},
         ]
         body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
@@ -334,20 +356,18 @@ async def test_ack_followed_by_malformed_stream_is_not_retained():
     adapter = VllmDecodeAdapter(client)
     turn = _turn()
 
-    result = await adapter.admit_local(turn, proxy_estimated_cached_tokens=4)
+    execution = await adapter.start_bound(turn)
     with pytest.raises(json.JSONDecodeError):
-        [chunk async for chunk in adapter.stream_local(turn, result)]
+        [chunk async for chunk in execution.stream]
 
-    assert adapter._sessions == {}
-    assert adapter._completed_acks == {}
     with pytest.raises(RuntimeError, match="without a Cache Action ACK"):
         await adapter.finish(turn, CacheAction.RETAIN_D)
     await client.aclose()
 
 
-async def test_ack_is_not_retained_when_stream_close_fails(monkeypatch):
-    admission = {
-        "outcome": "D_HIT",
+async def test_ack_is_not_retained_when_stream_close_fails():
+    observation = {
+        "cache_status": "D_HIT",
         "actual_local_cached_tokens": 4,
         "prompt_tokens": 5,
         "locally_computed_tokens": 1,
@@ -361,14 +381,25 @@ async def test_ack_is_not_retained_when_stream_close_fails(monkeypatch):
         "estimated_reusable_bytes": 0,
     }
 
+    class CloseFailingStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            chunks = [
+                {
+                    "kv_transfer_params": {
+                        "tda_forward": {"execution_observation": observation}
+                    }
+                },
+                {"kv_transfer_params": {"tda_forward": {"cache_action_ack": ack}}},
+            ]
+            body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+            yield (body + "data: [DONE]\n\n").encode()
+
+        async def aclose(self) -> None:
+            raise RuntimeError("stream close failed")
+
     def handler(request: httpx.Request) -> httpx.Response:
         del request
-        chunks = [
-            {"kv_transfer_params": {"tda_forward": {"admission_result": admission}}},
-            {"kv_transfer_params": {"tda_forward": {"cache_action_ack": ack}}},
-        ]
-        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
-        return httpx.Response(200, content=body + "data: [DONE]\n\n")
+        return httpx.Response(200, stream=CloseFailingStream())
 
     client = httpx.AsyncClient(
         base_url="http://decode",
@@ -376,17 +407,10 @@ async def test_ack_is_not_retained_when_stream_close_fails(monkeypatch):
     )
     adapter = VllmDecodeAdapter(client)
     turn = _turn()
-    result = await adapter.admit_local(turn, proxy_estimated_cached_tokens=4)
-    session = adapter._sessions[turn.request_id]
-
-    async def fail_close(self) -> None:
-        del self
-        raise RuntimeError("stream close failed")
-
-    monkeypatch.setattr(type(session), "close", fail_close)
+    execution = await adapter.start_bound(turn)
     with pytest.raises(RuntimeError, match="stream close failed"):
-        [chunk async for chunk in adapter.stream_local(turn, result)]
+        [chunk async for chunk in execution.stream]
 
-    assert adapter._sessions == {}
-    assert adapter._completed_acks == {}
+    with pytest.raises(RuntimeError, match="without a Cache Action ACK"):
+        await adapter.finish(turn, CacheAction.RETAIN_D)
     await client.aclose()

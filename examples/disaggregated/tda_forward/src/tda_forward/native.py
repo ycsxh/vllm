@@ -17,11 +17,12 @@ from typing import Any
 import httpx
 
 from tda_forward.contracts import (
-    AdmissionOutcome,
-    AdmissionResult,
     CacheAction,
     CacheActionAck,
     CacheActionStatus,
+    DecodeExecution,
+    DecodeExecutionObservation,
+    LocalCacheStatus,
     PrefillResult,
     PreparedTurn,
 )
@@ -138,24 +139,17 @@ class _DecodeSession:
 
 
 class VllmDecodeAdapter:
-    """Fuse Scheduler admission and generation over vLLM's native SSE output."""
+    """Execute decode requests over vLLM's native SSE output."""
 
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._client = client
         self._sessions: dict[str, _DecodeSession] = {}
         self._completed_acks: dict[str, CacheActionAck] = {}
 
-    async def admit_local(
-        self,
-        turn: PreparedTurn,
-        proxy_estimated_cached_tokens: int,
-    ) -> AdmissionResult:
+    async def start_bound(self, turn: PreparedTurn) -> DecodeExecution:
         transfer = {
             "tda_forward": {
-                "admission": {
-                    "path": "D_LOCAL_AP",
-                    "proxy_estimated_cached_tokens": proxy_estimated_cached_tokens,
-                },
+                "decode_bound": True,
                 "cache_action": turn.cache_action.value,
             }
         }
@@ -165,32 +159,21 @@ class VllmDecodeAdapter:
                 chunk = self._decode_sse(line)
                 if chunk is None:
                     continue
-                result = self._admission_result(chunk)
-                if result is None:
+                observation = self._execution_observation(chunk)
+                if observation is None:
                     continue
-                if result.outcome is AdmissionOutcome.D_MISS:
-                    await session.close()
-                else:
-                    if chunk.get("choices"):
-                        session.pending_chunks.append(chunk)
-                    self._sessions[turn.request_id] = session
-                return result
+                if chunk.get("choices") or chunk.get("usage"):
+                    session.pending_chunks.append(chunk)
+                self._sessions[turn.request_id] = session
+                return DecodeExecution(
+                    observation=observation,
+                    stream=self._stream_session(turn, session),
+                )
         except BaseException:
             await session.close()
             raise
         await session.close()
-        raise RuntimeError("Decode stream ended without an admission result")
-
-    def stream_local(
-        self,
-        turn: PreparedTurn,
-        admission: AdmissionResult,
-    ) -> AsyncIterator[dict[str, object]]:
-        del admission
-        session = self._sessions.get(turn.request_id)
-        if session is None:
-            raise RuntimeError("Decode admission did not retain a live request")
-        return self._stream_session(turn, session)
+        raise RuntimeError("Decode stream ended without an execution observation")
 
     def stream_from_prefill(
         self,
@@ -240,6 +223,10 @@ class VllmDecodeAdapter:
                 chunk = self._decode_sse(line)
                 if chunk is None:
                     continue
+                if self._execution_observation(chunk) is not None:
+                    raise RuntimeError(
+                        "Decode returned a duplicate execution observation"
+                    )
                 ack = self._cache_action_ack(chunk)
                 if ack is not None:
                     session.cache_action_ack = ack
@@ -290,13 +277,19 @@ class VllmDecodeAdapter:
         return decoded
 
     @classmethod
-    def _admission_result(cls, chunk: Mapping[str, object]) -> AdmissionResult | None:
-        value = cls._tda_value(chunk, "admission_result")
+    def _execution_observation(
+        cls, chunk: Mapping[str, object]
+    ) -> DecodeExecutionObservation | None:
+        value = cls._tda_value(chunk, "execution_observation")
         if value is None:
             return None
-        outcome = cls._required_string(value, "outcome")
-        return AdmissionResult(
-            outcome=AdmissionOutcome(outcome),
+        cache_status = cls._required_string(value, "cache_status")
+        try:
+            status = LocalCacheStatus(cache_status)
+        except ValueError as error:
+            raise RuntimeError("Decode returned malformed cache status") from error
+        return DecodeExecutionObservation(
+            cache_status=status,
             actual_local_cached_tokens=cls._required_int(
                 value, "actual_local_cached_tokens"
             ),
@@ -361,8 +354,12 @@ class VllmDecodeAdapter:
         tda_forward = transfer.get("tda_forward")
         if not isinstance(tda_forward, dict):
             return None
+        if key not in tda_forward:
+            return None
         value = tda_forward.get(key)
-        return value if isinstance(value, dict) else None
+        if not isinstance(value, dict):
+            raise RuntimeError(f"Decode returned malformed {key}")
+        return value
 
 
 class NativeEventPump:
