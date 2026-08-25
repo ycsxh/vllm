@@ -2186,10 +2186,13 @@ def test_evict_request_blocks_defers_capacity_held_by_active_reference():
     assert num_computed_tokens == 0
     assert not computed.blocks[0]
 
-    manager.free(owner)
-    manager.free(shared)
+    unrelated = make_request("unrelated", list(range(24, 48)), block_size, sha256)
+    assert manager.allocate_slots(unrelated, unrelated.num_tokens) is None
 
-    unrelated = make_request("unrelated", list(range(12, 24)), block_size, sha256)
+    manager.free(owner)
+    assert manager.allocate_slots(unrelated, unrelated.num_tokens) is None
+
+    manager.free(shared)
     assert manager.allocate_slots(unrelated, unrelated.num_tokens) is not None
     manager.free(unrelated)
 
