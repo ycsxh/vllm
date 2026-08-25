@@ -128,6 +128,7 @@ async def test_bound_decode_streams_after_cache_observation(
     assert ack.status is CacheActionStatus.RETAINED
 
 
+@pytest.mark.asyncio
 async def test_bound_decode_preserves_chunks_before_execution_observation():
     observation = {
         "cache_status": "D_HIT",
@@ -227,6 +228,7 @@ async def test_bound_decode_preserves_chunks_before_execution_observation():
         ),
     ],
 )
+@pytest.mark.asyncio
 async def test_bound_decode_closes_on_semantically_malformed_observation(
     observation: dict[str, object], message: str
 ) -> None:
@@ -262,6 +264,7 @@ async def test_bound_decode_closes_on_semantically_malformed_observation(
     await client.aclose()
 
 
+@pytest.mark.asyncio
 async def test_vllm_prefill_adapter_returns_native_transfer_metadata():
     seen_payload = None
     transfer = {
@@ -295,6 +298,7 @@ async def test_vllm_prefill_adapter_returns_native_transfer_metadata():
     assert result.transfer == {**transfer, "remote_host": "10.0.0.1"}
 
 
+@pytest.mark.asyncio
 async def test_bound_decode_rejects_a_missing_execution_observation():
     def handler(request: httpx.Request) -> httpx.Response:
         del request
@@ -315,6 +319,7 @@ async def test_bound_decode_rejects_a_missing_execution_observation():
     await client.aclose()
 
 
+@pytest.mark.asyncio
 async def test_bound_decode_rejects_a_malformed_execution_observation():
     def handler(request: httpx.Request) -> httpx.Response:
         del request
@@ -337,6 +342,7 @@ async def test_bound_decode_rejects_a_malformed_execution_observation():
     await client.aclose()
 
 
+@pytest.mark.asyncio
 async def test_bound_decode_rejects_a_duplicate_execution_observation():
     observation = {
         "cache_status": "D_HIT",
@@ -387,6 +393,7 @@ async def test_bound_decode_rejects_a_duplicate_execution_observation():
     await client.aclose()
 
 
+@pytest.mark.asyncio
 async def test_native_event_pump_fails_closed_on_malformed_native_frame():
     thread_ids = []
 
@@ -417,7 +424,8 @@ async def test_native_event_pump_fails_closed_on_malformed_native_frame():
     assert pump.status["alive"] is False
 
 
-async def test_decode_stream_without_ack_does_not_leak_session():
+@pytest.mark.asyncio
+async def test_decode_stream_without_ack_fails_finish():
     observation = {
         "cache_status": "D_HIT",
         "actual_local_cached_tokens": 4,
@@ -454,6 +462,7 @@ async def test_decode_stream_without_ack_does_not_leak_session():
     await client.aclose()
 
 
+@pytest.mark.asyncio
 async def test_ack_followed_by_malformed_stream_is_not_retained():
     observation = {
         "cache_status": "D_HIT",
@@ -499,6 +508,7 @@ async def test_ack_followed_by_malformed_stream_is_not_retained():
     await client.aclose()
 
 
+@pytest.mark.asyncio
 async def test_ack_is_not_retained_when_stream_close_fails():
     observation = {
         "cache_status": "D_HIT",

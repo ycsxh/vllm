@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
 import time
-from queue import Empty
 
 import msgspec
 import pytest
@@ -43,6 +42,58 @@ def create_test_events(count: int) -> SampleBatch:
     return SampleBatch(ts=time.time(), events=events)
 
 
+def create_test_kv_events() -> KVEventBatch:
+    return KVEventBatch(
+        ts=time.time(),
+        events=[
+            BlockStored(
+                block_hashes=[123],
+                parent_block_hash=None,
+                token_ids=[1, 2, 3, 4],
+                block_size=4,
+                lora_id=None,
+                medium="GPU",
+                lora_name=None,
+                group_idx=0,
+                kv_cache_spec_kind="full_attention",
+            )
+        ],
+    )
+
+
+def control_background_thread(monkeypatch):
+    real_thread = threading.Thread
+
+    class ControlledThread:
+        instances: list["ControlledThread"] = []
+
+        def __init__(self, *, target, daemon: bool, name: str) -> None:
+            self.target = target
+            self.daemon = daemon
+            self.name = name
+            self.delegate: threading.Thread | None = None
+            self.instances.append(self)
+
+        def start(self) -> None:
+            return
+
+        def release(self) -> None:
+            self.delegate = real_thread(
+                target=self.target, daemon=self.daemon, name=self.name
+            )
+            self.delegate.start()
+
+        def is_alive(self) -> bool:
+            return self.delegate is not None and self.delegate.is_alive()
+
+        def join(self, timeout: float | None = None) -> None:
+            if self.delegate is not None:
+                self.delegate.join(timeout)
+
+    monkeypatch.setattr(threading, "Thread", ControlledThread)
+    return ControlledThread
+
+
 def test_basic_publishing(publisher, subscriber):
     """Test basic event publishing works"""
 
@@ -81,102 +132,66 @@ def test_multiple_events(publisher, subscriber):
 
 def test_publish_drops_saturated_batch_without_waiting(monkeypatch):
     """A stalled publisher cannot backpressure the Scheduler-facing call."""
-    release_consumer = threading.Event()
-
-    def stalled_publisher_thread(self):
-        release_consumer.wait()
-        while self._running or not self._event_queue.empty():
-            try:
-                queued = self._event_queue.get(timeout=0.01)
-            except Empty:
-                continue
-            if queued is None:
-                return
-            self._event_queue.task_done()
-
-    monkeypatch.setattr(
-        ZmqEventPublisher,
-        "_publisher_thread",
-        stalled_publisher_thread,
-    )
+    controlled_thread = control_background_thread(monkeypatch)
     publisher = ZmqEventPublisher(
         data_parallel_rank=DP_RANK,
         endpoint="inproc://test-saturated-publisher",
         max_queue_size=1,
     )
-    publish_returned = threading.Event()
-
-    def publish_second_batch():
-        publisher.publish(create_test_events(1))
-        publish_returned.set()
 
     publisher.publish(create_test_events(1))
-    publish_thread = threading.Thread(target=publish_second_batch)
-    publish_thread.start()
+    publisher.publish(create_test_events(1))
 
     try:
-        assert publish_returned.wait(timeout=0.1)
         assert publisher.stats.dropped_batches == 1
     finally:
-        if not publish_returned.is_set():
-            publisher._event_queue.get_nowait()
-        publish_thread.join(timeout=1)
-        release_consumer.set()
+        controlled_thread.instances[0].release()
         publisher.shutdown()
 
 
 def test_dropped_batch_creates_a_source_sequence_gap(monkeypatch):
     """A later delivered batch exposes the sequence reserved by a drop."""
-    release_consumer = threading.Event()
-    publisher_thread = ZmqEventPublisher._publisher_thread
-
-    def stalled_publisher_thread(self):
-        release_consumer.wait()
-        publisher_thread(self)
-
-    monkeypatch.setattr(
-        ZmqEventPublisher,
-        "_publisher_thread",
-        stalled_publisher_thread,
-    )
+    controlled_thread = control_background_thread(monkeypatch)
     endpoint = "inproc://test-publisher-sequence-gap"
     publisher = ZmqEventPublisher(
         data_parallel_rank=DP_RANK,
         endpoint=endpoint,
         max_queue_size=1,
     )
-    from .conftest import MockSubscriber
-
-    subscriber = MockSubscriber(endpoint, None, "")
+    subscriber = ZmqEventSubscriber(endpoint)
 
     try:
-        publisher.publish(create_test_events(1))
-        publisher.publish(create_test_events(1))
-        release_consumer.set()
+        publisher.publish(create_test_kv_events())
+        publisher.publish(create_test_kv_events())
+        controlled_thread.instances[0].release()
 
         first = subscriber.receive_one(timeout=1000)
         assert first is not None
-        publisher.publish(create_test_events(1))
+        publisher.publish(create_test_kv_events())
         after_gap = subscriber.receive_one(timeout=1000)
         assert after_gap is not None
         assert (first[0], after_gap[0]) == (0, 2)
+        assert subscriber.stats.sequence_gaps == 1
     finally:
-        release_consumer.set()
         publisher.shutdown()
         subscriber.close()
 
 
-def test_publisher_stats_report_queue_and_background_activity(
-    publisher,
-    subscriber,
-):
-    batch = create_test_events(3)
-    publisher.publish(batch)
+def test_publisher_stats_report_queue_and_background_activity():
+    endpoint = "inproc://test-publisher-stats"
+    publisher = ZmqEventPublisher(data_parallel_rank=DP_RANK, endpoint=endpoint)
+    from .conftest import MockSubscriber
 
-    assert subscriber.receive_one(timeout=1000) is not None
-    deadline = time.monotonic() + 1
-    while publisher.stats.published_batches == 0 and time.monotonic() < deadline:
-        time.sleep(0.01)
+    subscriber = MockSubscriber(endpoint, None, "")
+    batch = create_test_events(3)
+
+    try:
+        publisher.observe_event_construction_time(0.25)
+        publisher.publish(batch)
+        assert subscriber.receive_one(timeout=1000) is not None
+    finally:
+        publisher.shutdown()
+        subscriber.close()
 
     stats = publisher.stats
     assert stats.enqueued_batches == 1
@@ -188,8 +203,7 @@ def test_publisher_stats_report_queue_and_background_activity(
     assert stats.published_bytes > 0
     assert stats.queue_depth == 0
     assert stats.queue_high_watermark == 1
-    publisher.observe_event_construction_time(0.25)
-    assert publisher.stats.total_event_construction_time_seconds == 0.25
+    assert stats.total_event_construction_time_seconds == 0.25
     assert stats.total_enqueue_time_seconds >= 0
     assert stats.total_publish_lag_seconds >= 0
 
@@ -202,22 +216,7 @@ def test_native_subscriber_decodes_publisher_batch_without_proxy_schema():
         topic="tda",
     )
     subscriber = ZmqEventSubscriber(endpoint, topic="tda")
-    batch = KVEventBatch(
-        ts=time.time(),
-        events=[
-            BlockStored(
-                block_hashes=[123],
-                parent_block_hash=None,
-                token_ids=[1, 2, 3, 4],
-                block_size=4,
-                lora_id=None,
-                medium="GPU",
-                lora_name=None,
-                group_idx=0,
-                kv_cache_spec_kind="full_attention",
-            )
-        ],
-    )
+    batch = create_test_kv_events()
 
     try:
         publisher.publish(batch)
@@ -226,16 +225,44 @@ def test_native_subscriber_decodes_publisher_batch_without_proxy_schema():
         publisher.shutdown()
         subscriber.close()
 
-    assert received is not None
-    sequence, decoded = received
-    assert sequence == 0
-    assert decoded == batch
-    assert publisher.stats.enqueued_blocks == 1
-    assert publisher.stats.published_blocks == 1
-    assert subscriber.stats.received_batches == 1
-    assert subscriber.stats.received_blocks == 1
-    assert subscriber.stats.received_bytes > 0
-    assert isinstance(decoded.events[0], BlockStored)
+    assert received == (0, batch)
+
+
+def test_native_publisher_stats_report_changed_blocks():
+    endpoint = "inproc://test-native-event-publisher-stats"
+    publisher = ZmqEventPublisher(data_parallel_rank=DP_RANK, endpoint=endpoint)
+    subscriber = ZmqEventSubscriber(endpoint)
+    batch = create_test_kv_events()
+
+    try:
+        publisher.publish(batch)
+        assert subscriber.receive_one(timeout=1000) is not None
+    finally:
+        publisher.shutdown()
+        subscriber.close()
+
+    stats = publisher.stats
+    assert stats.enqueued_blocks == 1
+    assert stats.published_blocks == 1
+
+
+def test_native_subscriber_stats_report_received_blocks():
+    endpoint = "inproc://test-native-event-subscriber-stats"
+    publisher = ZmqEventPublisher(data_parallel_rank=DP_RANK, endpoint=endpoint)
+    subscriber = ZmqEventSubscriber(endpoint)
+    batch = create_test_kv_events()
+
+    try:
+        publisher.publish(batch)
+        assert subscriber.receive_one(timeout=1000) is not None
+        stats = subscriber.stats
+    finally:
+        publisher.shutdown()
+        subscriber.close()
+
+    assert stats.received_batches == 1
+    assert stats.received_blocks == 1
+    assert stats.received_bytes > 0
 
 
 def test_native_subscriber_rejects_multiple_publishers_without_source_identity():

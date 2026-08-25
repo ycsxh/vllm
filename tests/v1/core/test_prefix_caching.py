@@ -2134,12 +2134,16 @@ def test_evict_request_blocks_invalidates_only_full_computed_blocks():
     assert result.estimated_reusable_bytes == (
         2 * manager.kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
     )
-    assert all(
-        block.ref_cnt == 1 for block in manager.get_blocks(request.request_id).blocks[0]
-    )
     events = manager.take_events()
     assert len(events) == 2
     assert all(isinstance(event, BlockRemoved) for event in events)
+
+    retry = make_request("retry", list(range(10)), block_size, sha256)
+    computed, num_computed_tokens, _ = manager.get_computed_blocks(retry)
+    assert num_computed_tokens == 0
+    assert not computed.blocks[0]
+
+    manager.free(request)
 
 
 def test_evict_request_blocks_defers_capacity_held_by_active_reference():
@@ -2173,13 +2177,21 @@ def test_evict_request_blocks_defers_capacity_held_by_active_reference():
     assert result.immediately_reusable_blocks == 0
     assert result.deferred_active_blocks == 2
     assert result.estimated_reusable_bytes == 0
-    owner_blocks = manager.get_blocks(owner.request_id).blocks[0][:2]
-    assert all(
-        block.ref_cnt == 2 and block.block_hash is None for block in owner_blocks
-    )
+    events = manager.take_events()
+    assert len(events) == 2
+    assert all(isinstance(event, BlockRemoved) for event in events)
+
+    retry = make_request("retry", list(range(12)), block_size, sha256)
+    computed, num_computed_tokens, _ = manager.get_computed_blocks(retry)
+    assert num_computed_tokens == 0
+    assert not computed.blocks[0]
 
     manager.free(owner)
-    assert all(block.ref_cnt == 1 for block in owner_blocks)
+    manager.free(shared)
+
+    unrelated = make_request("unrelated", list(range(12, 24)), block_size, sha256)
+    assert manager.allocate_slots(unrelated, unrelated.num_tokens) is not None
+    manager.free(unrelated)
 
 
 def test_null_parent_block_hash():
