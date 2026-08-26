@@ -23,10 +23,6 @@ native KV events, NIXL, pytest, uv, pre-commit.
 
 ## Global Constraints
 
-- Work only on `codex/tda-forward-native-reentry` in the existing linked
-  worktree; do not recreate the worktree or rewrite its history.
-- Preserve the existing unstaged `.gitignore` and untracked `.ignore` and
-  `.mcp.json`; stage files explicitly by path.
 - Use `uv` and `.venv/bin/python` for every Python and pytest command. Never use
   system Python or bare pip.
 - An absent D binding always selects Prefill/NIXL. There is no P-binding state.
