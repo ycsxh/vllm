@@ -1,10 +1,9 @@
 # TDAforward Proxy
 
-This directory contains the portable contract harness from issue #16 and the
-native 1P1D process adapters from issue #17. The ARM64 mode needs no CUDA,
-model, NIXL, or live vLLM engine. Native mode uses the same coordinator while
-binding its tokenizer, Prefill and Decode requests, and cache-event stream to
-vLLM's production contracts.
+This directory contains the portable contract harness and native 1P1D process
+adapters. The ARM64 mode needs no CUDA, model, NIXL, or live vLLM engine.
+Native mode uses the same coordinator while binding its tokenizer, Prefill and
+Decode requests, and cache-event stream to vLLM's production contracts.
 
 ## Local environment and tests
 
@@ -63,23 +62,28 @@ to workers.
 ## Contract boundaries
 
 - `ReentryCoordinator` owns per-session sequential turns, the exact
-  `t_pred <= g` rule, routing intent, Decode-miss fallback, Cache Action ACK
-  handling, and structured records.
+  `t_pred <= g` rule, routing intent, Cache Action ACK handling, and structured
+  records. With no D binding, it sends a Prefill-side AP request and uses NIXL
+  transfer. With a D binding, it sends Decode-local append prefill, including
+  when Decode has zero local reuse.
 - `DecodePrefixMirror` consumes vLLM's native `KVEventBatch`, `BlockStored`,
   `BlockRemoved`, and `AllBlocksCleared` field vocabulary. It deliberately does
   not define another production event schema. The transport sequence remains a
   separate envelope value, as it is in vLLM's ZMQ publisher.
 - `FakePrefillAdapter` and `FakeDecodeAdapter` model first/P-bound execution,
-  full or partial `D_HIT`, `D_MISS`, `CAPACITY_DEFERRED`, streaming, and
-  aggregate `EVICT_D` acknowledgements.
+  full or partial `D_HIT`, `D_MISS`, capacity delay, streaming, and aggregate
+  `EVICT_D` acknowledgements. `D_HIT` and `D_MISS` report final Decode-local
+  reuse; they never select the worker. `capacity_delay_ms` reports Decode
+  waiting and never causes rerouting.
 - `create_app` starts event consumption as a task independent from request
   forwarding and response streaming. Event delay cannot block client output.
 - `VllmPrefillAdapter` and `VllmDecodeAdapter` use the existing OpenAI
   `kv_transfer_params` extension. A D-local request carries its Scheduler
   admission attempt and final Cache Action in one live request. The zero-token
-  `D_HIT` control output protects admitted blocks before model work; `D_MISS`
-  is terminal and causes Prefill fallback; capacity pressure retries normal
-  Decode admission and returns `CAPACITY_DEFERRED` only after allocation.
+  `D_HIT` control output protects admitted blocks before model work. The
+  next-turn D binding changes only after the stream completes and a valid Cache
+  Action ACK arrives. `RETAIN_D` is soft retention: ordinary LRU-eligible
+  retention with neither a pin nor a TTL.
 - `ZmqEventSubscriber` decodes the publisher's native sequence envelope and
   `KVEventBatch`; the Proxy defines no parallel wire schema.
 
