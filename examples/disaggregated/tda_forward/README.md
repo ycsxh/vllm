@@ -70,7 +70,7 @@ to workers.
   `BlockRemoved`, and `AllBlocksCleared` field vocabulary. It deliberately does
   not define another production event schema. The transport sequence remains a
   separate envelope value, as it is in vLLM's ZMQ publisher.
-- `FakePrefillAdapter` and `FakeDecodeAdapter` model first/P-bound execution,
+- `FakePrefillAdapter` and `FakeDecodeAdapter` model initial unbound execution,
   full or partial `D_HIT`, `D_MISS`, capacity delay, streaming, and aggregate
   `EVICT_D` acknowledgements. `D_HIT` and `D_MISS` report final Decode-local
   reuse; they never select the worker. `capacity_delay_ms` reports Decode
