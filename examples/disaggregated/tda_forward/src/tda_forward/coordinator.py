@@ -20,10 +20,10 @@ from tda_forward.contracts import (
     DecodeExecution,
     DecodeExecutionObservation,
     ExecutionPath,
-    LocalCacheStatus,
     PrefillResult,
     PreparedTurn,
     TurnRecord,
+    validate_decode_execution_observation,
 )
 from tda_forward.mirror import DecodePrefixMirror
 
@@ -209,6 +209,7 @@ class ReentryCoordinator:
             "prompt_token_ids",
             "block_extra_keys",
             "cache_namespace",
+            "kv_transfer_params",
         ):
             forwarded.pop(extension, None)
         return PreparedTurn(
@@ -248,7 +249,7 @@ class ReentryCoordinator:
             if used_d_binding:
                 execution = await self.decode.start_bound(turn)
                 observation = execution.observation
-                self._validate_observation(observation)
+                validate_decode_execution_observation(observation)
                 execution_path = ExecutionPath.D_LOCAL_AP
                 stream = execution.stream
             else:
@@ -305,14 +306,14 @@ class ReentryCoordinator:
             if observation is None
             else observation.prompt_tokens
         )
-        eviction = action is CacheAction.EVICT_D
         return TurnRecord(
             request_id=turn.request_id,
             session_id=turn.session_id,
             turn_sequence=turn_sequence,
             t_pred=turn.t_pred,
             g=g,
-            action=action,
+            cache_action=action,
+            cache_action_ack=ack,
             used_d_binding=used_d_binding,
             execution_path=execution_path,
             proxy_estimated_cached_tokens=estimate,
@@ -335,43 +336,7 @@ class ReentryCoordinator:
             capacity_delay_ms=(
                 None if observation is None else observation.capacity_delay_ms
             ),
-            eviction_status=ack.status if eviction else None,
-            invalidated_blocks=ack.invalidated_blocks if eviction else None,
-            immediately_reusable_blocks=(
-                ack.immediately_reusable_blocks if eviction else None
-            ),
-            deferred_active_blocks=ack.deferred_active_blocks if eviction else None,
-            estimated_reusable_bytes=(
-                ack.estimated_reusable_bytes if eviction else None
-            ),
         )
-
-    @staticmethod
-    def _validate_observation(result: DecodeExecutionObservation) -> None:
-        if not isinstance(result.cache_status, LocalCacheStatus):
-            raise RuntimeError("Decode returned a malformed local cache status")
-        numeric = (
-            result.actual_local_cached_tokens,
-            result.prompt_tokens,
-            result.locally_computed_tokens,
-        )
-        if any(
-            isinstance(value, bool) or not isinstance(value, int) or value < 0
-            for value in numeric
-        ):
-            raise RuntimeError("Decode returned malformed token counts")
-        if not math.isfinite(result.capacity_delay_ms) or result.capacity_delay_ms < 0:
-            raise RuntimeError("Decode returned malformed capacity delay")
-        if (
-            result.cache_status is LocalCacheStatus.D_MISS
-            and result.actual_local_cached_tokens != 0
-        ):
-            raise RuntimeError("D_MISS must report zero local cached tokens")
-        if (
-            result.cache_status is LocalCacheStatus.D_HIT
-            and result.actual_local_cached_tokens == 0
-        ):
-            raise RuntimeError("D_HIT requires a positive local hit")
 
     @staticmethod
     def _validate_ack(ack: CacheActionAck, action: CacheAction) -> None:

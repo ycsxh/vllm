@@ -4,6 +4,7 @@
 import asyncio
 import json
 import threading
+from dataclasses import replace
 from types import SimpleNamespace
 
 import httpx
@@ -265,7 +266,7 @@ async def test_bound_decode_closes_on_semantically_malformed_observation(
 
 
 @pytest.mark.asyncio
-async def test_vllm_prefill_adapter_returns_native_transfer_metadata():
+async def test_vllm_prefill_adapter_replaces_caller_transfer_metadata():
     seen_payload = None
     transfer = {
         "remote_engine_id": "p-engine",
@@ -287,13 +288,32 @@ async def test_vllm_prefill_adapter_returns_native_transfer_metadata():
         transport=httpx.MockTransport(handler),
     )
     adapter = VllmPrefillAdapter(client, remote_host="10.0.0.1")
+    turn = _turn(CacheAction.EVICT_D)
+    turn = replace(
+        turn,
+        payload={
+            **turn.payload,
+            "kv_transfer_params": {
+                "tda_forward": {"decode_bound": True},
+                "caller_owned": True,
+            },
+        },
+    )
 
-    result = await adapter.prefill(_turn(CacheAction.EVICT_D))
+    result = await adapter.prefill(turn)
     await client.aclose()
 
     assert seen_payload is not None
     assert seen_payload["stream"] is False
     assert seen_payload["max_tokens"] == 1
+    assert seen_payload["kv_transfer_params"] == {
+        "do_remote_decode": True,
+        "do_remote_prefill": False,
+        "remote_engine_id": None,
+        "remote_block_ids": None,
+        "remote_host": None,
+        "remote_port": None,
+    }
     assert result.prompt_tokens == 5
     assert result.transfer == {**transfer, "remote_host": "10.0.0.1"}
 

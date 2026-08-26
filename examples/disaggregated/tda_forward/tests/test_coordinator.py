@@ -7,6 +7,7 @@ import math
 import pytest
 
 from tda_forward.contracts import (
+    CacheAction,
     CacheActionAck,
     CacheActionStatus,
     DecodeExecutionObservation,
@@ -101,6 +102,11 @@ async def test_boundary_rule_drives_the_next_turn() -> None:
 
     await run_turn(coordinator, payload(t_pred=10.0))
     assert coordinator.is_d_bound("s")
+    retain_record = coordinator.records[-1]
+    assert retain_record.cache_action is CacheAction.RETAIN_D
+    assert retain_record.cache_action_ack == CacheActionAck(
+        status=CacheActionStatus.RETAINED
+    )
 
     decode.queue_observation(
         "s",
@@ -118,7 +124,7 @@ async def test_boundary_rule_drives_the_next_turn() -> None:
 
 
 @pytest.mark.asyncio
-async def test_first_and_p_bound_turn_use_prefill_side_path() -> None:
+async def test_first_and_p_unbound_turn_use_prefill_side_path() -> None:
     coordinator, prefill, decode = make_coordinator()
 
     chunks = await run_turn(coordinator, payload(t_pred=50.0))
@@ -128,10 +134,11 @@ async def test_first_and_p_bound_turn_use_prefill_side_path() -> None:
     assert [call.kind for call in decode.calls] == ["stream_from_prefill", "finish"]
     record = coordinator.records[-1]
     assert record.g == 10.0
+    assert record.cache_action is CacheAction.EVICT_D
+    assert record.cache_action_ack == CacheActionAck(status=CacheActionStatus.EVICTED)
     assert not record.used_d_binding
     assert record.execution_path is ExecutionPath.P_SIDE_AP
     assert record.local_cache_status is None
-    assert record.eviction_status is CacheActionStatus.EVICTED
 
 
 @pytest.mark.asyncio
@@ -252,16 +259,14 @@ async def test_evict_ack_changes_binding_without_fabricating_mirror_removes() ->
             0,
         ],
     )
-    decode.queue_ack(
-        "s",
-        CacheActionAck(
-            status=CacheActionStatus.DEFERRED,
-            invalidated_blocks=2,
-            immediately_reusable_blocks=1,
-            deferred_active_blocks=1,
-            estimated_reusable_bytes=4096,
-        ),
+    deferred_ack = CacheActionAck(
+        status=CacheActionStatus.DEFERRED,
+        invalidated_blocks=2,
+        immediately_reusable_blocks=1,
+        deferred_active_blocks=1,
+        estimated_reusable_bytes=4096,
     )
+    decode.queue_ack("s", deferred_ack)
 
     await run_turn(coordinator, payload(t_pred=50.0))
 
@@ -270,16 +275,16 @@ async def test_evict_ack_changes_binding_without_fabricating_mirror_removes() ->
     record = coordinator.records[-1]
     assert record.execution_path is ExecutionPath.D_LOCAL_AP
     assert record.local_cache_status is LocalCacheStatus.D_MISS
-    assert record.invalidated_blocks == 2
-    assert record.immediately_reusable_blocks == 1
-    assert record.deferred_active_blocks == 1
+    assert record.cache_action is CacheAction.EVICT_D
+    assert record.cache_action_ack == deferred_ack
     assert record.as_dict().keys() == {
         "request_id",
         "session_id",
         "turn_sequence",
         "t_pred",
         "g",
-        "action",
+        "cache_action",
+        "cache_action_ack",
         "used_d_binding",
         "execution_path",
         "proxy_estimated_cached_tokens",
@@ -290,11 +295,6 @@ async def test_evict_ack_changes_binding_without_fabricating_mirror_removes() ->
         "hit_ratio",
         "estimate_error",
         "capacity_delay_ms",
-        "eviction_status",
-        "invalidated_blocks",
-        "immediately_reusable_blocks",
-        "deferred_active_blocks",
-        "estimated_reusable_bytes",
     }
 
 

@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
-import math
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -26,6 +25,7 @@ from tda_forward.contracts import (
     LocalCacheStatus,
     PrefillResult,
     PreparedTurn,
+    validate_decode_execution_observation,
 )
 
 
@@ -93,17 +93,14 @@ class VllmPrefillAdapter:
         payload.pop("max_completion_tokens", None)
         payload.pop("min_tokens", None)
         payload.pop("stream_options", None)
-        payload.setdefault(
-            "kv_transfer_params",
-            {
-                "do_remote_decode": True,
-                "do_remote_prefill": False,
-                "remote_engine_id": None,
-                "remote_block_ids": None,
-                "remote_host": None,
-                "remote_port": None,
-            },
-        )
+        payload["kv_transfer_params"] = {
+            "do_remote_decode": True,
+            "do_remote_prefill": False,
+            "remote_engine_id": None,
+            "remote_block_ids": None,
+            "remote_host": None,
+            "remote_port": None,
+        }
         response = await self._client.post(
             turn.api_path,
             json=payload,
@@ -300,38 +297,8 @@ class VllmDecodeAdapter:
             locally_computed_tokens=cls._required_int(value, "locally_computed_tokens"),
             capacity_delay_ms=cls._optional_number(value, "capacity_delay_ms", 0.0),
         )
-        cls._validate_execution_observation(observation)
+        validate_decode_execution_observation(observation)
         return observation
-
-    @staticmethod
-    def _validate_execution_observation(
-        observation: DecodeExecutionObservation,
-    ) -> None:
-        numeric = (
-            observation.actual_local_cached_tokens,
-            observation.prompt_tokens,
-            observation.locally_computed_tokens,
-        )
-        if any(
-            isinstance(value, bool) or not isinstance(value, int) or value < 0
-            for value in numeric
-        ):
-            raise RuntimeError("Decode returned malformed token counts")
-        if (
-            not math.isfinite(observation.capacity_delay_ms)
-            or observation.capacity_delay_ms < 0
-        ):
-            raise RuntimeError("Decode returned malformed capacity delay")
-        if (
-            observation.cache_status is LocalCacheStatus.D_MISS
-            and observation.actual_local_cached_tokens != 0
-        ):
-            raise RuntimeError("D_MISS must report zero local cached tokens")
-        if (
-            observation.cache_status is LocalCacheStatus.D_HIT
-            and observation.actual_local_cached_tokens == 0
-        ):
-            raise RuntimeError("D_HIT requires a positive local hit")
 
     @classmethod
     def _cache_action_ack(cls, chunk: Mapping[str, object]) -> CacheActionAck | None:
