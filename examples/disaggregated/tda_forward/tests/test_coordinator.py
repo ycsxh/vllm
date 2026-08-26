@@ -7,12 +7,12 @@ import math
 import pytest
 
 from tda_forward.contracts import (
-    AdmissionOutcome,
-    AdmissionResult,
     CacheAction,
     CacheActionAck,
     CacheActionStatus,
-    PlannedPath,
+    DecodeExecutionObservation,
+    ExecutionPath,
+    LocalCacheStatus,
 )
 from tda_forward.coordinator import ReentryCoordinator, RequestValidationError
 from tda_forward.fakes import FakeDecodeAdapter, FakePrefillAdapter
@@ -101,27 +101,30 @@ async def test_boundary_rule_drives_the_next_turn() -> None:
     coordinator, prefill, decode = make_coordinator()
 
     await run_turn(coordinator, payload(t_pred=10.0))
-    assert coordinator.plan_for("s").action is CacheAction.RETAIN_D
-    assert coordinator.plan_for("s").path is PlannedPath.D_LOCAL_AP
+    assert coordinator.is_d_bound("s")
+    retain_record = coordinator.records[-1]
+    assert retain_record.cache_action is CacheAction.RETAIN_D
+    assert retain_record.cache_action_ack == CacheActionAck(
+        status=CacheActionStatus.RETAINED
+    )
 
-    decode.queue_admission(
+    decode.queue_observation(
         "s",
-        AdmissionResult(
-            outcome=AdmissionOutcome.D_HIT,
+        DecodeExecutionObservation(
+            cache_status=LocalCacheStatus.D_HIT,
             actual_local_cached_tokens=8,
             prompt_tokens=8,
             locally_computed_tokens=0,
         ),
     )
     await run_turn(coordinator, payload(t_pred=10.01))
-    assert coordinator.plan_for("s").action is CacheAction.EVICT_D
-    assert coordinator.plan_for("s").path is PlannedPath.P_SIDE_AP
+    assert not coordinator.is_d_bound("s")
     assert len(prefill.calls) == 1
-    assert [call.kind for call in decode.calls].count("admit_local") == 1
+    assert [call.kind for call in decode.calls].count("start_bound") == 1
 
 
 @pytest.mark.asyncio
-async def test_first_and_p_bound_turn_use_prefill_side_path() -> None:
+async def test_first_and_p_unbound_turn_use_prefill_side_path() -> None:
     coordinator, prefill, decode = make_coordinator()
 
     chunks = await run_turn(coordinator, payload(t_pred=50.0))
@@ -131,9 +134,11 @@ async def test_first_and_p_bound_turn_use_prefill_side_path() -> None:
     assert [call.kind for call in decode.calls] == ["stream_from_prefill", "finish"]
     record = coordinator.records[-1]
     assert record.g == 10.0
-    assert record.planned_path is PlannedPath.P_SIDE_AP
-    assert record.engine_outcome is None
-    assert record.eviction_status is CacheActionStatus.EVICTED
+    assert record.cache_action is CacheAction.EVICT_D
+    assert record.cache_action_ack == CacheActionAck(status=CacheActionStatus.EVICTED)
+    assert not record.used_d_binding
+    assert record.execution_path is ExecutionPath.P_SIDE_AP
+    assert record.local_cache_status is None
 
 
 @pytest.mark.asyncio
@@ -143,10 +148,10 @@ async def test_full_and_partial_d_hit_stay_on_decode(
 ) -> None:
     coordinator, prefill, decode = make_coordinator()
     await run_turn(coordinator, payload(t_pred=1.0))
-    decode.queue_admission(
+    decode.queue_observation(
         "s",
-        AdmissionResult(
-            outcome=AdmissionOutcome.D_HIT,
+        DecodeExecutionObservation(
+            cache_status=LocalCacheStatus.D_HIT,
             actual_local_cached_tokens=cached,
             prompt_tokens=8,
             locally_computed_tokens=computed,
@@ -157,50 +162,46 @@ async def test_full_and_partial_d_hit_stay_on_decode(
 
     assert chunks[-1]["choices"] == [{"text": "local"}]
     assert len(prefill.calls) == 1
-    admission_call = next(call for call in decode.calls if call.kind == "admit_local")
-    assert admission_call.prompt_token_ids == tuple(range(8))
+    assert [call.kind for call in decode.calls].count("start_bound") == 1
     record = coordinator.records[-1]
-    assert record.engine_outcome is AdmissionOutcome.D_HIT
+    assert record.used_d_binding
+    assert record.execution_path is ExecutionPath.D_LOCAL_AP
+    assert record.local_cache_status is LocalCacheStatus.D_HIT
     assert record.actual_local_cached_tokens == cached
     assert record.locally_computed_tokens == computed
     assert record.hit_ratio == cached / 8
 
 
 @pytest.mark.asyncio
-async def test_d_miss_falls_back_before_client_visible_output() -> None:
+async def test_zero_hit_d_bound_turn_stays_on_decode() -> None:
     coordinator, prefill, decode = make_coordinator()
     await run_turn(coordinator, payload(t_pred=1.0))
-    decode.queue_admission(
+    decode.queue_observation(
         "s",
-        AdmissionResult(
-            outcome=AdmissionOutcome.D_MISS,
+        DecodeExecutionObservation(
+            cache_status=LocalCacheStatus.D_MISS,
             actual_local_cached_tokens=0,
             prompt_tokens=8,
-            locally_computed_tokens=0,
+            locally_computed_tokens=8,
         ),
     )
 
     chunks = await run_turn(coordinator, payload(t_pred=1.0, stream=True))
 
-    assert chunks == [{"choices": [{"text": "prefill"}]}]
-    assert [call.kind for call in decode.calls[-3:]] == [
-        "admit_local",
-        "stream_from_prefill",
-        "finish",
-    ]
-    record = coordinator.records[-1]
-    assert record.actual_path == "P_FALLBACK"
-    assert record.fallback_reason == "D_MISS"
+    assert chunks == [{"choices": [{"text": "local"}]}]
+    assert [call.kind for call in prefill.calls] == ["prefill"]
+    assert coordinator.records[-1].execution_path is ExecutionPath.D_LOCAL_AP
+    assert coordinator.records[-1].local_cache_status is LocalCacheStatus.D_MISS
 
 
 @pytest.mark.asyncio
-async def test_capacity_deferred_does_not_fall_back() -> None:
+async def test_capacity_delay_is_an_observation_only() -> None:
     coordinator, prefill, decode = make_coordinator()
     await run_turn(coordinator, payload(t_pred=1.0))
-    decode.queue_admission(
+    decode.queue_observation(
         "s",
-        AdmissionResult(
-            outcome=AdmissionOutcome.CAPACITY_DEFERRED,
+        DecodeExecutionObservation(
+            cache_status=LocalCacheStatus.D_HIT,
             actual_local_cached_tokens=4,
             prompt_tokens=8,
             locally_computed_tokens=4,
@@ -212,14 +213,31 @@ async def test_capacity_deferred_does_not_fall_back() -> None:
 
     assert len(prefill.calls) == 1
     record = coordinator.records[-1]
-    assert record.engine_outcome is AdmissionOutcome.CAPACITY_DEFERRED
+    assert record.execution_path is ExecutionPath.D_LOCAL_AP
+    assert record.local_cache_status is LocalCacheStatus.D_HIT
     assert record.capacity_delay_ms == 12.5
-    assert record.fallback_reason is None
 
 
 @pytest.mark.asyncio
-async def test_evict_ack_changes_intent_without_fabricating_mirror_removes() -> None:
+async def test_ack_failure_preserves_committed_binding() -> None:
     coordinator, _, decode = make_coordinator()
+    await run_turn(coordinator, payload(t_pred=1.0))
+    assert coordinator.is_d_bound("s")
+    decode.queue_ack(
+        "s",
+        CacheActionAck(status=CacheActionStatus.RETAINED),
+    )
+
+    with pytest.raises(RuntimeError, match="inconsistent with its action"):
+        await run_turn(coordinator, payload(t_pred=50.0))
+
+    assert coordinator.is_d_bound("s")
+
+
+@pytest.mark.asyncio
+async def test_evict_ack_changes_binding_without_fabricating_mirror_removes() -> None:
+    coordinator, _, decode = make_coordinator()
+    await run_turn(coordinator, payload(t_pred=1.0))
     coordinator.mirror.register_session("s", list(range(8)))
     coordinator.mirror.apply_batch(
         1,
@@ -241,53 +259,49 @@ async def test_evict_ack_changes_intent_without_fabricating_mirror_removes() -> 
             0,
         ],
     )
-    decode.queue_ack(
-        "s",
-        CacheActionAck(
-            status=CacheActionStatus.DEFERRED,
-            invalidated_blocks=2,
-            immediately_reusable_blocks=1,
-            deferred_active_blocks=1,
-            estimated_reusable_bytes=4096,
-        ),
+    deferred_ack = CacheActionAck(
+        status=CacheActionStatus.DEFERRED,
+        invalidated_blocks=2,
+        immediately_reusable_blocks=1,
+        deferred_active_blocks=1,
+        estimated_reusable_bytes=4096,
     )
+    decode.queue_ack("s", deferred_ack)
 
     await run_turn(coordinator, payload(t_pred=50.0))
 
-    assert coordinator.plan_for("s").path is PlannedPath.P_SIDE_AP
+    assert not coordinator.is_d_bound("s")
     assert coordinator.mirror.estimated_cached_tokens("s") == 8
     record = coordinator.records[-1]
-    assert record.invalidated_blocks == 2
-    assert record.immediately_reusable_blocks == 1
-    assert record.deferred_active_blocks == 1
+    assert record.execution_path is ExecutionPath.D_LOCAL_AP
+    assert record.local_cache_status is LocalCacheStatus.D_MISS
+    assert record.cache_action is CacheAction.EVICT_D
+    assert record.cache_action_ack == deferred_ack
     assert record.as_dict().keys() == {
         "request_id",
         "session_id",
         "turn_sequence",
         "t_pred",
         "g",
-        "action",
-        "planned_path",
-        "actual_path",
+        "cache_action",
+        "cache_action_ack",
+        "used_d_binding",
+        "execution_path",
         "proxy_estimated_cached_tokens",
-        "engine_outcome",
+        "local_cache_status",
         "actual_local_cached_tokens",
         "prompt_tokens",
         "locally_computed_tokens",
         "hit_ratio",
         "estimate_error",
         "capacity_delay_ms",
-        "eviction_status",
-        "invalidated_blocks",
-        "immediately_reusable_blocks",
-        "deferred_active_blocks",
-        "estimated_reusable_bytes",
-        "fallback_reason",
     }
 
 
 @pytest.mark.asyncio
-async def test_concurrent_sessions_keep_independent_plans_and_turn_sequences() -> None:
+async def test_concurrent_sessions_keep_independent_bindings_and_turn_sequences() -> (
+    None
+):
     coordinator, _, _ = make_coordinator()
 
     await asyncio.gather(
@@ -295,8 +309,8 @@ async def test_concurrent_sessions_keep_independent_plans_and_turn_sequences() -
         run_turn(coordinator, payload("evict", 50.0)),
     )
 
-    assert coordinator.plan_for("retain").path is PlannedPath.D_LOCAL_AP
-    assert coordinator.plan_for("evict").path is PlannedPath.P_SIDE_AP
+    assert coordinator.is_d_bound("retain")
+    assert not coordinator.is_d_bound("evict")
     records = {record.session_id: record for record in coordinator.records}
     assert records["retain"].turn_sequence == 1
     assert records["evict"].turn_sequence == 1

@@ -1,10 +1,9 @@
-# TDAforward portable Proxy slice
+# TDAforward Proxy
 
-This directory is the locally executable part of TDAforward issue #16. It runs
-on ARM64 macOS without CUDA, a model, NIXL, or a live vLLM engine. A thin
-OpenAI-compatible FastAPI adapter delegates all policy and state transitions to
-`ReentryCoordinator`; deterministic fake Prefill and Decode adapters exercise
-the Engine Reentry Contract.
+This directory contains the portable contract harness and native 1P1D process
+adapters. The ARM64 mode needs no CUDA, model, NIXL, or live vLLM engine.
+Native mode uses the same coordinator while binding its tokenizer, Prefill and
+Decode requests, and cache-event stream to vLLM's production contracts.
 
 ## Local environment and tests
 
@@ -26,6 +25,27 @@ Start the fake-worker Proxy on the specified MVP port:
 uv run tda-forward-proxy --g 1000 --port 8000
 ```
 
+On the target server, start native mode after the P and D vLLM instances are
+healthy and the D event publisher is reachable:
+
+```bash
+uv run tda-forward-proxy \
+  --native \
+  --model <Qwen3.5-4B-model-path> \
+  --g 1000 \
+  --block-size 16 \
+  --prefill-url http://127.0.0.1:8100 \
+  --decode-url http://127.0.0.1:8200 \
+  --event-endpoint tcp://127.0.0.1:5557 \
+  --port 8000
+```
+
+The URL arguments are service roots; the Proxy preserves the incoming
+`/v1/completions` or `/v1/chat/completions` path. Fixed 1P1D native mode accepts
+exactly one Decode `--event-endpoint`. Native mode loads the tokenizer through vLLM,
+decodes `KVEventBatch` directly, and keeps event consumption in an independent
+task so publisher lag cannot block response streaming.
+
 Then send a completion turn:
 
 ```bash
@@ -42,17 +62,30 @@ to workers.
 ## Contract boundaries
 
 - `ReentryCoordinator` owns per-session sequential turns, the exact
-  `t_pred <= g` rule, routing intent, Decode-miss fallback, Cache Action ACK
-  handling, and structured records.
+  `t_pred <= g` rule, routing intent, Cache Action ACK handling, and structured
+  records. With no D binding, it sends a Prefill-side AP request and uses NIXL
+  transfer. With a D binding, it sends Decode-local append prefill, including
+  when Decode has zero local reuse.
 - `DecodePrefixMirror` consumes vLLM's native `KVEventBatch`, `BlockStored`,
   `BlockRemoved`, and `AllBlocksCleared` field vocabulary. It deliberately does
   not define another production event schema. The transport sequence remains a
   separate envelope value, as it is in vLLM's ZMQ publisher.
-- `FakePrefillAdapter` and `FakeDecodeAdapter` model first/P-bound execution,
-  full or partial `D_HIT`, `D_MISS`, `CAPACITY_DEFERRED`, streaming, and
-  aggregate `EVICT_D` acknowledgements.
+- `FakePrefillAdapter` and `FakeDecodeAdapter` model initial unbound execution,
+  full or partial `D_HIT`, `D_MISS`, capacity delay, streaming, and aggregate
+  `EVICT_D` acknowledgements. `D_HIT` and `D_MISS` report final Decode-local
+  reuse; they never select the worker. `capacity_delay_ms` reports Decode
+  waiting and never causes rerouting.
 - `create_app` starts event consumption as a task independent from request
   forwarding and response streaming. Event delay cannot block client output.
+- `VllmPrefillAdapter` and `VllmDecodeAdapter` use the existing OpenAI
+  `kv_transfer_params` extension. A D-local request carries its Scheduler
+  admission attempt and final Cache Action in one live request. The zero-token
+  `D_HIT` control output protects admitted blocks before model work. The
+  next-turn D binding changes only after the stream completes and a valid Cache
+  Action ACK arrives. `RETAIN_D` is soft retention: ordinary LRU-eligible
+  retention with neither a pin nor a TTL.
+- `ZmqEventSubscriber` decodes the publisher's native sequence envelope and
+  `KVEventBatch`; the Proxy defines no parallel wire schema.
 
 The default portable tokenizer exists only for the fake harness. A native vLLM
 adapter supplies the engine tokenizer through the `TokenizerAdapter` seam; the
@@ -91,6 +124,6 @@ events; it does not add another hash domain. Presence is tracked independently
 per native `group_idx`, and a prefix is considered resident only when every
 group observed for that session is present.
 
-The slice makes no claim about CUDA behavior, real model output, live vLLM
-scheduler admission, NIXL transfer, physical block eviction, or performance on
-the target two-GPU server.
+The ARM64 tests establish contract and Scheduler behavior but do not establish
+CUDA, NIXL, model-output, or performance results. Those claims require the
+Qwen3.5-4B BF16 1P1D run on the target dual-RTX-3090 server.

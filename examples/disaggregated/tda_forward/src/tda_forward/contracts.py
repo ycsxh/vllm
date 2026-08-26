@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import AsyncIterator
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 
@@ -20,36 +22,61 @@ class CacheActionStatus(StrEnum):
     DEFERRED = "DEFERRED"
 
 
-class PlannedPath(StrEnum):
+class ExecutionPath(StrEnum):
     D_LOCAL_AP = "D_LOCAL_AP"
     P_SIDE_AP = "P_SIDE_AP"
 
 
-class ActualPath(StrEnum):
-    D_LOCAL_AP = "D_LOCAL_AP"
-    P_SIDE_AP = "P_SIDE_AP"
-    P_FALLBACK = "P_FALLBACK"
-
-
-class AdmissionOutcome(StrEnum):
+class LocalCacheStatus(StrEnum):
     D_HIT = "D_HIT"
     D_MISS = "D_MISS"
-    CAPACITY_DEFERRED = "CAPACITY_DEFERRED"
 
 
 @dataclass(frozen=True)
-class ReentryPlan:
-    action: CacheAction
-    path: PlannedPath
-
-
-@dataclass(frozen=True)
-class AdmissionResult:
-    outcome: AdmissionOutcome
+class DecodeExecutionObservation:
+    cache_status: LocalCacheStatus
     actual_local_cached_tokens: int
     prompt_tokens: int
     locally_computed_tokens: int
     capacity_delay_ms: float = 0.0
+
+
+def validate_decode_execution_observation(
+    observation: DecodeExecutionObservation,
+) -> None:
+    if not isinstance(observation.cache_status, LocalCacheStatus):
+        raise RuntimeError("Decode returned a malformed local cache status")
+    numeric = (
+        observation.actual_local_cached_tokens,
+        observation.prompt_tokens,
+        observation.locally_computed_tokens,
+    )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in numeric
+    ):
+        raise RuntimeError("Decode returned malformed token counts")
+    if (
+        not math.isfinite(observation.capacity_delay_ms)
+        or observation.capacity_delay_ms < 0
+    ):
+        raise RuntimeError("Decode returned malformed capacity delay")
+    if (
+        observation.cache_status is LocalCacheStatus.D_MISS
+        and observation.actual_local_cached_tokens != 0
+    ):
+        raise RuntimeError("D_MISS must report zero local cached tokens")
+    if (
+        observation.cache_status is LocalCacheStatus.D_HIT
+        and observation.actual_local_cached_tokens == 0
+    ):
+        raise RuntimeError("D_HIT requires a positive local hit")
+
+
+@dataclass(frozen=True)
+class DecodeExecution:
+    observation: DecodeExecutionObservation
+    stream: AsyncIterator[dict[str, object]]
 
 
 @dataclass(frozen=True)
@@ -72,6 +99,7 @@ class PreparedTurn:
     lora_name: str | None = None
     cache_namespace: str | None = None
     block_extra_keys: tuple[object | None, ...] | None = None
+    cache_action: CacheAction = CacheAction.EVICT_D
 
 
 @dataclass(frozen=True)
@@ -87,23 +115,18 @@ class TurnRecord:
     turn_sequence: int
     t_pred: float
     g: float
-    action: CacheAction
-    planned_path: PlannedPath
-    actual_path: ActualPath
+    cache_action: CacheAction
+    cache_action_ack: CacheActionAck
+    used_d_binding: bool
+    execution_path: ExecutionPath
     proxy_estimated_cached_tokens: int
-    engine_outcome: AdmissionOutcome | None
+    local_cache_status: LocalCacheStatus | None
     actual_local_cached_tokens: int | None
     prompt_tokens: int
     locally_computed_tokens: int | None
     hit_ratio: float | None
     estimate_error: int | None
     capacity_delay_ms: float | None
-    eviction_status: CacheActionStatus | None
-    invalidated_blocks: int | None
-    immediately_reusable_blocks: int | None
-    deferred_active_blocks: int | None
-    estimated_reusable_bytes: int | None
-    fallback_reason: str | None
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)

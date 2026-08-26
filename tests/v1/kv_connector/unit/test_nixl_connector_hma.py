@@ -832,6 +832,17 @@ def test_mamba_n1_p_side_truncation():
 
 
 @pytest.mark.cpu_test
+def test_mamba_p_side_truncates_before_scheduler_prefix_lookup():
+    """Register P-side Mamba requests at N-1 before prefix-cache lookup."""
+    sched = make_nixl_scheduler(has_mamba=True, is_hma_required=True)
+    req = create_request(num_tokens=10, do_remote_decode=True)
+
+    sched.on_new_request(req)
+
+    assert req.num_prompt_tokens == 9
+
+
+@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "swa_enabled,mamba_enabled,expected_has_mamba,expected_is_hma",
     [

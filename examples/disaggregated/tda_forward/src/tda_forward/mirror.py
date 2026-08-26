@@ -141,6 +141,11 @@ class DecodePrefixMirror:
     def last_sequence(self) -> int | None:
         return self._cursor.last_applied
 
+    def invalidate(self, reason: str) -> None:
+        """Fail closed when the native event transport is no longer trustworthy."""
+        if self._invalid_reason is None:
+            self._invalid_reason = reason
+
     def register_session(
         self,
         session_id: str,

@@ -512,6 +512,7 @@ class OpenAIServingChat(GenerateBaseServing):
                                 else None
                             ),
                             prompt_text=prompt_text,
+                            kv_transfer_params=res.kv_transfer_params,
                         )
 
                         # if continuous usage stats are requested, add it
@@ -720,6 +721,7 @@ class OpenAIServingChat(GenerateBaseServing):
                         created=created_time,
                         choices=[choice_data],
                         model=model_name,
+                        kv_transfer_params=res.kv_transfer_params,
                     )
                     # Stamp the fingerprint on terminal chunks only (those with
                     # finish_reason set). When ``include_usage`` is on, the

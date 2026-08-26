@@ -11,11 +11,12 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from tda_forward.contracts import (
-    AdmissionOutcome,
-    AdmissionResult,
     CacheAction,
     CacheActionAck,
     CacheActionStatus,
+    DecodeExecution,
+    DecodeExecutionObservation,
+    LocalCacheStatus,
     PrefillResult,
     PreparedTurn,
 )
@@ -26,7 +27,6 @@ class AdapterCall:
     kind: str
     session_id: str
     action: CacheAction | None = None
-    proxy_estimated_cached_tokens: int | None = None
     prompt_token_ids: tuple[int, ...] = ()
 
 
@@ -51,35 +51,42 @@ class FakePrefillAdapter:
 class FakeDecodeAdapter:
     def __init__(self) -> None:
         self.calls: list[AdapterCall] = []
-        self._admissions: dict[str, deque[AdmissionResult]] = defaultdict(deque)
+        self._observations: dict[str, deque[DecodeExecutionObservation]] = defaultdict(
+            deque
+        )
         self._acks: dict[str, deque[CacheActionAck]] = defaultdict(deque)
 
-    def queue_admission(self, session_id: str, result: AdmissionResult) -> None:
-        self._admissions[session_id].append(result)
+    def queue_observation(
+        self, session_id: str, observation: DecodeExecutionObservation
+    ) -> None:
+        self._observations[session_id].append(observation)
 
     def queue_ack(self, session_id: str, ack: CacheActionAck) -> None:
         self._acks[session_id].append(ack)
 
-    async def admit_local(
-        self, turn: PreparedTurn, proxy_estimated_cached_tokens: int
-    ) -> AdmissionResult:
+    async def start_bound(self, turn: PreparedTurn) -> DecodeExecution:
         self.calls.append(
             AdapterCall(
-                "admit_local",
+                "start_bound",
                 turn.session_id,
-                proxy_estimated_cached_tokens=proxy_estimated_cached_tokens,
                 prompt_token_ids=turn.prompt_token_ids,
             )
         )
-        queued = self._admissions[turn.session_id]
+        queued = self._observations[turn.session_id]
         if queued:
-            return queued.popleft()
-        return AdmissionResult(
-            outcome=AdmissionOutcome.D_MISS,
-            actual_local_cached_tokens=0,
-            prompt_tokens=len(turn.prompt_token_ids),
-            locally_computed_tokens=0,
-        )
+            observation = queued.popleft()
+        else:
+            observation = DecodeExecutionObservation(
+                cache_status=LocalCacheStatus.D_MISS,
+                actual_local_cached_tokens=0,
+                prompt_tokens=len(turn.prompt_token_ids),
+                locally_computed_tokens=len(turn.prompt_token_ids),
+            )
+
+        async def stream() -> AsyncIterator[dict[str, object]]:
+            yield self._response_chunk(turn, "local")
+
+        return DecodeExecution(observation=observation, stream=stream())
 
     async def stream_from_prefill(
         self, turn: PreparedTurn, prefill: PrefillResult
@@ -93,19 +100,6 @@ class FakeDecodeAdapter:
             )
         )
         yield self._response_chunk(turn, "prefill")
-
-    async def stream_local(
-        self, turn: PreparedTurn, admission: AdmissionResult
-    ) -> AsyncIterator[dict[str, object]]:
-        del admission
-        self.calls.append(
-            AdapterCall(
-                "stream_local",
-                turn.session_id,
-                prompt_token_ids=turn.prompt_token_ids,
-            )
-        )
-        yield self._response_chunk(turn, "local")
 
     async def finish(self, turn: PreparedTurn, action: CacheAction) -> CacheActionAck:
         self.calls.append(

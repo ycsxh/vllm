@@ -375,6 +375,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                             not delta_text
                             and not delta_token_ids
                             and not previous_num_tokens[i]
+                            and res.kv_transfer_params is None
                         ):
                             # Chunked prefill case, don't return empty chunks
                             continue
@@ -420,6 +421,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                                 ),
                             )
                         ],
+                        kv_transfer_params=res.kv_transfer_params,
                     )
                     # Stamp on terminal chunk only when no trailing usage chunk
                     # will follow (that one is the true final message).

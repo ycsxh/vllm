@@ -65,6 +65,7 @@ def create_scheduler(
     ec_role: str | None = None,
     use_v2_model_runner: bool | None = None,
     kv_cache_spec: KVCacheSpec | None = None,
+    kv_cache_groups: list[KVCacheGroupSpec] | None = None,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -173,10 +174,12 @@ def create_scheduler(
             head_size=1,
             dtype=torch.float32,
         )
+    if kv_cache_groups is None:
+        kv_cache_groups = [KVCacheGroupSpec(["layer"], kv_cache_spec)]
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,  # A large number of blocks to hold all requests
         kv_cache_tensors=[],
-        kv_cache_groups=[KVCacheGroupSpec(["layer"], kv_cache_spec)],
+        kv_cache_groups=kv_cache_groups,
     )
     cache_config.num_gpu_blocks = num_blocks
     register_all_kvcache_specs(vllm_config)

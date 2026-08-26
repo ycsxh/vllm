@@ -17,9 +17,11 @@ if TYPE_CHECKING:
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+    from vllm.v1.engine import EngineCoreOutput
     from vllm.v1.request import Request
 else:
     ECConnectorMetadata = object
+    EngineCoreOutput = object
     KVConnectorMetadata = object
     KVCacheBlockCopy = object
     LoRARequest = object
@@ -248,6 +250,9 @@ class SchedulerOutput:
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
+
+    # Scheduler-owned observations emitted before model execution.
+    tda_forward_observation_outputs: list[tuple[int, EngineCoreOutput]] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

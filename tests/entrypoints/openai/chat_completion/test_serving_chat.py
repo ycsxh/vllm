@@ -666,6 +666,61 @@ async def _single_request_output(
     yield request_output
 
 
+@pytest.mark.asyncio
+async def test_streaming_response_carries_kv_transfer_control_metadata():
+    serving = await _async_serving_chat_init()
+    transfer = {
+        "tda_forward": {
+            "execution_observation": {
+                "cache_status": "D_HIT",
+                "actual_local_cached_tokens": 16,
+                "prompt_tokens": 17,
+                "locally_computed_tokens": 1,
+                "capacity_delay_ms": 0.0,
+            }
+        }
+    }
+    request_output = RequestOutput(
+        request_id="test-id",
+        prompt="Test prompt",
+        prompt_token_ids=[1, 2, 3],
+        prompt_logprobs=None,
+        outputs=[
+            CompletionOutput(
+                index=0,
+                text="",
+                token_ids=[],
+                cumulative_logprob=None,
+                logprobs=None,
+            )
+        ],
+        finished=False,
+        kv_transfer_params=transfer,
+    )
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "Test"}],
+        stream=True,
+    )
+
+    chunks = []
+    async for line in serving.chat_completion_stream_generator(
+        request,
+        _single_request_output(request_output),
+        "chatcmpl-test-id",
+        MODEL_NAME,
+        conversation=[{"role": "user", "content": "Test"}],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+    ):
+        if line.startswith("data: {"):
+            chunks.append(json.loads(line.removeprefix("data: ")))
+
+    assert [
+        chunk["kv_transfer_params"] for chunk in chunks if "kv_transfer_params" in chunk
+    ] == [transfer]
+
+
 async def _collect_metrics_stream_chunks(
     serving: OpenAIServingChat,
     request: ChatCompletionRequest,
