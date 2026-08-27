@@ -127,6 +127,7 @@ class DecodePrefixMirror:
         self._cursor = SequenceCursor()
         self._invalid_reason: str | None = None
         self.gap_count = 0
+        self.first_gap_at: float | None = None
         self.metrics = MirrorMetrics()
 
     @property
@@ -294,6 +295,8 @@ class DecodePrefixMirror:
             return BatchApplyResult.STALE
         if observation.kind is CursorKind.GAP:
             self.gap_count += 1
+            if self.first_gap_at is None:
+                self.first_gap_at = time.time()
             self._cursor = self._cursor.advance_to(sequence)
             self._clear_presence()
             return self._invalidate(

@@ -9,6 +9,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
+from dataclasses import asdict
 from typing import Any, Protocol
 
 from fastapi import FastAPI, HTTPException, Request
@@ -110,6 +111,22 @@ def create_app(
             "status": "ok",
             "mirror_valid": coordinator.mirror.is_valid,
             "mirror_invalid_reason": coordinator.mirror.invalid_reason,
+            "event_pump": event_pump.status if event_pump is not None else None,
+        }
+
+    @app.get("/acceptance/state")
+    async def acceptance_state() -> dict[str, object]:
+        """Expose a read-only evidence snapshot without changing routing state."""
+        return {
+            "records": [record.as_dict() for record in coordinator.records],
+            "mirror": {
+                "valid": coordinator.mirror.is_valid,
+                "invalid_reason": coordinator.mirror.invalid_reason,
+                "last_sequence": coordinator.mirror.last_sequence,
+                "gap_count": coordinator.mirror.gap_count,
+                "first_gap_at": coordinator.mirror.first_gap_at,
+                "metrics": asdict(coordinator.mirror.metrics),
+            },
             "event_pump": event_pump.status if event_pump is not None else None,
         }
 

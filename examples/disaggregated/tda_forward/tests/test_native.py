@@ -30,8 +30,9 @@ def test_vllm_tokenizer_adapter_uses_public_tokenizer_api(monkeypatch):
             assert prompt == "hello"
             return [11, 12]
 
-    def get_tokenizer(model: str, *, trust_remote_code: bool):
+    def get_tokenizer(model: str, *, revision: str, trust_remote_code: bool):
         assert model == "test-model"
+        assert revision == "tokenizer-revision"
         assert trust_remote_code is True
         return Tokenizer()
 
@@ -42,7 +43,11 @@ def test_vllm_tokenizer_adapter_uses_public_tokenizer_api(monkeypatch):
 
     monkeypatch.setattr("tda_forward.native.importlib.import_module", import_module)
 
-    adapter = VllmTokenizerAdapter("test-model", trust_remote_code=True)
+    adapter = VllmTokenizerAdapter(
+        "test-model",
+        revision="tokenizer-revision",
+        trust_remote_code=True,
+    )
 
     assert adapter.token_ids({"prompt": "hello"}) == [11, 12]
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import math
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -36,10 +37,17 @@ def _headers(request_id: str) -> dict[str, str]:
 class VllmTokenizerAdapter:
     """Use the model tokenizer loaded through vLLM's native tokenizer helper."""
 
-    def __init__(self, model: str, *, trust_remote_code: bool = False) -> None:
+    def __init__(
+        self,
+        model: str,
+        *,
+        revision: str | None = None,
+        trust_remote_code: bool = False,
+    ) -> None:
         tokenizer_module = importlib.import_module("vllm.tokenizers")
         self._tokenizer = tokenizer_module.get_tokenizer(
             model,
+            revision=revision,
             trust_remote_code=trust_remote_code,
         )
 
@@ -372,13 +380,18 @@ class NativeEventPump:
         subscriber_factory: Callable[[], Any],
         *,
         on_failure: Callable[[str], None] | None = None,
+        consumer_delay_seconds: float = 0.0,
     ) -> None:
+        if not math.isfinite(consumer_delay_seconds) or consumer_delay_seconds < 0:
+            raise ValueError("consumer_delay_seconds must be finite and nonnegative")
         self._subscriber_factory = subscriber_factory
         self._on_failure = on_failure
+        self._consumer_delay_seconds = consumer_delay_seconds
         self._subscriber: Any | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._failure: str | None = None
+        self._event_lag_seconds: list[float] = []
 
     @classmethod
     def from_endpoints(
@@ -386,12 +399,19 @@ class NativeEventPump:
         endpoints: str | list[str],
         *,
         topic: str = "",
+        subscriber_hwm: int = 100_000,
         on_failure: Callable[[str], None] | None = None,
+        consumer_delay_seconds: float = 0.0,
     ) -> NativeEventPump:
+        if subscriber_hwm <= 0:
+            raise ValueError("subscriber_hwm must be positive")
         event_module = importlib.import_module("vllm.distributed.kv_events")
         return cls(
-            lambda: event_module.ZmqEventSubscriber(endpoints, topic=topic),
+            lambda: event_module.ZmqEventSubscriber(
+                endpoints, topic=topic, hwm=subscriber_hwm
+            ),
             on_failure=on_failure,
+            consumer_delay_seconds=consumer_delay_seconds,
         )
 
     async def run(
@@ -417,10 +437,16 @@ class NativeEventPump:
                     envelope = subscriber.receive_one(100)
                     if envelope is not None:
                         sequence, batch = envelope
+                        received_at = time.time()
+                        self._event_lag_seconds.append(
+                            max(0.0, received_at - float(batch.ts))
+                        )
                         loop.call_soon_threadsafe(
                             event_queue.put_nowait,
-                            (sequence, batch, time.time()),
+                            (sequence, batch, received_at),
                         )
+                        if self._consumer_delay_seconds:
+                            time.sleep(self._consumer_delay_seconds)
             except BaseException as error:
                 loop.call_soon_threadsafe(finish, error)
             finally:
@@ -464,4 +490,23 @@ class NativeEventPump:
             "alive": self._thread is not None and self._thread.is_alive(),
             "failure": self._failure,
             "subscriber": asdict(stats) if stats is not None else None,
+            "event_lag_seconds": self._lag_summary(),
+        }
+
+    def _lag_summary(self) -> dict[str, object]:
+        values = sorted(self._event_lag_seconds)
+
+        def percentile(quantile: float) -> float | None:
+            if not values:
+                return None
+            index = max(0, math.ceil(quantile * len(values)) - 1)
+            return values[index]
+
+        return {
+            "count": len(values),
+            "raw": values,
+            "p50": percentile(0.50),
+            "p95": percentile(0.95),
+            "p99": percentile(0.99),
+            "max": values[-1] if values else None,
         }

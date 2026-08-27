@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "model": "Qwen/Qwen3.5-4B",
+  "model_revision_env": "TDA_MODEL_REVISION",
+  "tokenizer_revision_env": "TDA_TOKENIZER_REVISION",
+  "seeds": [17, 29, 43],
+  "ports": {
+    "proxy": 8000,
+    "prefill": 8100,
+    "decode": 8200,
+    "prefill_side_channel": 5600,
+    "decode_side_channel": 5601,
+    "decode_events": 5557
+  },
+  "deployment": {
+    "dtype": "bfloat16",
+    "kv_cache_dtype": "bfloat16",
+    "tensor_parallel_size": 1,
+    "block_size": 128,
+    "max_model_len": 8192,
+    "max_num_batched_tokens": 4096,
+    "gpu_memory_utilization": 0.65,
+    "attention_backend_env": "TDA_ATTENTION_BACKEND",
+    "prefill_cpus_env": "TDA_PREFILL_CPUS",
+    "prefill_numa_env": "TDA_PREFILL_NUMA_NODE",
+    "decode_cpus_env": "TDA_DECODE_CPUS",
+    "decode_numa_env": "TDA_DECODE_NUMA_NODE"
+  },
+  "workload": {
+    "session_count": 32,
+    "turns_per_session": 6,
+    "warmup_turns": 1,
+    "max_tokens": 32,
+    "request_timeout_seconds": 300,
+    "run_timeout_seconds": 900,
+    "shared_prefix_words": 256,
+    "pressure_words": 2400,
+    "g_seconds": 1000
+  },
+  "publisher": {
+    "healthy_hwm": 100000,
+    "healthy_queue_size": 100000,
+    "stalled_hwm": 1,
+    "stalled_queue_size": 1,
+    "stalled_consumer_delay_seconds": 2.0
+  },
+  "thresholds": {
+    "minimum_throughput_ratio": 0.95,
+    "maximum_latency_ratio": 1.05,
+    "maximum_stalled_enqueue_p99_ms": 50
+  }
+}

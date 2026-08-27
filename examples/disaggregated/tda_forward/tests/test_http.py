@@ -83,6 +83,30 @@ async def test_http_validation_happens_before_worker_dispatch() -> None:
 
 
 @pytest.mark.asyncio
+async def test_acceptance_state_is_a_read_only_record_snapshot() -> None:
+    app, coordinator = make_app()
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post(
+            "/v1/completions",
+            json={
+                "model": "fake",
+                "prompt": [1, 2, 3, 4],
+                "session_id": "snapshot",
+                "t_pred": 1.0,
+            },
+        )
+        response = await client.get("/acceptance/state")
+
+    body = response.json()
+    assert body["records"][0]["session_id"] == "snapshot"
+    assert body["mirror"]["valid"] is True
+    assert body["event_pump"] is None
+    assert len(coordinator.records) == 1
+
+
+@pytest.mark.asyncio
 async def test_delayed_event_producer_does_not_block_streaming() -> None:
     event_queue: asyncio.Queue[tuple[int, object, float | None] | None] = (
         asyncio.Queue()

@@ -32,6 +32,7 @@ healthy and the D event publisher is reachable:
 uv run tda-forward-proxy \
   --native \
   --model <Qwen3.5-4B-model-path> \
+  --tokenizer-revision <full-tokenizer-commit> \
   --g 1000 \
   --block-size 16 \
   --prefill-url http://127.0.0.1:8100 \
